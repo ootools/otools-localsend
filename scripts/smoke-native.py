@@ -10,6 +10,7 @@ import ctypes
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 
 _NATIVE = None
@@ -71,6 +72,37 @@ def main():
         assert reloaded["data"]["port"] == 53318, f"port not persisted: {reloaded['data']}"
         assert (Path(directory) / "settings.json").is_file(), "settings.json not written to the isolated data dir"
         print("PASS: settings_set persists into the isolated data directory")
+
+        # Task 6: discovery surface. No real network peers are required.
+        # Before start_background the table is empty, no socket is bound, and
+        # discover_now is a no-op that still answers ok.
+        pre_devices = invoke("device_list")
+        assert pre_devices["ok"] is True, f"device_list before start: {pre_devices.get('error')}"
+        assert pre_devices["data"]["devices"] == [], f"unexpected devices before start: {pre_devices['data']}"
+        assert pre_devices["data"]["udpPort"] == 0, f"udpPort must be 0 before start: {pre_devices['data']}"
+        pre_now = invoke("discover_now")
+        assert pre_now["ok"] is True and pre_now["data"]["ok"] is True, f"discover_now before start: {pre_now}"
+        print("PASS: device_list empty (udpPort 0) and discover_now ok before start_background")
+
+        started = invoke("start_localsend")
+        assert started["ok"] is True, f"start_localsend: {started.get('error')}"
+
+        # The discovery task binds asynchronously; poll for the actual port.
+        # Settings above switched the port to 53318, so discovery binds there
+        # first and may fall back up to +10 on a busy machine.
+        devices = invoke("device_list")
+        assert devices["ok"] is True, f"device_list after start: {devices.get('error')}"
+        assert isinstance(devices["data"]["devices"], list), "devices must be a list"
+        udp_port = devices["data"]["udpPort"]
+        deadline = time.monotonic() + 5
+        while udp_port == 0 and time.monotonic() < deadline:
+            time.sleep(0.1)
+            devices = invoke("device_list")
+            udp_port = devices["data"]["udpPort"]
+        assert 53318 <= udp_port <= 53328, f"udpPort outside the fallback range: {udp_port}"
+        now = invoke("discover_now")
+        assert now["ok"] is True and now["data"]["ok"] is True, f"discover_now after start: {now}"
+        print(f"PASS: start_localsend binds discovery on UDP {udp_port}, device_list/discover_now ok")
 
         assert invoke("__otools_shutdown__")["ok"] is True
         retired = invoke("settings_get")

@@ -1,4 +1,5 @@
 pub mod crypto;
+pub mod discovery;
 pub mod event_bridge;
 pub mod models;
 pub mod runtime;

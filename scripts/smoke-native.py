@@ -75,7 +75,9 @@ def main():
         assert invoke("__otools_shutdown__")["ok"] is True
         retired = invoke("settings_get")
         assert retired["ok"] is False and retired.get("error") == "plugin retired", f"expected retired: {retired}"
-        assert invoke("poll_events")["ok"] is True, "poll_events must stay answerable after retirement"
+        retired_poll = invoke("poll_events")
+        assert retired_poll["ok"] is True, "poll_events must stay answerable after retirement"
+        assert retired_poll["data"]["events"] == [], f"retired poll_events must drain empty: {retired_poll}"
         print("PASS: shutdown retires the plugin while poll_events remains available")
 
 

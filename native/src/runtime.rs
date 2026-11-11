@@ -1,8 +1,9 @@
 use crate::crypto::{self, CertMaterial};
+use crate::event_bridge::WebEventBroadcaster;
 use crate::settings::{self, Settings};
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::runtime::{Builder, Runtime};
 
 static PLUGIN: OnceLock<Mutex<Slot>> = OnceLock::new();
@@ -17,6 +18,10 @@ struct PluginRuntime {
     runtime: Runtime,
     data_dir: PathBuf,
     cert: Option<CertMaterial>,
+    /// Native→frontend event queue. Shared as `Arc` so background workers
+    /// spawned on the runtime can emit events without touching the plugin
+    /// slot mutex.
+    broadcaster: Arc<WebEventBroadcaster>,
 }
 
 impl PluginRuntime {
@@ -34,6 +39,7 @@ impl PluginRuntime {
             runtime,
             data_dir,
             cert: None,
+            broadcaster: Arc::new(WebEventBroadcaster::new()),
         })
     }
 
@@ -46,12 +52,25 @@ impl PluginRuntime {
 
 pub fn invoke(method: &str, payload: Value) -> Result<Value, String> {
     let lock = PLUGIN.get_or_init(|| Mutex::new(Slot::Empty));
-    let mut guard = lock.lock().unwrap_or_else(|error| error.into_inner());
     if method == "poll_events" {
-        // Must never block behind initialization or retirement; Task 5 wires
-        // the broadcaster in.
-        return Ok(json!({"events": []}));
+        // Must never block behind initialization or retirement, and the slot
+        // mutex must stay short-held: only clone the broadcaster Arc here.
+        // The actual drain takes the broadcaster's own lock (a cheap
+        // VecDeque take), and payload serialization happens later in
+        // `handle_json`, outside every mutex.
+        let broadcaster = {
+            let guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+            match &*guard {
+                Slot::Running(plugin) => Some(Arc::clone(&plugin.broadcaster)),
+                _ => None,
+            }
+        };
+        let events = broadcaster
+            .map(|broadcaster| broadcaster.drain())
+            .unwrap_or_default();
+        return Ok(json!({ "events": events }));
     }
+    let mut guard = lock.lock().unwrap_or_else(|error| error.into_inner());
     if method == "__otools_shutdown__" {
         shutdown(&mut guard);
         return Ok(Value::Null);

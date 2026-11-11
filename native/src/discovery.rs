@@ -449,7 +449,11 @@ fn bind_multicast_socket(port: u16) -> io::Result<StdUdpSocket> {
         port,
     ))))?;
     socket.join_multicast_v4(&MULTICAST_GROUP, &Ipv4Addr::UNSPECIFIED)?;
-    socket.set_multicast_loop_v4(false)?;
+    // NOTE: IP_MULTICAST_LOOP stays at the Windows default (enabled). On
+    // Windows the flag gates the delivery of ALL local loop-copies TO this
+    // socket, not just our own sends — disabling it makes same-host peers
+    // (the official LocalSend app next to us, integration tests) invisible.
+    // Our own echoed frames are filtered by fingerprint in `handle_frame`.
     socket.set_multicast_ttl_v4(1)?; // LAN scope
     let socket: StdUdpSocket = socket.into();
     socket.set_nonblocking(true)?;

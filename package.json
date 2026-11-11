@@ -5,5 +5,8 @@
   "scripts": {
     "build:native": "node scripts/build-native.mjs",
     "smoke": "python scripts/smoke-native.py"
+  },
+  "devDependencies": {
+    "selfsigned": "^5.5.0"
   }
 }

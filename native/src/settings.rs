@@ -42,6 +42,11 @@ fn default_alias() -> String {
         .unwrap_or_else(|| "LocalSend Device".into())
 }
 
+/// Serializes `OTOOLS_DATA_DIR` mutations between tests that share the
+/// process environment (see `settings_data_dir` and the runtime cert test).
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Default plugin data dir; smoke and tests point `OTOOLS_DATA_DIR` elsewhere.
 pub fn default_data_dir() -> Result<PathBuf, String> {
     directories::BaseDirs::new()
@@ -86,7 +91,7 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_data_dir, resolve_data_dir, load, Settings, SETTINGS_FILE};
+    use super::{default_data_dir, resolve_data_dir, load, Settings, SETTINGS_FILE, TEST_ENV_LOCK};
     use std::path::PathBuf;
 
     #[test]
@@ -117,6 +122,7 @@ mod tests {
 
     #[test]
     fn settings_data_dir() {
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = default_data_dir().expect("default data dir");
         assert!(
             dir.ends_with(".otools/local/otools-localsend"),

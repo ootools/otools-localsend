@@ -1,0 +1,19 @@
+{
+  "packid": "otools-localsend",
+  "uuid": "otools-localsend",
+  "displayName": "LocalSend · 局域网互传",
+  "displayNameCN": "LocalSend · 局域网互传",
+  "version": "0.1.0",
+  "entry": "dist/index.html",
+  "icon": "📡",
+  "developerName": "OTools",
+  "summary": "LocalSend 协议 v2 兼容的局域网互传：与手机、电脑上的官方 LocalSend 互相发现并收发文件与文本。",
+  "key": ["localsend", "LocalSend", "互传", "局域网", "文件传输", "AirDrop", "传输"],
+  "openMode": "panel",
+  "openInBrowser": false,
+  "devUrl": "http://127.0.0.1:6497",
+  "quickDev": true,
+  "hasAd": false,
+  "inPluginPurchase": false,
+  "screenshots": []
+}

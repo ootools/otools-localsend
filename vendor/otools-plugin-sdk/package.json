@@ -1,0 +1,165 @@
+{
+  "name": "otools-plugin-sdk",
+  "version": "0.1.0",
+  "description": "OTools compatibility SDK for migrating Tauri apps into OTools plugins",
+  "keywords": [
+    "otools",
+    "tauri",
+    "vite",
+    "plugin",
+    "sdk"
+  ],
+  "homepage": "https://github.com/farion1231/cc-switch/tree/main/otools-plugin-sdk",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/farion1231/cc-switch.git",
+    "directory": "otools-plugin-sdk"
+  },
+  "bugs": {
+    "url": "https://github.com/farion1231/cc-switch/issues"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./capture": {
+      "types": "./dist/capture.d.ts",
+      "import": "./dist/capture.js",
+      "default": "./dist/capture.js"
+    },
+    "./capture-factory": {
+      "types": "./dist/capture-factory.d.ts",
+      "import": "./dist/capture-factory.js",
+      "default": "./dist/capture-factory.js"
+    },
+    "./aliases": {
+      "types": "./dist/aliases.d.ts",
+      "import": "./dist/aliases.js",
+      "default": "./dist/aliases.js"
+    },
+    "./vite": {
+      "types": "./dist/vite.d.ts",
+      "import": "./dist/vite.js",
+      "default": "./dist/vite.js"
+    },
+    "./runtime": {
+      "types": "./dist/runtime.d.ts",
+      "import": "./dist/runtime.js",
+      "default": "./dist/runtime.js"
+    },
+    "./popup-manager": {
+      "types": "./dist/popup-manager.d.ts",
+      "import": "./dist/popup-manager.js",
+      "default": "./dist/popup-manager.js"
+    },
+    "./native-event-bridge": {
+      "types": "./dist/native-event-bridge.d.ts",
+      "import": "./dist/native-event-bridge.js",
+      "default": "./dist/native-event-bridge.js"
+    },
+    "./dialog": {
+      "types": "./dist/dialog.d.ts",
+      "import": "./dist/dialog.js",
+      "default": "./dist/dialog.js"
+    },
+    "./tauri-core-shim": {
+      "types": "./dist/tauri-core-shim.d.ts",
+      "import": "./dist/tauri-core-shim.js",
+      "default": "./dist/tauri-core-shim.js"
+    },
+    "./tauri-event-shim": {
+      "types": "./dist/tauri-event-shim.d.ts",
+      "import": "./dist/tauri-event-shim.js",
+      "default": "./dist/tauri-event-shim.js"
+    },
+    "./tauri-window-shim": {
+      "types": "./dist/tauri-window-shim.d.ts",
+      "import": "./dist/tauri-window-shim.js",
+      "default": "./dist/tauri-window-shim.js"
+    },
+    "./tauri-webview-window-shim": {
+      "types": "./dist/tauri-webview-window-shim.d.ts",
+      "import": "./dist/tauri-webview-window-shim.js",
+      "default": "./dist/tauri-webview-window-shim.js"
+    },
+    "./tauri-webview-shim": {
+      "types": "./dist/tauri-webview-shim.d.ts",
+      "import": "./dist/tauri-webview-shim.js",
+      "default": "./dist/tauri-webview-shim.js"
+    },
+    "./tauri-app-shim": {
+      "types": "./dist/tauri-app-shim.d.ts",
+      "import": "./dist/tauri-app-shim.js",
+      "default": "./dist/tauri-app-shim.js"
+    },
+    "./tauri-plugin-dialog-shim": {
+      "types": "./dist/tauri-plugin-dialog-shim.d.ts",
+      "import": "./dist/tauri-plugin-dialog-shim.js",
+      "default": "./dist/tauri-plugin-dialog-shim.js"
+    },
+    "./tauri-plugin-opener-shim": {
+      "types": "./dist/tauri-plugin-opener-shim.d.ts",
+      "import": "./dist/tauri-plugin-opener-shim.js",
+      "default": "./dist/tauri-plugin-opener-shim.js"
+    },
+    "./tauri-plugin-process-shim": {
+      "types": "./dist/tauri-plugin-process-shim.d.ts",
+      "import": "./dist/tauri-plugin-process-shim.js",
+      "default": "./dist/tauri-plugin-process-shim.js"
+    },
+    "./tauri-plugin-updater-shim": {
+      "types": "./dist/tauri-plugin-updater-shim.d.ts",
+      "import": "./dist/tauri-plugin-updater-shim.js",
+      "default": "./dist/tauri-plugin-updater-shim.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/farion1231"
+  },
+  "peerDependenciesMeta": {
+    "@tauri-apps/api": {
+      "optional": false
+    }
+  },
+  "scripts": {
+    "build": "vite build",
+    "sync:capture-injection": "node scripts/sync-capture-injection.mjs",
+    "check:capture-injection": "node scripts/sync-capture-injection.mjs --check",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "pnpm build"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-dialog": "^2.4.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-dialog": "^2.4.0",
+    "jsdom": "^26.1.0",
+    "typescript": "^5.9.2",
+    "vite": "^7.3.0",
+    "vite-plugin-dts": "^4.5.4",
+    "vitest": "^3.2.4"
+  }
+}

@@ -1,0 +1,28 @@
+[package]
+name = "otools-localsend-native"
+version = "0.1.0"
+description = "LocalSend business core for the OTools native plugin ABI"
+authors = ["xyito"]
+edition = "2021"
+autobins = false
+
+[lib]
+name = "otools_localsend_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+directories = "5"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0

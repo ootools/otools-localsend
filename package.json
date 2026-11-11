@@ -1,5 +1,9 @@
 {
   "name": "otools-localsend",
   "private": true,
-  "version": "0.1.0"
+  "version": "0.1.0",
+  "scripts": {
+    "build:native": "node scripts/build-native.mjs",
+    "smoke": "python scripts/smoke-native.py"
+  }
 }

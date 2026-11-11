@@ -62,10 +62,13 @@ const MAX_UPLOAD_ATTEMPTS: u32 = 3;
 // ---------------------------------------------------------------------------
 
 /// The user's decision on a manual (Pending) receive session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum Decision {
-    /// Accept (a possibly empty subset of files was tokenized).
-    Accept,
+    /// Accept — carries the tokens issued for the accepted files (an empty
+    /// map means nothing was accepted: the suspended sender gets 204).
+    /// Carrying the tokens removes the post-decision session lookup, so the
+    /// session can be evicted the moment it turns terminal.
+    Accept(HashMap<String, String>),
     /// Decline — the suspended sender receives 403 "Rejected".
     Decline,
 }
@@ -204,9 +207,44 @@ impl ReceiveSessions {
 
     /// Cancel every non-terminal session older than [`SESSION_EXPIRY_MS`].
     /// Called from prepare-upload so a dead transfer cannot hold the
-    /// single-session slot forever. A stale Pending session resolves its
+    /// single-active-session rule forever. A stale Pending session resolves its
     /// suspended sender with 403 (Decline path) instead of hanging forever.
+    ///
+    /// Also reaps sessions that cannot make progress anymore, so a new
+    /// prepare is never answered 409 because of them:
+    /// - terminal sessions (Done/Failed/Cancelled) are evicted — official
+    ///   drops the slot on completion; the TransferRecord keeps the history;
+    /// - a Pending session whose decision sender is closed (the suspended
+    ///   prepare-upload handler was dropped — the sender vanished without a
+    ///   decision) is aborted like the official PendingSessionGuard.
     fn sweep_expired(&self) {
+        let dead_pending: Vec<String> = {
+            let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            let mut dead_pending = Vec::new();
+            inner.sessions.retain(|_, session| {
+                if session.status.is_terminal() {
+                    return false; // evicted; the history record stays
+                }
+                let sender_gone = session.status == TransferStatus::Pending
+                    && session
+                        .decision_tx
+                        .as_ref()
+                        .is_some_and(|tx| tx.is_closed());
+                if sender_gone {
+                    // NOT removed here: abort_session below owns the removal
+                    // plus the Cancelled record, temp dir and event.
+                    dead_pending.push(session.session_id.clone());
+                }
+                true
+            });
+            dead_pending
+        };
+        for session_id in &dead_pending {
+            // abort_session re-locks: it marks the record Cancelled, clears
+            // the (still empty) temp dir and reports the transfer-done.
+            self.abort_session(session_id);
+        }
+
         let now = now_ms();
         let expired: Vec<(String, PathBuf, Option<oneshot::Sender<Decision>>)> = {
             let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
@@ -332,57 +370,48 @@ impl ReceiveSessions {
     /// Transferring and resolve the suspended prepare-upload sender with the
     /// Accept decision. `None` accepts every file; unknown ids are skipped.
     /// Returns the sorted accepted file ids (empty → the sender gets 204,
-    /// nothing to transfer).
+    /// nothing to transfer, and the terminal session is evicted at once).
     pub fn session_accept(
         &self,
         session_id: &str,
         file_ids: Option<Vec<String>>,
     ) -> Result<Vec<String>, String> {
-        let (accepted, decision_tx, finished_empty) = {
+        let (accepted, tokens, decision_tx, finished_empty) = {
             let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-            let outcome = {
-                let session = inner
-                    .sessions
-                    .get_mut(session_id)
-                    .ok_or_else(|| format!("session not found: {session_id}"))?;
-                if session.status != TransferStatus::Pending {
-                    return Err(format!(
-                        "session {session_id} is not pending (status {:?})",
-                        session.status
-                    ));
+            let session = inner
+                .sessions
+                .get_mut(session_id)
+                .ok_or_else(|| format!("session not found: {session_id}"))?;
+            if session.status != TransferStatus::Pending {
+                return Err(format!(
+                    "session {session_id} is not pending (status {:?})",
+                    session.status
+                ));
+            }
+            let requested: Vec<String> = match file_ids {
+                None => {
+                    let mut all: Vec<String> = session.files.keys().cloned().collect();
+                    all.sort();
+                    all
                 }
-                let requested: Vec<String> = match file_ids {
-                    None => {
-                        let mut all: Vec<String> = session.files.keys().cloned().collect();
-                        all.sort();
-                        all
-                    }
-                    Some(ids) => {
-                        ids.into_iter()
-                            .filter(|id| session.files.contains_key(id))
-                            .collect()
-                    }
-                };
-                let mut accepted = Vec::new();
-                for file_id in requested {
-                    if session.tokens.contains_key(&file_id) {
-                        continue;
-                    }
-                    session
-                        .tokens
-                        .insert(file_id.clone(), uuid::Uuid::new_v4().to_string());
-                    accepted.push(file_id);
-                }
-                accepted.sort();
-                let decision_tx = session.decision_tx.take();
-                session.status = if accepted.is_empty() {
-                    TransferStatus::Done
-                } else {
-                    TransferStatus::Transferring
-                };
-                (accepted, decision_tx)
+                Some(ids) => ids
+                    .into_iter()
+                    .filter(|id| session.files.contains_key(id))
+                    .collect(),
             };
-            let (accepted, decision_tx) = outcome;
+            let mut accepted = Vec::new();
+            for file_id in requested {
+                if session.tokens.contains_key(&file_id) {
+                    continue;
+                }
+                session
+                    .tokens
+                    .insert(file_id.clone(), uuid::Uuid::new_v4().to_string());
+                accepted.push(file_id);
+            }
+            accepted.sort();
+            let decision_tx = session.decision_tx.take();
+            let tokens = session.tokens.clone();
             let finished_empty = accepted.is_empty();
             let status = if finished_empty {
                 // Nothing accepted: the suspended sender gets 204 (official
@@ -391,8 +420,16 @@ impl ReceiveSessions {
             } else {
                 TransferStatus::Transferring
             };
+            if finished_empty {
+                // Terminal: evict immediately (official drops the slot on
+                // completion); the decision below still carries the (empty)
+                // token map that turns into the 204 response.
+                inner.sessions.remove(session_id);
+            } else {
+                session.status = status;
+            }
             self.update_record(&mut inner, session_id, status, None);
-            (accepted, decision_tx, finished_empty)
+            (accepted, tokens, decision_tx, finished_empty)
         };
         if finished_empty {
             self.events.send(
@@ -405,7 +442,7 @@ impl ReceiveSessions {
             // disconnected while the decision was pending (the suspended
             // handler was dropped): clean up like the official
             // PendingSessionGuard and report the abort.
-            if decision_tx.send(Decision::Accept).is_err() {
+            if decision_tx.send(Decision::Accept(tokens)).is_err() {
                 self.abort_session(session_id);
                 return Err(format!("sender disconnected before decision: {session_id}"));
             }
@@ -738,34 +775,22 @@ pub fn prepare_upload(
 
 /// Resolve a suspended manual prepare-upload (official v2 behavior).
 ///
-/// Accept → the sender receives `{sessionId, files}` with the tokens issued
-/// by [`session_accept`] (204 "nothing to transfer" when the accepted set is
-/// empty); Decline → 403 "Rejected". No timeout: the official server has
-/// none either — a stuck sender is freed by its own client timeout, after
-/// which the next decision aborts the session (`tx.send` fails).
+/// Accept → the sender receives `{sessionId, files}` with the tokens carried
+/// by the decision ([`session_accept`] gathered them under the session lock;
+/// 204 "nothing to transfer" when the accepted set is empty); Decline →
+/// 403 "Rejected". No timeout: the official server has none either — a stuck
+/// sender is freed by its own client timeout, after which the session is
+/// aborted (`tx.send` fails) or reaped by the next prepare-upload.
 pub async fn await_user_decision(
-    sessions: Arc<ReceiveSessions>,
+    _sessions: Arc<ReceiveSessions>,
     session_id: String,
     decision_rx: oneshot::Receiver<Decision>,
 ) -> (u16, Value) {
     match decision_rx.await {
-        Ok(Decision::Accept) => {
-            let tokens = {
-                let inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
-                inner.sessions.get(&session_id).map(|session| session.tokens.clone())
-            };
-            match tokens {
-                Some(tokens) if !tokens.is_empty() => {
-                    (200, json!({ "sessionId": session_id, "files": tokens }))
-                }
-                Some(_) => (204, Value::Null),
-                None => (
-                    // The session vanished concurrently (cancel raced the accept).
-                    403,
-                    json!({ "error": "Rejected" }),
-                ),
-            }
+        Ok(Decision::Accept(tokens)) if !tokens.is_empty() => {
+            (200, json!({ "sessionId": session_id, "files": tokens }))
         }
+        Ok(Decision::Accept(_)) => (204, Value::Null),
         Ok(Decision::Decline) => (403, json!({ "error": "Rejected" })),
         // The decision channel closed without a decision (runtime shutdown).
         Err(_) => (403, json!({ "error": "Rejected" })),
@@ -837,13 +862,20 @@ impl ReceiveSessions {
                 let source = session.temp_dir.join(id);
                 destinations.insert(id.clone(), source.to_string_lossy().into_owned());
             }
-            TerminalPlan {
+            let plan = TerminalPlan {
                 session_id: session_id.to_string(),
                 status,
                 moves,
                 destinations,
                 temp_dir: session.temp_dir.clone(),
-            }
+            };
+            // Terminal: evict immediately (official drops the slot on
+            // completion). The plan carries everything the caller performs
+            // IO with; without a download dir the received files stay in tmp
+            // and remain the recorded destinations, so the dir is NOT
+            // removed here.
+            inner.sessions.remove(session_id);
+            plan
         };
         self.update_record(&mut inner, session_id, plan.status, Some(plan.destinations.clone()));
         Some(plan)
@@ -1793,7 +1825,8 @@ mod tests {
         assert!(accepted.is_empty());
         let (status, body) = waiter.await.expect("waiter task");
         assert_eq!(status, 204, "nothing to transfer: {body}");
-        assert_eq!(session_status(&sessions, &session_id), Some(TransferStatus::Done));
+        // Terminal Done session: evicted from the map, history kept.
+        assert_eq!(session_status(&sessions, &session_id), None, "evicted");
         let record = record_snapshot(&sessions, &session_id);
         assert_eq!(record.status, TransferStatus::Done);
     }
@@ -1963,7 +1996,8 @@ mod tests {
         assert!(temp_path.is_file(), "no download dir: file stays in tmp");
         let stored = std::fs::metadata(&temp_path).expect("final file").len();
         assert_eq!(stored, 9, "every chunk reached the disk");
-        assert_eq!(session_status(&sessions, &session_id), Some(TransferStatus::Done));
+        // Terminal Done session: evicted from the map, history kept.
+        assert_eq!(session_status(&sessions, &session_id), None, "evicted");
 
         let record = record_snapshot(&sessions, &session_id);
         assert_eq!(record.status, TransferStatus::Done);
@@ -2027,8 +2061,8 @@ mod tests {
         }
         assert_eq!(
             session_status(&sessions, &bad_session),
-            Some(TransferStatus::Failed),
-            "budget exhausted on the third mismatch"
+            None,
+            "budget exhausted on the third mismatch — terminal session evicted"
         );
         let record = record_snapshot(&sessions, &bad_session);
         assert_eq!(record.status, TransferStatus::Failed);
@@ -2036,7 +2070,8 @@ mod tests {
         assert_eq!(done.len(), 1);
         assert_eq!(done[0]["status"], "failed");
 
-        // A fourth upload against the failed file is blocked outright.
+        // A fourth upload against the failed file is blocked outright: the
+        // evicted session can no longer validate any token.
         let (status, _) = upload_stream(
             Arc::clone(&sessions),
             None,
@@ -2047,7 +2082,7 @@ mod tests {
             empty_body(),
         )
         .await;
-        assert_eq!(status, 409, "failed file is terminal");
+        assert_eq!(status, 403, "failed file is terminal");
     }
 
     #[tokio::test]
@@ -2149,7 +2184,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, 200);
-        assert_eq!(session_status(&sessions, &session_id), Some(TransferStatus::Done));
+        assert_eq!(session_status(&sessions, &session_id), None, "evicted on Done");
 
         let (status, _) = upload_stream(
             Arc::clone(&sessions),
@@ -2161,7 +2196,9 @@ mod tests {
             empty_body(),
         )
         .await;
-        assert_eq!(status, 409, "replay upload against a Done session blocked");
+        // The Done session was evicted (official drops the slot on
+        // completion), so the replayed token can no longer be validated.
+        assert_eq!(status, 403, "replay upload against a Done session blocked");
     }
 
     #[tokio::test]
@@ -2354,8 +2391,8 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(
             session_status(&sessions, &session_id),
-            Some(TransferStatus::Done),
-            "accepted files all terminal → session done"
+            None,
+            "accepted files all terminal → session done and evicted"
         );
         let record = record_snapshot(&sessions, &session_id);
         assert_eq!(record.status, TransferStatus::Done);
@@ -2364,6 +2401,91 @@ mod tests {
         let done = event_data(&events, "transfer-done");
         assert_eq!(done.len(), 1);
         assert_eq!(done[0]["status"], "done");
+    }
+
+    #[test]
+    fn dead_pending_slot_reclaimed_on_new_prepare() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions =
+            Arc::new(ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions"));
+        let entries = [file_entry("f1", 10, None)];
+
+        // Manual prepare whose sender vanishes without a decision: the
+        // suspended prepare-upload handler future was dropped, so the
+        // decision receiver is gone while the session sits in the map.
+        let (dead_id, decision_rx) = prepare_manual(&sessions, &entries, SENDER_IP);
+        drop(decision_rx);
+
+        // The next prepare must NOT be answered 409: the dead pending slot
+        // is reclaimed and the request becomes a fresh Pending session.
+        let (new_id, _decision_rx) = prepare_manual(&sessions, &entries, SENDER_IP);
+        assert_ne!(new_id, dead_id, "a fresh session was stored");
+        assert_eq!(
+            session_status(&sessions, &new_id),
+            Some(TransferStatus::Pending)
+        );
+        assert_eq!(
+            session_status(&sessions, &dead_id),
+            None,
+            "the dead pending session was aborted"
+        );
+        let record = record_snapshot(&sessions, &dead_id);
+        assert_eq!(record.status, TransferStatus::Cancelled);
+        let done = event_data(&events, "transfer-done");
+        assert!(
+            done.iter()
+                .any(|data| data["sessionId"] == dead_id && data["status"] == "cancelled"),
+            "the abort is reported: {done:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_sessions_evicted() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions =
+            Arc::new(ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions"));
+        let config = settings(true, None);
+
+        let digest = sha256_hex(b"payload");
+        let entries = [file_entry("f1", 7, Some(&digest))];
+        let (status, body) = prepare_now(&sessions, &config, &entries, None, SENDER_IP);
+        assert_eq!(status, 200, "{body}");
+        let session_id = body["sessionId"].as_str().expect("sessionId").to_string();
+        let token = body["files"]["f1"].as_str().expect("token").to_string();
+
+        let (status, body) = upload_stream(
+            Arc::clone(&sessions),
+            None,
+            session_id.clone(),
+            "f1".into(),
+            token,
+            SENDER_IP,
+            body_from_chunks(&[b"payload"]),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+
+        // Terminal: the session left the map (official drops the slot on
+        // completion) while the history record stays in transfer_list.
+        {
+            let inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
+            assert!(
+                inner.sessions.is_empty(),
+                "terminal sessions must be evicted: {:?}",
+                inner.sessions.keys().collect::<Vec<_>>()
+            );
+        }
+        let record = record_snapshot(&sessions, &session_id);
+        assert_eq!(record.status, TransferStatus::Done);
+        // Without a download dir the received file stays in tmp as the
+        // recorded destination — eviction must not touch it.
+        assert!(sessions.tmp_root().join(&session_id).join("f1").is_file());
+
+        // The freed slot accepts the next prepare immediately.
+        let (status, body) = prepare_now(&sessions, &config, &entries, None, SENDER_IP);
+        assert_eq!(status, 200, "slot free after completion: {body}");
     }
 
     #[test]

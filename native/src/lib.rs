@@ -3,6 +3,7 @@ pub mod discovery;
 pub mod event_bridge;
 pub mod models;
 pub mod runtime;
+pub mod sender;
 pub mod server;
 pub mod settings;
 
@@ -25,6 +26,7 @@ pub fn handle_json(input: &[u8]) -> Value {
 }
 
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn otools_plugin_invoke(input_ptr: *const u8, input_len: usize, output_len: *mut usize) -> *mut u8 {
     if output_len.is_null() { return std::ptr::null_mut(); }
     let result = catch_unwind(AssertUnwindSafe(|| {
@@ -40,6 +42,7 @@ pub extern "C" fn otools_plugin_invoke(input_ptr: *const u8, input_len: usize, o
 }
 
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn otools_plugin_free(ptr: *mut u8, len: usize) {
     if !ptr.is_null() {
         unsafe { drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len))); }

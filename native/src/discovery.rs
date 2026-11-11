@@ -400,8 +400,10 @@ async fn handle_frame(state: &DiscoveryShared, bytes: &[u8], source: SocketAddr)
         return;
     };
     if info.fingerprint == state.local_fingerprint {
-        // Self echo (multicast loopback is disabled, but multi-NIC hosts can
-        // still bounce our own frame back to us).
+        // Self echo: multicast loopback is intentionally ON (see
+        // `bind_multicast_socket` — disabling it makes same-host peers
+        // invisible on Windows), so our own announce frames legitimately
+        // come back to us; filter them by fingerprint here.
         return;
     }
     let is_new = state.devices.upsert(info.clone(), source.ip());

@@ -514,13 +514,14 @@ async function cmdServe(opts) {
     const hash = crypto.createHash('sha256');
     const handle = await fs.promises.open(target, 'w');
     let bytes = 0;
+    const read = makeBodyReader(req);
     try {
-      const buffer = Buffer.alloc(64 * 1024);
       for (;;) {
-        const { bytesRead } = await readChunk(req, buffer);
+        const bytesRead = await read();
         if (bytesRead === 0) break;
-        hash.update(buffer.subarray(0, bytesRead));
-        await handle.write(buffer.subarray(0, bytesRead));
+        const slice = read.buffer.subarray(0, bytesRead);
+        hash.update(slice);
+        await handle.write(slice);
         bytes += bytesRead;
         if (receiver.slowMs) await sleep(receiver.slowMs);
       }
@@ -534,7 +535,7 @@ async function cmdServe(opts) {
       return jsonReply(res, 422, { error: 'Checksum mismatch' });
     }
     session.uploaded.add(fileId);
-    emit({ event: 'uploaded', sessionId, fileId, bytes, path: target });
+    emit({ event: 'uploaded', sessionId, fileId, fileName: entry?.fileName, bytes, path: target });
     if (session.uploaded.size === session.files.size) {
       session.status = 'done';
       emit({ event: 'done', sessionId, status: 'done' });
@@ -547,36 +548,88 @@ async function cmdServe(opts) {
   process.on('SIGTERM', () => process.exit(0));
 }
 
-/** Read one chunk from the request body into `buffer`; 0 bytes means EOF. */
-function readChunk(req, buffer) {
-  return new Promise((resolve, reject) => {
-    if (req.readableEnded) return resolve({ bytesRead: 0 });
-    const onData = (chunk) => {
-      cleanup();
-      const copied = chunk.copy(buffer, 0, 0, Math.min(chunk.length, buffer.length));
-      // If the chunk exceeds the buffer, the remainder would be lost — our
-      // sender never produces such chunks (64 KiB buffer vs 256 KiB reads on
-      // the wire would). Consume everything to be safe.
-      resolve({ bytesRead: copied, rest: chunk.subarray(copied) });
-    };
-    const onEnd = () => {
-      cleanup();
-      resolve({ bytesRead: 0 });
-    };
-    const onError = (error) => {
-      cleanup();
-      reject(error);
-    };
-    function cleanup() {
-      req.removeListener('data', onData);
-      req.removeListener('end', onEnd);
-      req.removeListener('error', onError);
+/**
+ * Bounded streaming reader for a request body: each `read()` copies up to
+ * 64 KiB into an internal buffer and returns the byte count; 0 means EOF.
+ * Chunks larger than the buffer are split and the remainder is carried into
+ * the following read — the previous readChunk dropped everything past the
+ * first 64 KiB of an oversized chunk (latent corruption). A client abort
+ * mid-body surfaces as an error instead of a silent 0-byte EOF, and the
+ * socket is paused while a produced piece waits for the next read, so the
+ * body is never buffered whole in memory.
+ */
+function makeBodyReader(req) {
+  const size = 64 * 1024;
+  const buffer = Buffer.alloc(size);
+  const queue = []; // unconsumed pieces: { data, offset }
+  let waiter = null; // pending { resolve, reject } of a waiting read
+  let ended = false;
+  let failure = null;
+
+  function settle() {
+    if (!waiter) return;
+    if (queue.length > 0) {
+      const copied = takeInto();
+      waiter.resolve(copied);
+      waiter = null;
+    } else if (ended) {
+      waiter.resolve(0);
+      waiter = null;
+    } else if (failure) {
+      waiter.reject(failure);
+      waiter = null;
     }
-    req.on('data', onData);
-    req.on('end', onEnd);
-    req.on('error', onError);
-    req.resume();
+  }
+
+  function takeInto() {
+    const item = queue[0];
+    const wanted = Math.min(buffer.length, item.data.length - item.offset);
+    const copied = item.data.copy(buffer, 0, item.offset, item.offset + wanted);
+    item.offset += copied;
+    if (item.offset >= item.data.length) queue.shift();
+    return copied;
+  }
+
+  const abort = () => {
+    ended = true;
+    failure = failure ?? new Error('request aborted by the sender');
+    settle();
+  };
+  req.on('data', (chunk) => {
+    queue.push({ data: chunk, offset: 0 });
+    if (!waiter) req.pause(); // backpressure: nothing is consuming right now
+    settle();
   });
+  req.on('end', () => {
+    ended = true;
+    settle();
+  });
+  req.on('aborted', abort);
+  req.on('error', (error) => {
+    failure = failure ?? error;
+    ended = true;
+    settle();
+  });
+  req.on('close', () => {
+    if (!ended) abort();
+  });
+
+  read.buffer = buffer;
+  return read;
+
+  function read() {
+    if (queue.length > 0) {
+      const copied = takeInto();
+      req.resume(); // one piece consumed: let the next chunk flow
+      return Promise.resolve(copied);
+    }
+    if (ended && !failure) return Promise.resolve(0);
+    if (failure) return Promise.reject(failure);
+    req.resume(); // keep the stream flowing while we wait
+    return new Promise((resolve, reject) => {
+      waiter = { resolve, reject };
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------

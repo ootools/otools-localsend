@@ -1,0 +1,14 @@
+/* 深色友好的基线：骨架阶段固定深色调，Task 11 接入主题方案时再抽离。 */
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+}

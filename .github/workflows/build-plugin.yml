@@ -1,0 +1,56 @@
+# 构建插件原生库（lib/Windows.dll）与前端（dist/）并上传产物。
+# 触发：push 到 main、PR、手动。
+#
+# v1 仅产出 lib/Windows.dll，因此固定 windows-latest。
+# scripts/build-native.mjs（Task 3）与 scripts/build-web.mjs（Task 10）就位之前，
+# 本工作流会因脚本缺失而失败，属预期；不使用 continue-on-error。
+name: build-plugin
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm 版本取 package.json 的 packageManager 字段（对齐 ai-switch）；
+      # 不要在此硬编码 version 输入，否则与 packageManager 冲突会导致 action 报错。
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 构建原生库
+        run: node scripts/build-native.mjs
+
+      - name: 构建前端
+        run: node scripts/build-web.mjs
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-dist
+          path: dist/
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-lib
+          path: lib/
+          if-no-files-found: error

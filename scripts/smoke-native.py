@@ -104,6 +104,41 @@ def main():
         assert now["ok"] is True and now["data"]["ok"] is True, f"discover_now after start: {now}"
         print(f"PASS: start_localsend binds discovery on UDP {udp_port}, device_list/discover_now ok")
 
+        # Task 7: HTTPS v2 server. The server binds TCP independently of the
+        # UDP discovery socket (own fallback window); poll server_status for
+        # the actual port.
+        status = invoke("server_status")
+        assert status["ok"] is True, f"server_status: {status.get('error')}"
+        assert status["data"]["protocol"] == "https", f"unexpected protocol: {status['data']}"
+        deadline = time.monotonic() + 5
+        while status["data"]["port"] == 0 and time.monotonic() < deadline:
+            time.sleep(0.1)
+            status = invoke("server_status")
+        https_port = status["data"]["port"]
+        assert 53318 <= https_port <= 53328, f"https port outside the fallback range: {https_port}"
+        fingerprint = status["data"]["fingerprint"]
+        assert isinstance(fingerprint, str) and len(fingerprint) == 64, f"fingerprint: {fingerprint}"
+        assert status["data"]["error"] is None, f"unexpected bind error: {status['data']}"
+        print(f"PASS: server_status records the actual HTTPS port TCP {https_port} with fingerprint")
+
+        events = drain_events()
+        status_events = [e for e in events if e["event"] == "server-status" and "port" in e["data"]]
+        assert status_events, f"server-status event missing after start: {events}"
+        latest = status_events[-1]["data"]
+        assert latest["port"] == https_port, f"event port mismatch: {latest}"
+        assert latest["protocol"] == "https", f"event protocol: {latest}"
+        assert latest["fingerprint"] == fingerprint, f"event fingerprint mismatch: {latest}"
+        print("PASS: server-status event carries the actual https port, protocol and fingerprint")
+
+        transfers = invoke("transfer_list")
+        assert transfers["ok"] is True, f"transfer_list: {transfers.get('error')}"
+        assert transfers["data"]["transfers"] == [], f"unexpected history: {transfers['data']}"
+        for method in ("session_accept", "session_decline", "session_cancel"):
+            bogus = invoke(method, {"sessionId": "bogus"})
+            assert bogus["ok"] is False, f"{method} with a bogus id must fail: {bogus}"
+            assert "session not found" in bogus.get("error", ""), f"unexpected error: {bogus}"
+        print("PASS: transfer_list ok and bogus session ids rejected on all session endpoints")
+
         assert invoke("__otools_shutdown__")["ok"] is True
         retired = invoke("settings_get")
         assert retired["ok"] is False and retired.get("error") == "plugin retired", f"expected retired: {retired}"

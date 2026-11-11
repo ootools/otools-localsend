@@ -3,6 +3,7 @@ pub mod discovery;
 pub mod event_bridge;
 pub mod models;
 pub mod runtime;
+pub mod server;
 pub mod settings;
 
 use serde_json::{json, Value};

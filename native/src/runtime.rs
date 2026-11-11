@@ -1,10 +1,12 @@
 use crate::crypto::{self, CertMaterial};
 use crate::discovery::{self, DiscoveryShared};
 use crate::event_bridge::WebEventBroadcaster;
+use crate::server::{self, ReceiveSessions, ServerShared};
 use crate::settings::{self, Settings};
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tokio::runtime::{Builder, Runtime};
 
 static PLUGIN: OnceLock<Mutex<Slot>> = OnceLock::new();
@@ -27,6 +29,12 @@ struct PluginRuntime {
     /// spawned discovery task holds its own `Arc`, so this handle stays valid
     /// for the dispatch methods.
     discovery: Option<Arc<DiscoveryShared>>,
+    /// Live settings snapshot the server reads (pin, auto_save, download dir).
+    settings_snapshot: Arc<RwLock<Settings>>,
+    /// Receive-session state machine + transfer history.
+    receive: Arc<ReceiveSessions>,
+    /// HTTPS server state, present once the background shell has started.
+    server: Option<Arc<ServerShared>>,
 }
 
 impl PluginRuntime {
@@ -40,17 +48,26 @@ impl PluginRuntime {
         let data_dir = settings::resolve_data_dir()?;
         std::fs::create_dir_all(&data_dir)
             .map_err(|error| format!("create data dir {}: {error}", data_dir.display()))?;
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let settings_snapshot = Arc::new(RwLock::new(settings::load(&data_dir)));
+        let receive = Arc::new(
+            ReceiveSessions::new(&data_dir, Arc::clone(&broadcaster))
+                .map_err(|error| format!("receive sessions: {error}"))?,
+        );
         Ok(Self {
             runtime,
             data_dir,
             cert: None,
-            broadcaster: Arc::new(WebEventBroadcaster::new()),
+            broadcaster,
             discovery: None,
+            settings_snapshot,
+            receive,
+            server: None,
         })
     }
 
     fn shutdown(self) {
-        // Dropping the runtime aborts the discovery (and later server) tasks
+        // Dropping the runtime aborts the discovery and HTTPS server tasks
         // before the DLL can unload.
         drop(self.runtime);
     }
@@ -100,14 +117,24 @@ pub fn invoke(method: &str, payload: Value) -> Result<Value, String> {
             update
                 .save(&plugin.data_dir)
                 .map_err(|error| format!("save settings: {error}"))?;
+            *plugin
+                .settings_snapshot
+                .write()
+                .unwrap_or_else(|error| error.into_inner()) = update.clone();
             // Keep our announcement payload in sync with the new settings so
             // the next announce frame carries the fresh alias/model/port.
+            // The announced port stays the ACTUAL bound HTTPS port while the
+            // server is up (a settings port change takes effect on restart).
             if let Some(shared) = &plugin.discovery {
                 if let Some(cert) = &plugin.cert {
-                    shared.update_local_info(discovery::local_info_from_settings(
-                        &update,
-                        &cert.fingerprint,
-                    ));
+                    let mut info = discovery::local_info_from_settings(&update, &cert.fingerprint);
+                    if let Some(server) = &plugin.server {
+                        let bound = server.server_port.load(Ordering::SeqCst);
+                        if bound != 0 {
+                            info.port = bound;
+                        }
+                    }
+                    shared.update_local_info(info);
                 }
             }
             serde_json::to_value(update).map_err(|error| error.to_string())
@@ -135,13 +162,72 @@ pub fn invoke(method: &str, payload: Value) -> Result<Value, String> {
             }
             Ok(json!({ "ok": true }))
         }
+        "session_accept" => {
+            let session_id = require_session_id(&payload)?;
+            let file_ids: Option<Vec<String>> = payload
+                .get("fileIds")
+                .and_then(Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                });
+            let accepted = server::session_accept(&plugin.receive, &session_id, file_ids)?;
+            Ok(json!({ "accepted": accepted }))
+        }
+        "session_decline" => {
+            let session_id = require_session_id(&payload)?;
+            server::session_decline(&plugin.receive, &session_id)?;
+            Ok(json!({}))
+        }
+        "session_cancel" => {
+            let session_id = require_session_id(&payload)?;
+            server::session_cancel(&plugin.receive, &session_id)?;
+            Ok(json!({}))
+        }
+        "transfer_list" => Ok(json!({
+            "transfers": server::transfer_records(&plugin.receive),
+        })),
+        "server_status" => {
+            let (port, error) = plugin
+                .server
+                .as_ref()
+                .map(|server| {
+                    (
+                        server.server_port.load(Ordering::SeqCst),
+                        server
+                            .bind_error
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .clone(),
+                    )
+                })
+                .unwrap_or((0, None));
+            let fingerprint = plugin.cert.as_ref().map(|cert| cert.fingerprint.clone());
+            Ok(json!({
+                "port": port,
+                "protocol": "https",
+                "fingerprint": fingerprint,
+                "error": error,
+            }))
+        }
         _ => Err(format!("unknown method: {method}")),
     }
 }
 
+fn require_session_id(payload: &Value) -> Result<String, String> {
+    payload
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .ok_or("payload.sessionId is required".to_string())
+}
+
 /// Autostart entry: ensure the runtime exists, generate or load the instance
 /// certificate, then spawn-and-return the background shell with the UDP
-/// discovery loop attached. The HTTPS server attaches in Task 7.
+/// discovery loop and the HTTPS v2 server attached.
 pub fn start_background() -> Result<(), String> {
     let lock = PLUGIN.get_or_init(|| Mutex::new(Slot::Empty));
     let mut guard = lock.lock().unwrap_or_else(|error| error.into_inner());
@@ -165,6 +251,10 @@ fn start_background_locked(guard: &mut Slot) -> Result<(), String> {
     if plugin.discovery.is_none() {
         let cert = plugin.cert.as_ref().expect("certificate ensured above");
         let loaded = settings::load(&plugin.data_dir);
+        *plugin
+            .settings_snapshot
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = loaded.clone();
         let shared = Arc::new(DiscoveryShared::new(
             discovery::local_info_from_settings(&loaded, &cert.fingerprint),
             Arc::clone(&plugin.broadcaster),
@@ -173,6 +263,26 @@ fn start_background_locked(guard: &mut Slot) -> Result<(), String> {
             .runtime
             .spawn(discovery::run_discovery(Arc::clone(&shared), loaded.port));
         plugin.discovery = Some(shared);
+    }
+    // Idempotent: the HTTPS server task is spawned only once, after the
+    // certificate is ready. The server and discovery bind independently —
+    // each applies its own port fallback.
+    if plugin.server.is_none() {
+        let cert = plugin.cert.as_ref().expect("certificate ensured above").clone();
+        let server_shared = Arc::new(ServerShared {
+            sessions: Arc::clone(&plugin.receive),
+            settings: Arc::clone(&plugin.settings_snapshot),
+            broadcaster: Arc::clone(&plugin.broadcaster),
+            data_dir: plugin.data_dir.clone(),
+            cert,
+            server_port: std::sync::atomic::AtomicU16::new(0),
+            bind_error: Mutex::new(None),
+            discovery: plugin.discovery.clone(),
+        });
+        plugin
+            .runtime
+            .spawn(server::run_server(Arc::clone(&server_shared)));
+        plugin.server = Some(server_shared);
     }
     Ok(())
 }
@@ -247,6 +357,44 @@ mod tests {
         let devices = invoke("device_list", json!({})).expect("device_list after start");
         assert!(devices["devices"].is_array());
         assert!(devices["udpPort"].is_u64());
+
+        // Task 7: the HTTPS server binds asynchronously; poll for the port.
+        let mut status = invoke("server_status", json!({})).expect("server_status");
+        assert_eq!(status["protocol"], json!("https"));
+        assert_eq!(status["port"], json!(0), "unbound before the task runs");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while status["port"] == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            status = invoke("server_status", json!({})).expect("server_status");
+        }
+        let https_port = status["port"].as_u64().expect("bound port");
+        assert!(
+            (53317..=53327).contains(&https_port),
+            "https port outside the fallback range: {https_port}"
+        );
+        assert_eq!(
+            status["fingerprint"].as_str(),
+            Some(fingerprint.as_str()),
+            "server_status carries the certificate fingerprint"
+        );
+
+        // Receive surface: empty history and bogus session ids rejected.
+        let transfers = invoke("transfer_list", json!({})).expect("transfer_list");
+        assert!(transfers["transfers"].is_array());
+        let bogus = invoke("session_accept", json!({ "sessionId": "bogus" }))
+            .expect_err("bogus session_accept must fail");
+        assert!(
+            bogus.contains("session not found"),
+            "unexpected error: {bogus}"
+        );
+        assert!(
+            invoke("session_decline", json!({ "sessionId": "bogus" })).is_err(),
+            "bogus session_decline must fail"
+        );
+        assert!(
+            invoke("session_cancel", json!({ "sessionId": "bogus" })).is_err(),
+            "bogus session_cancel must fail"
+        );
 
         let cert_pem =
             std::fs::read_to_string(temp.path().join("cert.pem")).expect("cert.pem in data dir");

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// LocalSend v2 device announcement/registration DTO.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,4 +61,9 @@ pub struct TransferRecord {
     pub files: Vec<FileEntry>,
     pub status: TransferStatus,
     pub created_at: u64,
+    /// Final destination (absolute path) of every received file, keyed by
+    /// fileId. Filled when a receive session reaches a terminal state; empty
+    /// for send-direction records.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub destinations: HashMap<String, String>,
 }

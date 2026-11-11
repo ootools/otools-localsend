@@ -41,16 +41,47 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::oneshot;
 
 /// A stalled receive session older than this is swept so it cannot pin the
 /// single-active-session rule forever (cancelled with a `transfer-done`).
 const SESSION_EXPIRY_MS: u64 = 30 * 60 * 1000;
 /// Pause between HTTPS bind attempts (matches the discovery loop's cadence).
 const BIND_RETRY_PAUSE: Duration = Duration::from_secs(5);
+/// Maximum failed PIN attempts per IP before requests are blocked with 429
+/// (official `MAX_PIN_ATTEMPTS`, packages/core/src/http/server/common/pin.rs).
+const MAX_PIN_ATTEMPTS: u32 = 3;
+/// How often an upload of the same file may be started, i.e. how often a
+/// sender may retry after a checksum mismatch (official `MAX_UPLOAD_ATTEMPTS`,
+/// packages/core/src/http/server/v2.rs, mirrored by the sender isolate's
+/// `_maxUploadAttempts = 3`).
+const MAX_UPLOAD_ATTEMPTS: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Receive-session state machine
 // ---------------------------------------------------------------------------
+
+/// The user's decision on a manual (Pending) receive session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// Accept (a possibly empty subset of files was tokenized).
+    Accept,
+    /// Decline — the suspended sender receives 403 "Rejected".
+    Decline,
+}
+
+/// What [`prepare_upload`] decided to do with the request.
+pub enum PrepareOutcome {
+    /// Answer immediately (auto-accept path, PIN failures, busy slot, ...).
+    Immediate { status: u16, body: Value },
+    /// Manual mode: the session was stored as Pending and the HTTP response
+    /// is held until the user decides (official v2 behavior). `decision_rx`
+    /// resolves the suspended request.
+    AwaitDecision {
+        session_id: String,
+        decision_rx: oneshot::Receiver<Decision>,
+    },
+}
 
 /// State of one incoming transfer, keyed by session id. Mirrors the v2
 /// receiver lifecycle: Pending (manual accept) or Transferring (auto-save) →
@@ -63,13 +94,18 @@ pub struct ReceiveSession {
     pub tokens: HashMap<String, String>,
     pub status: TransferStatus,
     pub sender_ip: IpAddr,
-    pub pin_ok: bool,
     pub created_at: u64,
     pub temp_dir: PathBuf,
     /// File ids whose upload completed (sha256 verified when provided).
     pub uploaded: HashSet<String>,
     /// File ids that failed (sha256 mismatch, IO error, aborted body).
     pub failed: HashSet<String>,
+    /// sha256 mismatch count per fileId; from [`MAX_UPLOAD_ATTEMPTS`] the file
+    /// is terminal instead of being reset for another retry.
+    pub attempts: HashMap<String, u32>,
+    /// Manual mode only: resolves the suspended prepare-upload handler.
+    /// Taken and sent outside the inner lock (never held across `send`).
+    pub decision_tx: Option<oneshot::Sender<Decision>>,
 }
 
 struct Inner {
@@ -77,6 +113,8 @@ struct Inner {
     records: Vec<TransferRecord>,
     /// Coalescing state for `transfer-progress` per (sessionId, fileId).
     progress: HashMap<(String, String), (u32, Value, Instant)>,
+    /// Failed PIN attempts per source IP (official `pin_attempts`).
+    pin_failures: HashMap<IpAddr, (u32, Instant)>,
 }
 
 impl TransferStatus {
@@ -113,11 +151,13 @@ impl Default for TransfersFile {
 impl ReceiveSessions {
     /// Create the store for `data_dir`, loading transfers.json history.
     /// A missing or unreadable history file starts with an empty list.
+    /// Residual non-terminal records (a restart happened mid-transfer) are
+    /// marked Failed — the historical truth — and the correction is persisted.
     pub fn new(data_dir: &Path, events: Arc<WebEventBroadcaster>) -> Result<Self, String> {
         std::fs::create_dir_all(data_dir)
             .map_err(|error| format!("create data dir {}: {error}", data_dir.display()))?;
         let transfers_path = data_dir.join("transfers.json");
-        let records = match std::fs::read(&transfers_path) {
+        let mut records = match std::fs::read(&transfers_path) {
             Ok(bytes) => match serde_json::from_slice::<TransfersFile>(&bytes) {
                 Ok(file) => file.transfers,
                 Err(error) => {
@@ -129,11 +169,22 @@ impl ReceiveSessions {
             },
             Err(_) => Vec::new(),
         };
+        let mut residual_failed = false;
+        for record in &mut records {
+            if !record.status.is_terminal() {
+                record.status = TransferStatus::Failed;
+                residual_failed = true;
+            }
+        }
+        if residual_failed {
+            persist_records(&records, &transfers_path);
+        }
         Ok(Self {
             inner: Mutex::new(Inner {
                 sessions: HashMap::new(),
                 records,
                 progress: HashMap::new(),
+                pin_failures: HashMap::new(),
             }),
             tmp_root: data_dir.join("tmp"),
             transfers_path,
@@ -153,28 +204,42 @@ impl ReceiveSessions {
 
     /// Cancel every non-terminal session older than [`SESSION_EXPIRY_MS`].
     /// Called from prepare-upload so a dead transfer cannot hold the
-    /// single-session slot forever.
+    /// single-session slot forever. A stale Pending session resolves its
+    /// suspended sender with 403 (Decline path) instead of hanging forever.
     fn sweep_expired(&self) {
         let now = now_ms();
-        let expired: Vec<(String, PathBuf)> = {
+        let expired: Vec<(String, PathBuf, Option<oneshot::Sender<Decision>>)> = {
             let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-            let expired: Vec<(String, PathBuf)> = inner
+            let expired: Vec<(String, PathBuf, Option<oneshot::Sender<Decision>>)> = inner
                 .sessions
-                .values()
+                .values_mut()
                 .filter(|session| {
                     !session.status.is_terminal()
                         && now.saturating_sub(session.created_at) >= SESSION_EXPIRY_MS
                 })
-                .map(|session| (session.session_id.clone(), session.temp_dir.clone()))
+                .map(|session| {
+                    (
+                        session.session_id.clone(),
+                        session.temp_dir.clone(),
+                        session.decision_tx.take(),
+                    )
+                })
                 .collect();
-            for (session_id, _) in &expired {
+            for (session_id, _, _) in &expired {
                 inner.sessions.remove(session_id);
                 self.update_record(&mut inner, session_id, TransferStatus::Cancelled, None);
             }
+            // PIN failure counters from before the pause window expire too.
+            inner
+                .pin_failures
+                .retain(|_, (_, last)| last.elapsed() < Duration::from_millis(SESSION_EXPIRY_MS));
             expired
         };
-        for (session_id, temp_dir) in expired {
+        for (session_id, temp_dir, decision_tx) in expired {
             let _ = std::fs::remove_dir_all(temp_dir);
+            if let Some(decision_tx) = decision_tx {
+                let _ = decision_tx.send(Decision::Decline);
+            }
             self.events.send(
                 "transfer-done",
                 json!({ "sessionId": session_id, "status": "cancelled" }),
@@ -194,10 +259,59 @@ impl ReceiveSessions {
     }
 
     fn cancel_session(&self, session_id: &str) -> Result<(), String> {
+        let (temp_dir, decision_tx) = {
+            let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            let Some(session) = inner.sessions.get_mut(session_id) else {
+                return Err(format!("session not found: {session_id}"));
+            };
+            let temp_dir = session.temp_dir.clone();
+            let was_active = !session.status.is_terminal();
+            let decision_tx = session.decision_tx.take();
+            inner.sessions.remove(session_id);
+            if was_active {
+                self.update_record(&mut inner, session_id, TransferStatus::Cancelled, None);
+            }
+            (temp_dir, decision_tx)
+        };
+        let _ = std::fs::remove_dir_all(temp_dir);
+        if let Some(decision_tx) = decision_tx {
+            // A still-connected sender receives the 403 through its suspended
+            // prepare-upload handler; a disconnected one needs no reply.
+            let _ = decision_tx.send(Decision::Decline);
+        }
+        self.events.send(
+            "transfer-done",
+            json!({ "sessionId": session_id, "status": "cancelled" }),
+        );
+        Ok(())
+    }
+
+    /// Official `/cancel` without a sessionId: the sender does not know the
+    /// session id yet (it is part of the pending response), so a cancel from
+    /// the pending sender's address resolves that session as a decline.
+    pub fn decline_pending_from(&self, ip: IpAddr) {
+        let session_id = {
+            let inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            inner
+                .sessions
+                .values()
+                .find(|session| {
+                    session.status == TransferStatus::Pending && session.sender_ip == ip
+                })
+                .map(|session| session.session_id.clone())
+        };
+        if let Some(session_id) = session_id {
+            let _ = self.cancel_session(&session_id);
+        }
+    }
+
+    /// Sender-disconnect cleanup (official PendingSessionGuard): remove the
+    /// session, record it Cancelled and free the single-session slot.
+    fn abort_session(&self, session_id: &str) {
         let temp_dir = {
             let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
             let Some(session) = inner.sessions.get(session_id) else {
-                return Err(format!("session not found: {session_id}"));
+                return;
             };
             let temp_dir = session.temp_dir.clone();
             let was_active = !session.status.is_terminal();
@@ -212,57 +326,89 @@ impl ReceiveSessions {
             "transfer-done",
             json!({ "sessionId": session_id, "status": "cancelled" }),
         );
-        Ok(())
     }
 
-    /// Issue tokens for the requested files of a Pending session and move it
-    /// to Transferring. `None` accepts every file; unknown ids are skipped.
-    /// Returns the sorted accepted file ids.
+    /// Issue tokens for the requested files of a Pending session, move it to
+    /// Transferring and resolve the suspended prepare-upload sender with the
+    /// Accept decision. `None` accepts every file; unknown ids are skipped.
+    /// Returns the sorted accepted file ids (empty → the sender gets 204,
+    /// nothing to transfer).
     pub fn session_accept(
         &self,
         session_id: &str,
         file_ids: Option<Vec<String>>,
     ) -> Result<Vec<String>, String> {
-        let accepted = {
+        let (accepted, decision_tx, finished_empty) = {
             let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-            let session = inner
-                .sessions
-                .get_mut(session_id)
-                .ok_or_else(|| format!("session not found: {session_id}"))?;
-            if session.status != TransferStatus::Pending {
-                return Err(format!(
-                    "session {session_id} is not pending (status {:?})",
-                    session.status
-                ));
-            }
-            let requested: Vec<String> = match file_ids {
-                None => {
-                    let mut all: Vec<String> = session.files.keys().cloned().collect();
-                    all.sort();
-                    all
+            let outcome = {
+                let session = inner
+                    .sessions
+                    .get_mut(session_id)
+                    .ok_or_else(|| format!("session not found: {session_id}"))?;
+                if session.status != TransferStatus::Pending {
+                    return Err(format!(
+                        "session {session_id} is not pending (status {:?})",
+                        session.status
+                    ));
                 }
-                Some(ids) => ids.into_iter().filter(|id| session.files.contains_key(id)).collect(),
+                let requested: Vec<String> = match file_ids {
+                    None => {
+                        let mut all: Vec<String> = session.files.keys().cloned().collect();
+                        all.sort();
+                        all
+                    }
+                    Some(ids) => {
+                        ids.into_iter()
+                            .filter(|id| session.files.contains_key(id))
+                            .collect()
+                    }
+                };
+                let mut accepted = Vec::new();
+                for file_id in requested {
+                    if session.tokens.contains_key(&file_id) {
+                        continue;
+                    }
+                    session
+                        .tokens
+                        .insert(file_id.clone(), uuid::Uuid::new_v4().to_string());
+                    accepted.push(file_id);
+                }
+                accepted.sort();
+                let decision_tx = session.decision_tx.take();
+                session.status = if accepted.is_empty() {
+                    TransferStatus::Done
+                } else {
+                    TransferStatus::Transferring
+                };
+                (accepted, decision_tx)
             };
-            let mut accepted = Vec::new();
-            for file_id in requested {
-                if session.tokens.contains_key(&file_id) {
-                    continue;
-                }
-                session
-                    .tokens
-                    .insert(file_id.clone(), uuid::Uuid::new_v4().to_string());
-                accepted.push(file_id);
-            }
-            if accepted.is_empty() {
-                return Err("no matching files to accept".into());
-            }
-            accepted.sort();
-            session.status = TransferStatus::Transferring;
-            accepted
+            let (accepted, decision_tx) = outcome;
+            let finished_empty = accepted.is_empty();
+            let status = if finished_empty {
+                // Nothing accepted: the suspended sender gets 204 (official
+                // "Nothing to transfer") and the session is finished.
+                TransferStatus::Done
+            } else {
+                TransferStatus::Transferring
+            };
+            self.update_record(&mut inner, session_id, status, None);
+            (accepted, decision_tx, finished_empty)
         };
-        {
-            let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-            self.update_record(&mut inner, session_id, TransferStatus::Transferring, None);
+        if finished_empty {
+            self.events.send(
+                "transfer-done",
+                json!({ "sessionId": session_id, "status": "done" }),
+            );
+        }
+        if let Some(decision_tx) = decision_tx {
+            // Send OUTSIDE the inner lock. A failure means the sender
+            // disconnected while the decision was pending (the suspended
+            // handler was dropped): clean up like the official
+            // PendingSessionGuard and report the abort.
+            if decision_tx.send(Decision::Accept).is_err() {
+                self.abort_session(session_id);
+                return Err(format!("sender disconnected before decision: {session_id}"));
+            }
         }
         Ok(accepted)
     }
@@ -286,15 +432,7 @@ impl ReceiveSessions {
                 record.destinations = destinations;
             }
         }
-        let payload = json!({ "transfers": inner.records });
-        match serde_json::to_vec_pretty(&payload) {
-            Ok(bytes) => {
-                if let Err(error) = std::fs::write(&self.transfers_path, bytes) {
-                    eprintln!("otools-localsend server: persist transfers: {error}");
-                }
-            }
-            Err(error) => eprintln!("otools-localsend server: serialize transfers: {error}"),
-        }
+        persist_records(&inner.records, &self.transfers_path);
     }
 
     fn patch_record_destinations(&self, session_id: &str, destinations: HashMap<String, String>) {
@@ -312,6 +450,19 @@ impl ReceiveSessions {
 /// History snapshot for the runtime `transfer_list` method.
 pub fn transfer_records(sessions: &ReceiveSessions) -> Vec<TransferRecord> {
     sessions.transfer_records()
+}
+
+/// Write the whole history to transfers.json (best effort).
+fn persist_records(records: &[TransferRecord], path: &Path) {
+    let payload = json!({ "transfers": records });
+    match serde_json::to_vec_pretty(&payload) {
+        Ok(bytes) => {
+            if let Err(error) = std::fs::write(path, bytes) {
+                eprintln!("otools-localsend server: persist transfers: {error}");
+            }
+        }
+        Err(error) => eprintln!("otools-localsend server: serialize transfers: {error}"),
+    }
 }
 
 /// Invoke-method surface: `session_accept {sessionId, fileIds?}` — `None`
@@ -377,18 +528,66 @@ fn safe_file_name(entry: &FileEntry) -> String {
     }
 }
 
+/// PIN validation result (official `check_pin` semantics).
+enum PinCheck {
+    Ok,
+    /// Wrong PIN — 401, counts against the per-IP budget.
+    Wrong,
+    /// PIN required — 401, does NOT count against the budget (official).
+    Missing,
+    /// Per-IP budget exhausted — 429, checked before correctness (official).
+    TooMany,
+}
+
+/// Outcome of the PIN check for one prepare-upload request.
+fn check_pin_attempt(
+    sessions: &ReceiveSessions,
+    remote_ip: IpAddr,
+    provided: Option<&str>,
+    expected: &str,
+) -> PinCheck {
+    let mut inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
+    let count = inner
+        .pin_failures
+        .get(&remote_ip)
+        .copied()
+        .unwrap_or((0, Instant::now()))
+        .0;
+    if count >= MAX_PIN_ATTEMPTS {
+        return PinCheck::TooMany;
+    }
+    match provided {
+        Some(pin) if constant_time_eq(pin, expected) => {
+            inner.pin_failures.remove(&remote_ip);
+            PinCheck::Ok
+        }
+        Some(_) => {
+            inner
+                .pin_failures
+                .insert(remote_ip, (count + 1, Instant::now()));
+            PinCheck::Wrong
+        }
+        None => PinCheck::Missing,
+    }
+}
+
 /// The prepare-upload state machine (v2 `POST /prepare-upload`).
 ///
-/// Returns `(status, body)`:
-/// - `204` — no file transfer needed (empty files map);
-/// - `401` — a PIN is set and missing/mismatched;
+/// Immediate outcomes:
+/// - `400` — empty files map ("No files provided") or an unsafe file id;
+/// - `401` — a PIN is set and missing ("PIN required") or wrong ("Invalid
+///   PIN", counts against the per-IP budget);
+/// - `429` — the per-IP PIN budget is exhausted ("Too many requests");
 /// - `409` — another non-terminal receive session is active;
-/// - `400` — a file id is unsafe as a path component;
-/// - `200` — `{sessionId, files: {fileId: token}}` where `files` only
-///   contains accepted files: all of them when auto-save is on (session
-///   Transferring), none while a manual decision is pending (session
-///   Pending; tokens are issued later by [`session_accept`], partial
-///   accepts included).
+/// - `200` — auto-save: `{sessionId, files: {fileId: token}}` for every file
+///   (session Transferring).
+///
+/// Manual mode suspends instead ([`PrepareOutcome::AwaitDecision`]): the
+/// session is stored Pending and the HTTP response is held until the user
+/// decides (official v2 behavior). On Accept the suspended sender receives
+/// `{sessionId, files: {acceptedId: token}}` (204 when nothing was accepted);
+/// on Decline 403 "Rejected". A disconnected sender frees the session at the
+/// next decision (`tx.send` fails → abort, official PendingSessionGuard).
 pub fn prepare_upload(
     sessions: &ReceiveSessions,
     settings: &Settings,
@@ -396,45 +595,75 @@ pub fn prepare_upload(
     files: HashMap<String, FileEntry>,
     pin: Option<String>,
     remote_ip: IpAddr,
-) -> (u16, Value) {
+) -> PrepareOutcome {
     sessions.sweep_expired();
-    if files.is_empty() {
-        return (204, Value::Null);
-    }
+    // Official order: the PIN is validated before the body is even parsed,
+    // so a wrong PIN beats an empty files map.
     if let Some(expected) = &settings.pin {
-        let pin_ok = pin
-            .as_deref()
-            .map(|provided| constant_time_eq(provided, expected))
-            .unwrap_or(false);
-        if !pin_ok {
-            return (401, json!({ "error": "Invalid PIN" }));
+        match check_pin_attempt(sessions, remote_ip, pin.as_deref(), expected) {
+            PinCheck::Ok => {}
+            PinCheck::Wrong => {
+                return PrepareOutcome::Immediate {
+                    status: 401,
+                    body: json!({ "error": "Invalid PIN" }),
+                };
+            }
+            PinCheck::Missing => {
+                return PrepareOutcome::Immediate {
+                    status: 401,
+                    body: json!({ "error": "PIN required" }),
+                };
+            }
+            PinCheck::TooMany => {
+                return PrepareOutcome::Immediate {
+                    status: 429,
+                    body: json!({ "error": "Too many requests" }),
+                };
+            }
         }
     }
+    if files.is_empty() {
+        return PrepareOutcome::Immediate {
+            status: 400,
+            body: json!({ "error": "No files provided" }),
+        };
+    }
     if files.keys().any(|id| !is_safe_file_id(id)) {
-        return (400, json!({ "error": "Invalid body" }));
+        return PrepareOutcome::Immediate {
+            status: 400,
+            body: json!({ "error": "Invalid body" }),
+        };
     }
     if sessions.has_active() {
-        return (409, json!({ "error": "Blocked by another session" }));
+        return PrepareOutcome::Immediate {
+            status: 409,
+            body: json!({ "error": "Blocked by another session" }),
+        };
     }
 
     let session_id = uuid::Uuid::new_v4().to_string();
-    let status = if settings.auto_save {
-        TransferStatus::Transferring
+    let (status, tokens, session_tx, decision_rx) = if settings.auto_save {
+        let tokens: HashMap<String, String> = files
+            .keys()
+            .map(|id| (id.clone(), uuid::Uuid::new_v4().to_string()))
+            .collect();
+        (TransferStatus::Transferring, tokens, None, None)
     } else {
-        TransferStatus::Pending
+        let (decision_tx, decision_rx) = oneshot::channel();
+        (
+            TransferStatus::Pending,
+            HashMap::new(),
+            Some(decision_tx),
+            Some(decision_rx),
+        )
     };
     let temp_dir = sessions.tmp_root.join(&session_id);
     if let Err(error) = std::fs::create_dir_all(&temp_dir) {
-        return (500, json!({ "error": format!("create temp dir: {error}") }));
+        return PrepareOutcome::Immediate {
+            status: 500,
+            body: json!({ "error": format!("create temp dir: {error}") }),
+        };
     }
-    let tokens: HashMap<String, String> = if settings.auto_save {
-        files
-            .keys()
-            .map(|id| (id.clone(), uuid::Uuid::new_v4().to_string()))
-            .collect()
-    } else {
-        HashMap::new()
-    };
     let mut files_list: Vec<FileEntry> = files.values().cloned().collect();
     files_list.sort_by(|a, b| a.id.cmp(&b.id));
     let created_at = now_ms();
@@ -445,11 +674,12 @@ pub fn prepare_upload(
         tokens,
         status,
         sender_ip: remote_ip,
-        pin_ok: true,
         created_at,
         temp_dir,
         uploaded: HashSet::new(),
         failed: HashSet::new(),
+        attempts: HashMap::new(),
+        decision_tx: session_tx,
     };
 
     {
@@ -457,7 +687,10 @@ pub fn prepare_upload(
         // Two concurrent prepares raced past the pre-check; only one may win.
         if inner.sessions.values().any(|session| !session.status.is_terminal()) {
             let _ = std::fs::remove_dir_all(&session.temp_dir);
-            return (409, json!({ "error": "Blocked by another session" }));
+            return PrepareOutcome::Immediate {
+                status: 409,
+                body: json!({ "error": "Blocked by another session" }),
+            };
         }
         inner.sessions.insert(session_id.clone(), session);
         inner.records.push(TransferRecord {
@@ -481,15 +714,62 @@ pub fn prepare_upload(
         }),
     );
 
-    let tokens = {
-        let inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
-        inner
-            .sessions
-            .get(&session_id)
-            .map(|session| session.tokens.clone())
-            .unwrap_or_default()
-    };
-    (200, json!({ "sessionId": session_id, "files": tokens }))
+    match decision_rx {
+        None => {
+            let tokens = {
+                let inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
+                inner
+                    .sessions
+                    .get(&session_id)
+                    .map(|session| session.tokens.clone())
+                    .unwrap_or_default()
+            };
+            PrepareOutcome::Immediate {
+                status: 200,
+                body: json!({ "sessionId": session_id, "files": tokens }),
+            }
+        }
+        Some(decision_rx) => PrepareOutcome::AwaitDecision {
+            session_id,
+            decision_rx,
+        },
+    }
+}
+
+/// Resolve a suspended manual prepare-upload (official v2 behavior).
+///
+/// Accept → the sender receives `{sessionId, files}` with the tokens issued
+/// by [`session_accept`] (204 "nothing to transfer" when the accepted set is
+/// empty); Decline → 403 "Rejected". No timeout: the official server has
+/// none either — a stuck sender is freed by its own client timeout, after
+/// which the next decision aborts the session (`tx.send` fails).
+pub async fn await_user_decision(
+    sessions: Arc<ReceiveSessions>,
+    session_id: String,
+    decision_rx: oneshot::Receiver<Decision>,
+) -> (u16, Value) {
+    match decision_rx.await {
+        Ok(Decision::Accept) => {
+            let tokens = {
+                let inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
+                inner.sessions.get(&session_id).map(|session| session.tokens.clone())
+            };
+            match tokens {
+                Some(tokens) if !tokens.is_empty() => {
+                    (200, json!({ "sessionId": session_id, "files": tokens }))
+                }
+                Some(_) => (204, Value::Null),
+                None => (
+                    // The session vanished concurrently (cancel raced the accept).
+                    403,
+                    json!({ "error": "Rejected" }),
+                ),
+            }
+        }
+        Ok(Decision::Decline) => (403, json!({ "error": "Rejected" })),
+        // The decision channel closed without a decision (runtime shutdown).
+        Err(_) => (403, json!({ "error": "Rejected" })),
+    }
 }
 
 /// Terminal-state payload produced when the last file of a session completes.
@@ -522,9 +802,14 @@ impl ReceiveSessions {
             } else {
                 session.failed.insert(file_id.to_string());
             }
+            // Only accepted (tokenized) files participate in the session
+            // lifecycle — the rest were skipped by a partial accept (official
+            // keeps only the accepted files in the session). When every
+            // accepted file is terminal the session is over.
             let all_terminal = session
                 .files
                 .keys()
+                .filter(|id| session.tokens.contains_key(*id))
                 .all(|id| session.uploaded.contains(id) || session.failed.contains(id));
             if !all_terminal {
                 return None;
@@ -562,6 +847,22 @@ impl ReceiveSessions {
         };
         self.update_record(&mut inner, session_id, plan.status, Some(plan.destinations.clone()));
         Some(plan)
+    }
+}
+
+impl ReceiveSessions {
+    /// Count one sha256 mismatch against the file's retry budget
+    /// ([`MAX_UPLOAD_ATTEMPTS`], official `_maxUploadAttempts`). While the
+    /// budget lasts the file stays retransmittable with the same token
+    /// (official resets it to Pending); once exhausted it is terminal.
+    fn register_mismatch(&self, session_id: &str, file_id: &str) -> bool {
+        let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(session) = inner.sessions.get_mut(session_id) else {
+            return false;
+        };
+        let attempts = session.attempts.entry(file_id.to_string()).or_insert(0);
+        *attempts += 1;
+        *attempts >= MAX_UPLOAD_ATTEMPTS
     }
 }
 
@@ -790,26 +1091,45 @@ pub async fn upload_stream(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
+    // None can mean "no checksum promised for this file" (verify is skipped)
+    // OR "the session vanished mid-stream" (cancelled by UI/sender) — the two
+    // cases must be told apart before comparing.
+    let session_gone;
     let expected_sha = {
         let inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
-        inner
-            .sessions
-            .get(&session_id)
-            .and_then(|session| session.files.get(&file_id))
-            .and_then(|entry| entry.sha256.clone())
+        match inner.sessions.get(&session_id) {
+            None => {
+                session_gone = true;
+                None
+            }
+            Some(session) => {
+                session_gone = false;
+                session.files.get(&file_id).and_then(|entry| entry.sha256.clone())
+            }
+        }
     };
-    let Some(expected_sha) = expected_sha else {
-        // The session vanished while streaming (cancelled by UI/sender).
+    if session_gone {
         let _ = tokio::fs::remove_file(&temp_path).await;
         return (409, json!({ "error": "Blocked by another session" }));
+    }
+    let checksum_ok = match &expected_sha {
+        Some(expected) => expected.eq_ignore_ascii_case(&digest),
+        None => true, // no checksum promised for this file
     };
-    if !expected_sha.eq_ignore_ascii_case(&digest) {
+    if !checksum_ok {
         let _ = tokio::fs::remove_file(&temp_path).await;
-        let plan = sessions.mark_file_terminal(&session_id, &file_id, false, download_dir.as_deref());
-        if let Some(plan) = plan {
-            execute_terminal_plan(Arc::clone(&sessions), plan).await;
+        // Official semantics: the mismatched file is NOT terminal while its
+        // retry budget lasts — the sender re-uploads it with the same token
+        // (attempt 3 = the last one, official MAX_UPLOAD_ATTEMPTS).
+        let exhausted = sessions.register_mismatch(&session_id, &file_id);
+        if exhausted {
+            let plan =
+                sessions.mark_file_terminal(&session_id, &file_id, false, download_dir.as_deref());
+            if let Some(plan) = plan {
+                execute_terminal_plan(Arc::clone(&sessions), plan).await;
+            }
         }
-        return (422, json!({ "error": "Checksum mismatch (sha256)" }));
+        return (422, json!({ "error": "Checksum mismatch" }));
     }
     let plan = sessions.mark_file_terminal(&session_id, &file_id, true, download_dir.as_deref());
     if let Some(plan) = plan {
@@ -915,15 +1235,28 @@ async fn prepare_upload_handler(
             (key, entry)
         })
         .collect();
-    let (status, value) = prepare_upload(
+    match prepare_upload(
         &state.sessions,
         &settings,
         body.info,
         files,
         query.pin,
         addr.ip(),
-    );
-    json_response(status, value)
+    ) {
+        PrepareOutcome::Immediate { status, body } => json_response(status, body),
+        PrepareOutcome::AwaitDecision {
+            session_id,
+            decision_rx,
+        } => {
+            // Manual mode: the response is held until the user decides. If
+            // the sender disconnects, hyper drops this future — the next
+            // decision (accept/decline/sweep) detects the dead channel and
+            // aborts the session (official PendingSessionGuard).
+            let (status, value) =
+                await_user_decision(Arc::clone(&state.sessions), session_id, decision_rx).await;
+            json_response(status, value)
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -968,13 +1301,22 @@ struct CancelQuery {
 }
 
 /// `POST /api/localsend/v2/cancel` — idempotent: an unknown session still
-/// answers 200 with an empty body (v2 semantics).
+/// answers 200 with an empty body (v2 semantics). Without a sessionId, a
+/// cancel from the pending sender's address declines that session (official:
+/// the sender does not know the session id yet — it is part of the pending
+/// response).
 async fn cancel_handler(
     State(state): State<Arc<ServerShared>>,
     Query(query): Query<CancelQuery>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
-    if let Some(session_id) = query.session_id.filter(|id| !id.is_empty()) {
-        let _ = session_cancel(&state.sessions, &session_id);
+    match query.session_id.filter(|id| !id.is_empty()) {
+        Some(session_id) => {
+            let _ = session_cancel(&state.sessions, &session_id);
+        }
+        None => {
+            state.sessions.decline_pending_from(addr.ip());
+        }
     }
     StatusCode::OK.into_response()
 }
@@ -1092,20 +1434,21 @@ pub async fn run_server(state: Arc<ServerShared>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        prepare_upload, session_accept, session_cancel, session_decline, transfer_records,
-        upload_stream, ReceiveSessions,
+        await_user_decision, prepare_upload, session_accept, session_cancel, session_decline,
+        transfer_records, upload_stream, Decision, PrepareOutcome, ReceiveSessions,
     };
     use crate::crypto::sha256_hex;
     use crate::event_bridge::WebEventBroadcaster;
     use crate::models::{DeviceInfo, Direction, FileEntry, TransferRecord, TransferStatus};
     use crate::settings::Settings;
     use axum::body::{Body, Bytes};
-    use serde_json::{json, Value};
+    use serde_json::Value;
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::Path;
     use std::sync::Arc;
     use std::time::Duration;
+    use tokio::sync::oneshot;
 
     const SENDER_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20));
     const OTHER_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99));
@@ -1164,21 +1507,64 @@ mod tests {
         Body::from_stream(tokio_stream::iter(items))
     }
 
-    fn prepare(
+    /// Run prepare_upload expecting an immediate answer (auto-save path and
+    /// all error paths).
+    fn prepare_now(
         sessions: &ReceiveSessions,
         settings: &Settings,
         entries: &[FileEntry],
         pin: Option<&str>,
         ip: IpAddr,
     ) -> (u16, Value) {
-        prepare_upload(
+        match prepare_upload(
             sessions,
             settings,
             sender_info(),
             files_map(entries),
             pin.map(str::to_string),
             ip,
-        )
+        ) {
+            PrepareOutcome::Immediate { status, body } => (status, body),
+            PrepareOutcome::AwaitDecision { .. } => {
+                panic!("expected an immediate prepare outcome")
+            }
+        }
+    }
+
+    /// Run prepare_upload in manual mode expecting the request to suspend.
+    /// Returns the session id plus the decision receiver; drop the receiver
+    /// to simulate a sender disconnect (the suspended handler future died).
+    fn prepare_manual(
+        sessions: &ReceiveSessions,
+        entries: &[FileEntry],
+        ip: IpAddr,
+    ) -> (String, oneshot::Receiver<Decision>) {
+        match prepare_upload(
+            sessions,
+            &settings(false, None),
+            sender_info(),
+            files_map(entries),
+            None,
+            ip,
+        ) {
+            PrepareOutcome::AwaitDecision {
+                session_id,
+                decision_rx,
+            } => (session_id, decision_rx),
+            PrepareOutcome::Immediate { status, body } => {
+                panic!("expected a suspended prepare, got {status} {body}")
+            }
+        }
+    }
+
+    /// Drive a suspended prepare to completion on a background task.
+    fn spawn_waiter(
+        sessions: &Arc<ReceiveSessions>,
+        session_id: String,
+        decision_rx: oneshot::Receiver<Decision>,
+    ) -> tokio::task::JoinHandle<(u16, Value)> {
+        let sessions = Arc::clone(sessions);
+        tokio::spawn(await_user_decision(sessions, session_id, decision_rx))
     }
 
     fn session_status(sessions: &ReceiveSessions, session_id: &str) -> Option<TransferStatus> {
@@ -1239,7 +1625,7 @@ mod tests {
         let config = settings(true, None);
 
         let entries = [file_entry("f1", 10, None), file_entry("f2", 20, None)];
-        let (status, body) = prepare(&sessions, &config, &entries, None, SENDER_IP);
+        let (status, body) = prepare_now(&sessions, &config, &entries, None, SENDER_IP);
 
         assert_eq!(status, 200, "auto-accept prepare must succeed: {body}");
         let session_id = body["sessionId"].as_str().expect("sessionId").to_string();
@@ -1256,7 +1642,6 @@ mod tests {
             assert_eq!(session.tokens["f2"], token2);
             assert_eq!(session.sender.alias, "Mock Sender");
             assert_eq!(session.sender_ip, SENDER_IP);
-            assert!(session.pin_ok);
         }
         assert!(
             sessions.tmp_root().join(&session_id).is_dir(),
@@ -1289,15 +1674,17 @@ mod tests {
         let config = settings(true, Some("123456"));
         let entries = [file_entry("f1", 10, None)];
 
-        let (status, body) = prepare(&sessions, &config, &entries, None, SENDER_IP);
+        let (status, body) = prepare_now(&sessions, &config, &entries, None, SENDER_IP);
         assert_eq!(status, 401, "missing pin: {body}");
-        let (status, _) = prepare(&sessions, &config, &entries, Some("000000"), SENDER_IP);
+        assert_eq!(body["error"], "PIN required", "official message");
+        let (status, body) = prepare_now(&sessions, &config, &entries, Some("000000"), SENDER_IP);
         assert_eq!(status, 401, "wrong pin");
-        let (status, body) = prepare(&sessions, &config, &entries, Some("123456"), SENDER_IP);
+        assert_eq!(body["error"], "Invalid PIN", "official message");
+        let (status, body) = prepare_now(&sessions, &config, &entries, Some("123456"), SENDER_IP);
         assert_eq!(status, 200, "correct pin passes: {body}");
 
         // The failed attempts must not have occupied the single-session slot.
-        let (status, _) = prepare(&sessions, &config, &entries, Some("123456"), SENDER_IP);
+        let (status, _) = prepare_now(&sessions, &config, &entries, Some("123456"), SENDER_IP);
         assert_eq!(status, 409, "the accepted session now blocks a second one");
 
         let incoming = event_data(&events, "incoming-request");
@@ -1317,43 +1704,35 @@ mod tests {
         let config = settings(true, None);
         let entries = [file_entry("f1", 10, None)];
 
-        let (status, first) = prepare(&sessions, &config, &entries, None, SENDER_IP);
+        let (status, first) = prepare_now(&sessions, &config, &entries, None, SENDER_IP);
         assert_eq!(status, 200);
         let first_id = first["sessionId"].as_str().expect("sessionId").to_string();
 
-        let (status, body) = prepare(&sessions, &config, &entries, None, SENDER_IP);
+        let (status, body) = prepare_now(&sessions, &config, &entries, None, SENDER_IP);
         assert_eq!(status, 409, "second active session blocked: {body}");
 
         session_cancel(&sessions, &first_id).expect("cancel the first session");
-        let (status, _) = prepare(&sessions, &config, &entries, None, SENDER_IP);
+        let (status, _) = prepare_now(&sessions, &config, &entries, None, SENDER_IP);
         assert_eq!(status, 200, "a terminal session frees the single slot");
     }
 
-    #[test]
-    fn prepare_upload_pending_when_manual() {
+    #[tokio::test]
+    async fn prepare_upload_pending_when_manual() {
         let temp = tempfile::tempdir().expect("temp dir");
         let events = Arc::new(WebEventBroadcaster::new());
         let sessions =
-            ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions");
-        let config = settings(false, None);
-
+            Arc::new(ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions"));
         let entries = [file_entry("f1", 10, None), file_entry("f2", 20, None)];
-        let (status, body) = prepare(&sessions, &config, &entries, None, SENDER_IP);
 
-        assert_eq!(status, 200, "manual prepare answers immediately: {body}");
-        assert_eq!(
-            body["files"],
-            json!({}),
-            "no tokens before the user accepts"
-        );
-        let session_id = body["sessionId"].as_str().expect("sessionId").to_string();
+        // (a) The manual prepare suspends and stores a Pending session; the
+        // incoming-request event still notifies the panel immediately.
+        let (session_id, decision_rx) = prepare_manual(&sessions, &entries, SENDER_IP);
         {
             let inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
             let session = inner.sessions.get(&session_id).expect("session stored");
             assert_eq!(session.status, TransferStatus::Pending);
             assert!(session.tokens.is_empty(), "no tokens in pending state");
         }
-
         let incoming = event_data(&events, "incoming-request");
         assert_eq!(incoming.len(), 1, "manual mode still notifies the panel");
         assert_eq!(incoming[0]["sessionId"], session_id);
@@ -1361,8 +1740,62 @@ mod tests {
             incoming[0]["files"].as_array().expect("files array").len(),
             2
         );
+
+        // Accept-all resolves the suspended sender with 200 and the tokens.
+        let waiter = spawn_waiter(&sessions, session_id.clone(), decision_rx);
+        let accepted = session_accept(&sessions, &session_id, None).expect("accept all");
+        assert_eq!(accepted, vec!["f1".to_string(), "f2".to_string()]);
+        let (status, body) = waiter.await.expect("waiter task");
+        assert_eq!(status, 200, "accept resolves the suspended sender: {body}");
+        assert_eq!(body["sessionId"], session_id);
+        let token1 = body["files"]["f1"].as_str().expect("f1 token").to_string();
+        let token2 = body["files"]["f2"].as_str().expect("f2 token").to_string();
+        assert!(!token1.is_empty() && !token2.is_empty());
+        assert_ne!(token1, token2);
+        {
+            let inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
+            let session = inner.sessions.get(&session_id).expect("session stored");
+            assert_eq!(session.status, TransferStatus::Transferring);
+            assert_eq!(session.tokens["f1"], token1, "tokens match the response");
+            assert_eq!(session.tokens["f2"], token2);
+        }
+
+        // (b) Decline resolves the suspended sender with 403 "Rejected".
+        session_cancel(&sessions, &session_id).expect("cancel the accepted session");
+        let (session_id, decision_rx) = prepare_manual(&sessions, &entries, SENDER_IP);
+        let waiter = spawn_waiter(&sessions, session_id.clone(), decision_rx);
+        session_decline(&sessions, &session_id).expect("decline");
+        let (status, body) = waiter.await.expect("waiter task");
+        assert_eq!(status, 403, "declined sender");
+        assert_eq!(body["error"], "Rejected");
+        assert_eq!(session_status(&sessions, &session_id), None, "session removed");
         let record = record_snapshot(&sessions, &session_id);
-        assert_eq!(record.status, TransferStatus::Pending);
+        assert_eq!(record.status, TransferStatus::Cancelled);
+
+        // (c) Sender disconnect (handler future dropped): a late accept
+        // detects the dead channel and cleans the session up, freeing the
+        // single-session slot (official PendingSessionGuard).
+        let (session_id, decision_rx) = prepare_manual(&sessions, &entries, SENDER_IP);
+        drop(decision_rx);
+        let error = session_accept(&sessions, &session_id, None)
+            .expect_err("late accept must detect the abort");
+        assert!(error.contains("sender disconnected"), "unexpected: {error}");
+        assert_eq!(session_status(&sessions, &session_id), None, "cleaned up");
+        let record = record_snapshot(&sessions, &session_id);
+        assert_eq!(record.status, TransferStatus::Cancelled);
+
+        // (d) Accepting nothing resolves the suspended sender with 204
+        // ("nothing to transfer", official) and finishes the session.
+        let (session_id, decision_rx) = prepare_manual(&sessions, &entries, SENDER_IP);
+        let waiter = spawn_waiter(&sessions, session_id.clone(), decision_rx);
+        let accepted = session_accept(&sessions, &session_id, Some(vec!["bogus-id".into()]))
+            .expect("empty accept is allowed");
+        assert!(accepted.is_empty());
+        let (status, body) = waiter.await.expect("waiter task");
+        assert_eq!(status, 204, "nothing to transfer: {body}");
+        assert_eq!(session_status(&sessions, &session_id), Some(TransferStatus::Done));
+        let record = record_snapshot(&sessions, &session_id);
+        assert_eq!(record.status, TransferStatus::Done);
     }
 
     #[tokio::test]
@@ -1371,16 +1804,22 @@ mod tests {
         let events = Arc::new(WebEventBroadcaster::new());
         let sessions =
             Arc::new(ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions"));
-        let config = settings(false, None);
         let entries = [file_entry("f1", 10, None), file_entry("f2", 20, None)];
 
-        let (status, body) = prepare(&sessions, &config, &entries, None, SENDER_IP);
-        assert_eq!(status, 200);
-        let session_id = body["sessionId"].as_str().expect("sessionId").to_string();
-
+        // Partial accept: the suspended sender learns ONLY the accepted
+        // file's token; the rest stay tokenless (official files map).
+        let (session_id, decision_rx) = prepare_manual(&sessions, &entries, SENDER_IP);
+        let waiter = spawn_waiter(&sessions, session_id.clone(), decision_rx);
         let accepted = session_accept(&sessions, &session_id, Some(vec!["f1".into()]))
             .expect("partial accept");
         assert_eq!(accepted, vec!["f1".to_string()]);
+        let (status, body) = waiter.await.expect("waiter task");
+        assert_eq!(status, 200, "{body}");
+        assert!(body["files"]["f1"].as_str().is_some(), "accepted token");
+        assert!(
+            body["files"]["f2"].is_null(),
+            "the skipped file has no token in the response"
+        );
         {
             let inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
             let session = inner.sessions.get(&session_id).expect("session stored");
@@ -1402,17 +1841,20 @@ mod tests {
         .await;
         assert_eq!(status, 409, "file without a token is not accepted for upload");
 
-        // Accept-all: fileIds omitted means every file of the session.
+        // Accept-all on a fresh pending session: fileIds omitted means every
+        // file of the session.
         session_cancel(&sessions, &session_id).expect("cancel the first session");
-        let (status, body) = prepare(&sessions, &config, &entries, None, SENDER_IP);
-        assert_eq!(status, 200);
-        let session_id = body["sessionId"].as_str().expect("sessionId").to_string();
+        let (session_id, decision_rx) = prepare_manual(&sessions, &entries, SENDER_IP);
+        let waiter = spawn_waiter(&sessions, session_id.clone(), decision_rx);
         let accepted = session_accept(&sessions, &session_id, None).expect("accept all");
         assert_eq!(accepted, vec!["f1".to_string(), "f2".to_string()]);
+        let (status, body) = waiter.await.expect("waiter task");
+        assert_eq!(status, 200, "{body}");
         let inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
         let session = inner.sessions.get(&session_id).expect("session stored");
         assert_eq!(session.status, TransferStatus::Transferring);
         assert_eq!(session.tokens.len(), 2);
+        assert_eq!(session.tokens["f1"], body["files"]["f1"], "response tokens match");
     }
 
     #[tokio::test]
@@ -1424,7 +1866,7 @@ mod tests {
         let config = settings(true, None);
         let entries = [file_entry("f1", 10, None)];
 
-        let (status, body) = prepare(&sessions, &config, &entries, None, SENDER_IP);
+        let (status, body) = prepare_now(&sessions, &config, &entries, None, SENDER_IP);
         assert_eq!(status, 200);
         let session_id = body["sessionId"].as_str().expect("sessionId").to_string();
         let token = body["files"]["f1"].as_str().expect("token").to_string();
@@ -1490,7 +1932,7 @@ mod tests {
         // session terminates.
         let digest = sha256_hex(b"abcdefghi");
         let entries = [file_entry("f1", 9, Some(&digest))];
-        let (status, body) = prepare(&sessions, &config, &entries, None, SENDER_IP);
+        let (status, body) = prepare_now(&sessions, &config, &entries, None, SENDER_IP);
         assert_eq!(status, 200, "{body}");
         let session_id = body["sessionId"].as_str().expect("sessionId").to_string();
         let token = body["files"]["f1"].as_str().expect("token").to_string();
@@ -1552,39 +1994,60 @@ mod tests {
             "progress events streamed during the upload"
         );
 
-        // Corruption path: a wrong expected hash fails the upload, deletes the
-        // temp file and fails the whole session.
+        // Corruption path: a checksum mismatch does NOT kill the file — the
+        // sender retries the same token up to MAX_UPLOAD_ATTEMPTS (official
+        // _maxUploadAttempts = 3). Only the third mismatch fails the session.
         let entries = [file_entry("f2", 9, Some(&"0".repeat(64)))];
-        let (status, body) = prepare(&sessions, &config, &entries, None, SENDER_IP);
+        let (status, body) = prepare_now(&sessions, &config, &entries, None, SENDER_IP);
         assert_eq!(status, 200, "{body}");
         let bad_session = body["sessionId"].as_str().expect("sessionId").to_string();
         let bad_token = body["files"]["f2"].as_str().expect("token").to_string();
+        let bad_path = sessions.tmp_root().join(&bad_session).join("f2");
 
-        let (status, _) = upload_stream(
-            Arc::clone(&sessions),
-            None,
-            bad_session.clone(),
-            "f2".into(),
-            bad_token,
-            SENDER_IP,
-            body_from_chunks(&[b"abc", b"def", b"ghi"]),
-        )
-        .await;
-        assert_eq!(status, 422, "checksum mismatch");
-        assert!(
-            !sessions.tmp_root().join(&bad_session).join("f2").exists(),
-            "corrupt temp file deleted"
-        );
+        for attempt in 1..=3u32 {
+            let (status, _) = upload_stream(
+                Arc::clone(&sessions),
+                None,
+                bad_session.clone(),
+                "f2".into(),
+                bad_token.clone(),
+                SENDER_IP,
+                body_from_chunks(&[b"abc", b"def", b"ghi"]),
+            )
+            .await;
+            assert_eq!(status, 422, "checksum mismatch on attempt {attempt}");
+            assert!(!bad_path.exists(), "corrupt temp file deleted (attempt {attempt})");
+            if attempt < 3 {
+                assert_eq!(
+                    session_status(&sessions, &bad_session),
+                    Some(TransferStatus::Transferring),
+                    "file reset for retransmission after attempt {attempt}"
+                );
+            }
+        }
         assert_eq!(
             session_status(&sessions, &bad_session),
             Some(TransferStatus::Failed),
-            "the last (failed) file terminates the session"
+            "budget exhausted on the third mismatch"
         );
         let record = record_snapshot(&sessions, &bad_session);
         assert_eq!(record.status, TransferStatus::Failed);
         let done = event_data(&events, "transfer-done");
         assert_eq!(done.len(), 1);
         assert_eq!(done[0]["status"], "failed");
+
+        // A fourth upload against the failed file is blocked outright.
+        let (status, _) = upload_stream(
+            Arc::clone(&sessions),
+            None,
+            bad_session,
+            "f2".into(),
+            bad_token,
+            SENDER_IP,
+            empty_body(),
+        )
+        .await;
+        assert_eq!(status, 409, "failed file is terminal");
     }
 
     #[tokio::test]
@@ -1596,7 +2059,7 @@ mod tests {
         let config = settings(true, None);
         let entries = [file_entry("f1", 10, None)];
 
-        let (status, body) = prepare(&sessions, &config, &entries, None, SENDER_IP);
+        let (status, body) = prepare_now(&sessions, &config, &entries, None, SENDER_IP);
         assert_eq!(status, 200);
         let session_id = body["sessionId"].as_str().expect("sessionId").to_string();
         let token = body["files"]["f1"].as_str().expect("token").to_string();
@@ -1638,12 +2101,10 @@ mod tests {
         let events = Arc::new(WebEventBroadcaster::new());
         let sessions =
             Arc::new(ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions"));
-        let config = settings(false, None);
         let entries = [file_entry("f1", 10, None)];
 
-        let (status, body) = prepare(&sessions, &config, &entries, None, SENDER_IP);
-        assert_eq!(status, 200);
-        let session_id = body["sessionId"].as_str().expect("sessionId").to_string();
+        // The manual prepare suspends; the receiver stays held open here.
+        let (session_id, _decision_rx) = prepare_manual(&sessions, &entries, SENDER_IP);
 
         session_decline(&sessions, &session_id).expect("decline");
         assert_eq!(session_status(&sessions, &session_id), None, "session removed");
@@ -1654,8 +2115,12 @@ mod tests {
         assert_eq!(done[0]["status"], "cancelled");
 
         // The single slot is free again.
-        let (status, _) = prepare(&sessions, &config, &entries, None, SENDER_IP);
-        assert_eq!(status, 200);
+        let (session_id, _decision_rx) = prepare_manual(&sessions, &entries, SENDER_IP);
+        assert_eq!(
+            session_status(&sessions, &session_id),
+            Some(TransferStatus::Pending),
+            "fresh pending session"
+        );
     }
 
     #[tokio::test]
@@ -1668,7 +2133,7 @@ mod tests {
 
         let digest = sha256_hex(b"payload");
         let entries = [file_entry("f1", 7, Some(&digest))];
-        let (status, body) = prepare(&sessions, &config, &entries, None, SENDER_IP);
+        let (status, body) = prepare_now(&sessions, &config, &entries, None, SENDER_IP);
         assert_eq!(status, 200);
         let session_id = body["sessionId"].as_str().expect("sessionId").to_string();
         let token = body["files"]["f1"].as_str().expect("token").to_string();
@@ -1710,7 +2175,7 @@ mod tests {
 
         let digest = sha256_hex(b"payload");
         let entries = [file_entry("f1", 7, Some(&digest))];
-        let (status, body) = prepare(&sessions, &config, &entries, None, SENDER_IP);
+        let (status, body) = prepare_now(&sessions, &config, &entries, None, SENDER_IP);
         assert_eq!(status, 200);
         let session_id = body["sessionId"].as_str().expect("sessionId").to_string();
         let token = body["files"]["f1"].as_str().expect("token").to_string();
@@ -1737,18 +2202,19 @@ mod tests {
         assert_eq!(record.destinations["f1"], target.to_string_lossy());
     }
 
-    #[test]
-    fn transfers_persist_and_reload() {
+    #[tokio::test]
+    async fn transfers_persist_and_reload() {
         let temp = tempfile::tempdir().expect("temp dir");
         let events = Arc::new(WebEventBroadcaster::new());
         let sessions = ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions");
-        let config = settings(false, None);
         let entries = [file_entry("f1", 10, None), file_entry("f2", 20, None)];
 
-        let (status, body) = prepare(&sessions, &config, &entries, None, SENDER_IP);
-        assert_eq!(status, 200);
-        let session_id = body["sessionId"].as_str().expect("sessionId").to_string();
+        let (session_id, _decision_rx) = prepare_manual(&sessions, &entries, SENDER_IP);
         session_accept(&sessions, &session_id, None).expect("accept all");
+        assert_eq!(
+            record_snapshot(&sessions, &session_id).status,
+            TransferStatus::Transferring
+        );
         drop(sessions);
 
         assert!(temp.path().join("transfers.json").is_file());
@@ -1757,8 +2223,19 @@ mod tests {
         let records = transfer_records(&reloaded);
         assert_eq!(records.len(), 1, "history survives a restart");
         let record = record_for(&records, &session_id);
-        assert_eq!(record.status, TransferStatus::Transferring);
+        assert_eq!(
+            record.status,
+            TransferStatus::Failed,
+            "a residual Transferring record is dead after a restart"
+        );
         assert_eq!(record.files.len(), 2);
+        // The correction itself is persisted.
+        let reloaded_again =
+            ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("reload again");
+        assert_eq!(
+            record_for(&transfer_records(&reloaded_again), &session_id).status,
+            TransferStatus::Failed
+        );
     }
 
     #[test]
@@ -1772,14 +2249,17 @@ mod tests {
         for evil in ["../evil", "sub\\dir", "..", ".", "con:stream", ""] {
             let mut files = files_map(&[file_entry("f1", 10, None)]);
             files.insert(evil.to_string(), file_entry("x", 10, None));
-            let (status, body) = prepare_upload(
+            let (status, body) = match prepare_upload(
                 &sessions,
                 &config,
                 sender_info(),
                 files,
                 None,
                 SENDER_IP,
-            );
+            ) {
+                PrepareOutcome::Immediate { status, body } => (status, body),
+                PrepareOutcome::AwaitDecision { .. } => panic!("must be rejected outright"),
+            };
             assert_eq!(status, 400, "unsafe file id {evil:?} rejected: {body}");
         }
 
@@ -1788,6 +2268,102 @@ mod tests {
             inner.sessions.is_empty(),
             "no session is created from an invalid body"
         );
+    }
+
+    #[test]
+    fn prepare_rejects_empty_files() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions =
+            ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions");
+        let config = settings(true, None);
+
+        let (status, body) = match prepare_upload(
+            &sessions,
+            &config,
+            sender_info(),
+            HashMap::new(),
+            None,
+            SENDER_IP,
+        ) {
+            PrepareOutcome::Immediate { status, body } => (status, body),
+            PrepareOutcome::AwaitDecision { .. } => panic!("must be rejected outright"),
+        };
+        assert_eq!(status, 400, "empty files map: {body}");
+        assert_eq!(body["error"], "No files provided", "official message");
+        assert!(transfer_records(&sessions).is_empty());
+    }
+
+    #[test]
+    fn prepare_pin_attempts_rate_limited() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions =
+            ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions");
+        let config = settings(true, Some("123456"));
+        let entries = [file_entry("f1", 10, None)];
+
+        // Three wrong attempts are answered 401; the next request from the
+        // same IP is blocked with 429 before the PIN is even compared
+        // (official MAX_PIN_ATTEMPTS = 3).
+        for attempt in 1..=3u32 {
+            let (status, body) =
+                prepare_now(&sessions, &config, &entries, Some("000000"), SENDER_IP);
+            assert_eq!(status, 401, "wrong pin attempt {attempt}: {body}");
+        }
+        let (status, body) = prepare_now(&sessions, &config, &entries, Some("123456"), SENDER_IP);
+        assert_eq!(status, 429, "budget exhausted, even the correct pin: {body}");
+        assert_eq!(body["error"], "Too many requests", "official message");
+
+        // A different source IP keeps its own budget.
+        let (status, body) = prepare_now(&sessions, &config, &entries, Some("000000"), OTHER_IP);
+        assert_eq!(status, 401, "fresh IP: {body}");
+
+        // No incoming request ever fired for the failed attempts.
+        assert!(event_data(&events, "incoming-request").is_empty());
+    }
+
+    #[tokio::test]
+    async fn partial_accept_terminates_when_accepted_files_done() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions =
+            Arc::new(ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions"));
+        let entries = [file_entry("f1", 7, None), file_entry("f2", 9, None)];
+
+        // Partial accept: only f1 is tokenized; f2 is skipped.
+        let (session_id, decision_rx) = prepare_manual(&sessions, &entries, SENDER_IP);
+        let waiter = spawn_waiter(&sessions, session_id.clone(), decision_rx);
+        session_accept(&sessions, &session_id, Some(vec!["f1".into()])).expect("partial accept");
+        let (status, body) = waiter.await.expect("waiter task");
+        assert_eq!(status, 200, "{body}");
+        let token = body["files"]["f1"].as_str().expect("token").to_string();
+
+        // The single accepted file completing ends the session even though
+        // the skipped f2 was never uploaded.
+        let (status, _) = upload_stream(
+            Arc::clone(&sessions),
+            None,
+            session_id.clone(),
+            "f1".into(),
+            token,
+            SENDER_IP,
+            body_from_chunks(&[b"payload"]),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            session_status(&sessions, &session_id),
+            Some(TransferStatus::Done),
+            "accepted files all terminal → session done"
+        );
+        let record = record_snapshot(&sessions, &session_id);
+        assert_eq!(record.status, TransferStatus::Done);
+        assert!(record.destinations.contains_key("f1"));
+        assert!(!record.destinations.contains_key("f2"), "skipped file");
+        let done = event_data(&events, "transfer-done");
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0]["status"], "done");
     }
 
     #[test]

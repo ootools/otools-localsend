@@ -1,19 +1,25 @@
 use crate::crypto::{self, CertMaterial};
-use crate::discovery::{self, DiscoveryShared};
+use crate::discovery::{self, DeviceEntry, DiscoveryShared};
 use crate::event_bridge::WebEventBroadcaster;
+use crate::models::DeviceInfo;
+use crate::sender::{self, SendItem, SendSessions};
 use crate::server::{self, ReceiveSessions, ServerShared};
 use crate::settings::{self, Settings};
 use serde_json::{json, Value};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
 
 static PLUGIN: OnceLock<Mutex<Slot>> = OnceLock::new();
 
 enum Slot {
     Empty,
-    Running(PluginRuntime),
+    /// Boxed: PluginRuntime is large (the tokio runtime dominates) and the
+    /// tiny Empty/Retired variants must not inflate every Slot access.
+    Running(Box<PluginRuntime>),
     Retired,
 }
 
@@ -33,6 +39,9 @@ struct PluginRuntime {
     settings_snapshot: Arc<RwLock<Settings>>,
     /// Receive-session state machine + transfer history.
     receive: Arc<ReceiveSessions>,
+    /// Outbound send jobs (Task 9), present once the background shell has
+    /// started; `session_cancel` consults it alongside `receive`.
+    send: Option<Arc<SendSessions>>,
     /// HTTPS server state, present once the background shell has started.
     server: Option<Arc<ServerShared>>,
 }
@@ -62,6 +71,7 @@ impl PluginRuntime {
             discovery: None,
             settings_snapshot,
             receive,
+            send: None,
             server: None,
         })
     }
@@ -183,8 +193,64 @@ pub fn invoke(method: &str, payload: Value) -> Result<Value, String> {
         }
         "session_cancel" => {
             let session_id = require_session_id(&payload)?;
+            // Outbound jobs first: an in-flight send aborts its uploads and
+            // notifies the peer via POST /cancel, then finalizes its record.
+            if plugin
+                .send
+                .as_ref()
+                .is_some_and(|send| send.cancel_session(&session_id))
+            {
+                return Ok(json!({}));
+            }
             server::session_cancel(&plugin.receive, &session_id)?;
             Ok(json!({}))
+        }
+        "send_files" => {
+            let send = plugin
+                .send
+                .clone()
+                .ok_or("start_localsend must run before sending")?;
+            let ip = require_ip(&payload)?;
+            let port = require_port(&payload)?;
+            let files = payload
+                .get("files")
+                .and_then(Value::as_array)
+                .filter(|list| !list.is_empty())
+                .ok_or("payload.files must be a non-empty array")?;
+            let mut items = Vec::with_capacity(files.len());
+            for file in files {
+                let path = file
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or("each files[] entry needs a non-empty path")?;
+                items.push(SendItem::File(PathBuf::from(path)));
+            }
+            let pin = payload.get("pin").and_then(Value::as_str).map(str::to_string);
+            // Spawn and answer immediately: the session id is generated
+            // locally and the job registered synchronously by `start_send`.
+            let (session_id, run) = sender::start_send(send, ip, port, items, pin)?;
+            plugin.runtime.spawn(run);
+            Ok(json!({ "sessionId": session_id }))
+        }
+        "send_text" => {
+            let send = plugin
+                .send
+                .clone()
+                .ok_or("start_localsend must run before sending")?;
+            let ip = require_ip(&payload)?;
+            let port = require_port(&payload)?;
+            let text = payload
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or("payload.text must be a non-empty string")?
+                .to_string();
+            let pin = payload.get("pin").and_then(Value::as_str).map(str::to_string);
+            let (session_id, run) =
+                sender::start_send(send, ip, port, vec![SendItem::Text(text)], pin)?;
+            plugin.runtime.spawn(run);
+            Ok(json!({ "sessionId": session_id }))
         }
         "transfer_list" => Ok(json!({
             "transfers": server::transfer_records(&plugin.receive),
@@ -225,6 +291,26 @@ fn require_session_id(payload: &Value) -> Result<String, String> {
         .ok_or("payload.sessionId is required".to_string())
 }
 
+fn require_ip(payload: &Value) -> Result<String, String> {
+    payload
+        .get("ip")
+        .and_then(Value::as_str)
+        .filter(|ip| !ip.is_empty())
+        .map(str::to_string)
+        .ok_or("payload.ip is required".to_string())
+}
+
+fn require_port(payload: &Value) -> Result<u16, String> {
+    let port = payload
+        .get("port")
+        .and_then(Value::as_u64)
+        .ok_or("payload.port is required")?;
+    if port == 0 || port > u16::MAX as u64 {
+        return Err(format!("payload.port out of range: {port}"));
+    }
+    Ok(port as u16)
+}
+
 /// Autostart entry: ensure the runtime exists, generate or load the instance
 /// certificate, then spawn-and-return the background shell with the UDP
 /// discovery loop and the HTTPS v2 server attached.
@@ -262,7 +348,18 @@ fn start_background_locked(guard: &mut Slot) -> Result<(), String> {
         plugin
             .runtime
             .spawn(discovery::run_discovery(Arc::clone(&shared), loaded.port));
+        spawn_register_loop(plugin, &shared);
         plugin.discovery = Some(shared);
+    }
+    // Idempotent: the sender surface is created once, after discovery so the
+    // prepare-upload bodies can reuse the announcement payload.
+    if plugin.send.is_none() {
+        let send = Arc::new(SendSessions::new(
+            Arc::clone(&plugin.receive),
+            Arc::clone(&plugin.broadcaster),
+            plugin.discovery.clone(),
+        ));
+        plugin.send = Some(send);
     }
     // Idempotent: the HTTPS server task is spawned only once, after the
     // certificate is ready. The server and discovery bind independently —
@@ -287,6 +384,75 @@ fn start_background_locked(guard: &mut Slot) -> Result<(), String> {
     Ok(())
 }
 
+/// Answer the register replies queued by the discovery loop (Task 9 wiring):
+/// every `announce: true` frame is replied to over HTTP with
+/// `POST /api/localsend/v2/register` to its origin, and the response's peer
+/// DeviceInfo is upserted into the device table. This keeps discovery
+/// symmetric: a peer whose UDP socket fell back off 53317 cannot hear our
+/// announcements, but it still receives this POST and — through the upsert —
+/// we keep a fresh view of it even without its UDP frames.
+async fn register_loop(shared: Arc<DiscoveryShared>, client: reqwest::Client) {
+    loop {
+        for (ip, port, our_info) in shared.take_register_replies() {
+            if port == 0 {
+                // A peer announcing port 0 has no HTTPS listener (send-only
+                // announce); there is nothing to register against.
+                continue;
+            }
+            let url = format!("https://{ip}:{port}{}/register", sender::API_ROOT);
+            let result = client
+                .post(&url)
+                .json(&our_info)
+                .timeout(sender::SHORT_REQUEST_TIMEOUT)
+                .send()
+                .await;
+            match result {
+                Ok(response) if response.status().as_u16() == 200 => {
+                    match response.json::<DeviceInfo>().await {
+                        Ok(info) => match ip.parse::<IpAddr>() {
+                            Ok(source_ip) => {
+                                let is_new = shared.devices.upsert(info.clone(), source_ip);
+                                if is_new {
+                                    let entry = serde_json::to_value(DeviceEntry {
+                                        info,
+                                        ip: ip.clone(),
+                                        last_seen_ms: 0,
+                                    })
+                                    .unwrap_or_else(|_| json!({ "ip": ip }));
+                                    shared.event.send("device-found", entry);
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!("otools-localsend register: source ip {ip}: {error}")
+                            }
+                        },
+                        Err(error) => {
+                            eprintln!("otools-localsend register: decode from {ip}:{port}: {error}")
+                        }
+                    }
+                }
+                Ok(response) => {
+                    eprintln!(
+                        "otools-localsend register: {ip}:{port} answered {}",
+                        response.status()
+                    );
+                }
+                Err(error) => {
+                    eprintln!("otools-localsend register: POST {ip}:{port}: {error}");
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn spawn_register_loop(plugin: &PluginRuntime, shared: &Arc<DiscoveryShared>) {
+    let client = sender::http_client();
+    plugin
+        .runtime
+        .spawn(register_loop(Arc::clone(shared), client));
+}
+
 /// SHA-256 fingerprint (hex) of the instance certificate once the background
 /// shell has started; None before start or after retirement. Tasks 6/7 read
 /// the full [`CertMaterial`] from the runtime state instead.
@@ -301,7 +467,7 @@ pub fn cert_fingerprint() -> Option<String> {
 
 fn ensure_running(guard: &mut Slot) -> Result<&mut PluginRuntime, String> {
     if matches!(*guard, Slot::Empty) {
-        *guard = Slot::Running(PluginRuntime::new()?);
+        *guard = Slot::Running(Box::new(PluginRuntime::new()?));
     }
     match guard {
         Slot::Running(plugin) => Ok(plugin),

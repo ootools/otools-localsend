@@ -139,16 +139,10 @@ pub struct ReceiveSessions {
     events: Arc<WebEventBroadcaster>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(default)]
 struct TransfersFile {
     transfers: Vec<TransferRecord>,
-}
-
-impl Default for TransfersFile {
-    fn default() -> Self {
-        Self { transfers: Vec::new() }
-    }
 }
 
 impl ReceiveSessions {
@@ -481,6 +475,48 @@ impl ReceiveSessions {
     pub fn transfer_records(&self) -> Vec<TransferRecord> {
         let inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         inner.records.clone()
+    }
+
+    /// Insert or refresh the history record of an outbound (Send) session.
+    /// The sender calls this at job start (Pending, entries as offered);
+    /// persists to transfers.json like every other record change.
+    pub fn upsert_send_record(&self, record: TransferRecord) {
+        let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        match inner
+            .records
+            .iter_mut()
+            .find(|existing| existing.session_id == record.session_id)
+        {
+            Some(existing) => {
+                existing.peer_alias = record.peer_alias;
+                existing.files = record.files;
+                existing.status = record.status;
+            }
+            None => inner.records.push(record),
+        }
+        persist_records(&inner.records, &self.transfers_path);
+    }
+
+    /// Move an outbound record to a new status, optionally replacing its
+    /// file entries (e.g. once the streamed checksums have been computed).
+    pub fn set_send_record(
+        &self,
+        session_id: &str,
+        status: TransferStatus,
+        files: Option<Vec<FileEntry>>,
+    ) {
+        let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(record) = inner
+            .records
+            .iter_mut()
+            .find(|record| record.session_id == session_id)
+        {
+            record.status = status;
+            if let Some(files) = files {
+                record.files = files;
+            }
+            persist_records(&inner.records, &self.transfers_path);
+        }
     }
 }
 

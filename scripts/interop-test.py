@@ -736,5 +736,172 @@ def pin_rate_limit():
     return "401 x3 then 429 from 127.0.0.2 (per-IP budget)"
 
 
+@register_scenario
+@scenario
+def send_files():
+    """DLL send_files -> mock serve (accept-all): 2 files received byte-exact
+    (one ~8MB, one named 中文发送.txt); then a slow send is cancelled mid-upload:
+    the mock sees POST /cancel and the DLL record turns Cancelled."""
+    drain_events()
+    mock = MockPeer(
+        ["serve", "--alias", "SendTarget", "--dir", str(CTX["work"] / "mock-receive")]
+    )
+    listening = mock.wait_event("listening", timeout=15)
+    assert listening, f"mock never listened: {mock.diagnostics()}"
+
+    big = make_random_file(CTX["src"], "send-8mb.bin", 8 * MB)
+    chinese = make_text_file(CTX["src"], "中文发送.txt", "中文文件名发送测试\n")
+    result = ok_data(
+        "send_files",
+        {
+            "ip": "127.0.0.1",
+            "port": listening["port"],
+            "files": [{"path": str(big)}, {"path": str(chinese)}],
+        },
+    )
+    session_id = result["sessionId"]
+    assert session_id, f"no sessionId: {result}"
+
+    done = mock.wait_event("done", lambda e: e.get("status") == "done", timeout=120)
+    assert done, f"mock never saw the whole transfer: {mock.diagnostics()}"
+    uploads = mock.of_type("uploaded")
+    assert {u["fileName"] for u in uploads} == {"send-8mb.bin", "中文发送.txt"}, uploads
+    expected_bytes = {"send-8mb.bin": 8 * MB, "中文发送.txt": chinese.stat().st_size}
+    for upload in uploads:
+        assert upload["bytes"] == expected_bytes[upload["fileName"]], (
+            f"uploaded bytes mismatch: {upload}"
+        )
+
+    # DLL side: per-file monotonic progress ending at 100, transfer-done done.
+    percents_by_file = {}
+    finished = None
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and finished is None:
+        for event in drain_events():
+            if event["event"] == "transfer-progress":
+                percents_by_file.setdefault(event["data"]["fileId"], []).append(
+                    event["data"]["percent"]
+                )
+            elif (
+                event["event"] == "transfer-done"
+                and event["data"]["sessionId"] == session_id
+            ):
+                finished = event["data"]
+        if finished is None:
+            time.sleep(0.05)
+    assert finished and finished["status"] == "done", f"no transfer-done: {finished}"
+    assert percents_by_file, "no transfer-progress events drained"
+    for file_id, percents in percents_by_file.items():
+        assert all(b >= a for a, b in zip(percents, percents[1:])), (
+            f"non-monotonic percent for {file_id}: {percents}"
+        )
+        assert percents[-1] == 100, f"final percent for {file_id}: {percents[-1]}"
+
+    record = find_record(session_id)
+    assert record["status"] == "Done", f"record status: {record['status']}"
+    assert record["direction"] == "Send", f"record direction: {record['direction']}"
+    assert {f["fileName"] for f in record["files"]} == {"send-8mb.bin", "中文发送.txt"}
+    assert all(f["sha256"] for f in record["files"]), "checksums must be recorded"
+
+    # Cancel test: a throttled receiver keeps the upload in flight long enough
+    # for session_cancel to abort it (8 MB at --slow-ms 60 ≈ 8s).
+    slow = MockPeer(
+        [
+            "serve",
+            "--alias",
+            "SlowTarget",
+            "--dir",
+            str(CTX["work"] / "mock-slow"),
+            "--slow-ms",
+            "60",
+        ]
+    )
+    slow_listening = slow.wait_event("listening", timeout=15)
+    assert slow_listening, f"slow mock never listened: {slow.diagnostics()}"
+    payload = make_random_file(CTX["src"], "cancel-slow.bin", 8 * MB)
+    result2 = ok_data(
+        "send_files",
+        {
+            "ip": "127.0.0.1",
+            "port": slow_listening["port"],
+            "files": [{"path": str(payload)}],
+        },
+    )
+    session2 = result2["sessionId"]
+    prepared = slow.wait_event("prepare", lambda e: e.get("status") == 200, timeout=30)
+    assert prepared, f"slow mock never accepted the prepare: {slow.diagnostics()}"
+    # Let a few hundred KB flow before cancelling.
+    deadline = time.monotonic() + 15
+    flowing = False
+    while time.monotonic() < deadline and not flowing:
+        for event in drain_events():
+            if (
+                event["event"] == "transfer-progress"
+                and event["data"]["sessionId"] == session2
+            ):
+                flowing = True
+        time.sleep(0.05)
+    assert flowing, "no progress before the cancel (upload never started)"
+
+    ok_data("session_cancel", {"sessionId": session2})
+    cancel_seen = slow.wait_event("cancel", timeout=15)
+    assert cancel_seen, (
+        f"mock must see POST /cancel: {slow.diagnostics()}"
+    )
+    cancelled = wait_dll_event(
+        "transfer-done",
+        lambda d: d["sessionId"] == session2 and d["status"] == "cancelled",
+        timeout=15,
+    )
+    assert cancelled, "DLL must report the cancelled send"
+    record2 = find_record(session2)
+    assert record2["status"] == "Cancelled", f"record2 status: {record2['status']}"
+    drain_events()
+    return "8MB + 中文发送.txt uploaded byte-exact; slow send cancelled at both ends"
+
+
+@register_scenario
+@scenario
+def send_text():
+    """DLL send_text -> mock serve: message.txt arrives with the exact utf8
+    bytes; the DLL record is Done."""
+    drain_events()
+    mock = MockPeer(
+        ["serve", "--alias", "TextTarget", "--dir", str(CTX["work"] / "mock-text")]
+    )
+    listening = mock.wait_event("listening", timeout=15)
+    assert listening, f"mock never listened: {mock.diagnostics()}"
+
+    text = "你好，LocalSend"
+    result = ok_data(
+        "send_text", {"ip": "127.0.0.1", "port": listening["port"], "text": text}
+    )
+    session_id = result["sessionId"]
+
+    done = mock.wait_event("done", lambda e: e.get("status") == "done", timeout=60)
+    assert done, f"mock never saw the message: {mock.diagnostics()}"
+    uploads = mock.of_type("uploaded")
+    assert len(uploads) == 1, f"exactly one virtual file expected: {uploads}"
+    upload = uploads[0]
+    assert upload["fileName"] == "message.txt", f"unexpected wire name: {upload}"
+    expected = text.encode("utf-8")
+    assert upload["bytes"] == len(expected), f"byte length mismatch: {upload}"
+    content = Path(upload["path"]).read_bytes()
+    assert content == expected, "message.txt bytes must match the text exactly"
+
+    wait_dll_event(
+        "transfer-done",
+        lambda d: d["sessionId"] == session_id and d["status"] == "done",
+        timeout=15,
+    )
+    record = find_record(session_id)
+    assert record["status"] == "Done", f"record status: {record['status']}"
+    assert record["direction"] == "Send"
+    assert record["files"][0]["fileName"] == "message.txt"
+    assert record["files"][0]["fileType"] == "text/plain"
+    drain_events()
+    return "message.txt received with exact utf8 bytes, record Done"
+
+
 if __name__ == "__main__":
     main()

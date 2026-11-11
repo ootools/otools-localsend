@@ -23,11 +23,14 @@
 //!   checksum mismatch retries the SAME token up to [`MAX_UPLOAD_ATTEMPTS`]
 //!   (official `_maxUploadAttempts = 3`) before the file fails; other files
 //!   continue.
-//! - Text messages travel as a virtual `.txt` file with in-memory bytes
-//!   (official app: `AddMessageAction` in
-//!   `app/lib/provider/selection/selected_sending_files_provider.dart`). The
-//!   modern official app names that file `<uuid v4>.txt`; we keep the
-//!   historically documented `message.txt` (stable and greppable in tests).
+//! - Text messages travel as a virtual `.txt` file with in-memory bytes,
+//!   named `<uuid v4>.txt` and carrying the text in `preview` — the exact
+//!   official wire shape (AddMessageAction in
+//!   `app/lib/provider/selection/selected_sending_files_provider.dart` builds
+//!   `<uuid v4>.txt`; `send_provider.dart:121-122` embeds the text into
+//!   `preview` for a single-text send, which the official receiver
+//!   (`receive_session_state.dart`) requires to render a message bubble and
+//!   accept the message without a plain-file transfer).
 //! - Cancelling (official behavior): abort the in-flight uploads and POST
 //!   `/api/localsend/v2/cancel?sessionId=` — without a sessionId while the
 //!   prepare is still pending (the receiver resolves it by source IP).
@@ -69,8 +72,6 @@ pub const SHORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Disk read chunk for hashing and upload streaming.
 const READ_CHUNK: usize = 64 * 1024;
-/// Wire name of a text message (see module docs about the official naming).
-pub const TEXT_MESSAGE_FILE_NAME: &str = "message.txt";
 
 /// reqwest client for every outbound v2 exchange: rustls, self-signed
 /// certificates accepted (official behavior), 5s connect timeout and NO
@@ -408,9 +409,10 @@ pub async fn send_to_peer(
     Ok(session_id)
 }
 
-/// Build one wire entry from a send item. Text is wrapped as a virtual
-/// `.txt` file (see [`TEXT_MESSAGE_FILE_NAME`]); files take their metadata
-/// from the filesystem now and their checksum from the streamed hash later.
+/// Build one wire entry from a send item. Text is wrapped as the official
+/// virtual message file (`<uuid v4>.txt`, text embedded into `preview` — see
+/// the module docs); files take their metadata from the filesystem now and
+/// their checksum from the streamed hash later.
 fn build_entry(item: &SendItem) -> Result<(FileEntry, SendSource), String> {
     match item {
         SendItem::Text(text) => {
@@ -418,11 +420,15 @@ fn build_entry(item: &SendItem) -> Result<(FileEntry, SendSource), String> {
             Ok((
                 FileEntry {
                     id: uuid::Uuid::new_v4().to_string(),
-                    file_name: TEXT_MESSAGE_FILE_NAME.to_string(),
+                    // Official AddMessageAction (v1.18.2): `<uuid v4>.txt`.
+                    file_name: format!("{}.txt", uuid::Uuid::new_v4()),
                     size: bytes.len() as u64,
                     file_type: "text/plain".to_string(),
                     sha256: Some(sha256_hex(&bytes)),
-                    preview: None,
+                    // Official send_provider.dart embeds the text into the
+                    // preview of a single-text send — that is what makes the
+                    // official receiver treat it as a message, not a file.
+                    preview: Some(text.clone()),
                     metadata: None,
                 },
                 SendSource::Bytes(bytes),
@@ -808,7 +814,14 @@ async fn upload_attempt(
     match status {
         200 => Attempt::Ok,
         // Checksum mismatch: retryable with the same token.
-        422 => Attempt::ChecksumMismatch,
+        422 => {
+            // Drain the error body before dropping the response: a receiver
+            // that rejects BEFORE reading our body (early 403/422) closes the
+            // connection, and an undrained response would leave the half-open
+            // pooled connection to break the retry attempt.
+            let _body = response.text().await.unwrap_or_default();
+            Attempt::ChecksumMismatch
+        }
         other => {
             let body = response
                 .text()
@@ -940,7 +953,7 @@ mod tests {
     use axum::{Json, Router};
     use serde_json::{json, Value};
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::Arc;
 
     const API_ROOT: &str = "/api/localsend/v2";
@@ -985,11 +998,48 @@ mod tests {
             .collect()
     }
 
+    /// Accept-all prepare handler: one token per offered file.
+    async fn prepare_ok(Json(body): Json<Value>) -> Response {
+        let files = body
+            .get("files")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let tokens: serde_json::Map<String, Value> = files
+            .keys()
+            .map(|id| (id.clone(), Value::String(format!("token-{id}"))))
+            .collect();
+        (
+            StatusCode::OK,
+            Json(json!({ "sessionId": "remote-session", "files": tokens })),
+        )
+            .into_response()
+    }
+
     #[test]
     fn send_text_wraps_as_virtual_txt_file() {
         let text = "你好，LocalSend\n";
         let (entry, source) = build_entry(&SendItem::Text(text.to_string())).expect("text entry");
-        assert_eq!(entry.file_name, "message.txt", "text travels as message.txt");
+        // Official wire shape (AddMessageAction, v1.18.2): the file name is
+        // `<uuid v4>.txt` and the text rides in `preview` so receivers render
+        // a message bubble instead of saving a plain .txt file.
+        assert!(
+            entry.file_name.ends_with(".txt"),
+            "wire name must end in .txt: {}",
+            entry.file_name
+        );
+        let stem = entry
+            .file_name
+            .strip_suffix(".txt")
+            .expect("wire name ends in .txt");
+        let parsed = uuid::Uuid::parse_str(stem).expect("wire name stem is a uuid");
+        assert_eq!(
+            parsed.get_version_num(),
+            4,
+            "wire name must embed a uuid v4: {}",
+            entry.file_name
+        );
+        assert_eq!(entry.preview.as_deref(), Some(text), "text embedded into preview");
         assert_eq!(entry.file_type, "text/plain");
         assert_eq!(entry.size, text.len() as u64, "size is the utf8 byte length");
         assert_eq!(
@@ -997,7 +1047,7 @@ mod tests {
             Some(sha256_hex(text.as_bytes()).as_str()),
             "checksum precomputed for the in-memory payload"
         );
-        assert!(entry.preview.is_none() && entry.metadata.is_none());
+        assert!(entry.metadata.is_none());
         match source {
             SendSource::Bytes(bytes) => assert_eq!(bytes, text.as_bytes(), "content = text bytes"),
             other => panic!("text must be an in-memory source, got {other:?}"),
@@ -1092,22 +1142,6 @@ mod tests {
     async fn send_files_streams_and_completes() {
         // Mini receiver: prepare-upload issues one token per offered file;
         // upload counts the streamed bytes and the declared content length.
-        async fn prepare_ok(Json(body): Json<Value>) -> Response {
-            let files = body
-                .get("files")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default();
-            let tokens: serde_json::Map<String, Value> = files
-                .keys()
-                .map(|id| (id.clone(), Value::String(format!("token-{id}"))))
-                .collect();
-            (
-                StatusCode::OK,
-                Json(json!({ "sessionId": "remote-session", "files": tokens })),
-            )
-                .into_response()
-        }
         let received = Arc::new(AtomicU64::new(0));
         let declared = Arc::new(AtomicU64::new(0));
         let (received_in_handler, declared_in_handler) =
@@ -1203,5 +1237,70 @@ mod tests {
         assert_eq!(done[0]["sessionId"], session_id.as_str());
         assert_eq!(done[0]["status"], "done");
         assert_eq!(state.pending_progress(), 0, "pending map cleaned at session end");
+    }
+
+    #[tokio::test]
+    async fn upload_422_retries_same_token() {
+        // Receiver rejects the first upload with 422 "Checksum mismatch" and
+        // accepts the second: the sender must retry with the SAME token
+        // (official _maxUploadAttempts) and finish Done.
+        let upload_calls = Arc::new(AtomicU32::new(0));
+        let tokens_seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let (calls_in_handler, tokens_in_handler) = (Arc::clone(&upload_calls), Arc::clone(&tokens_seen));
+        let upload = move |Query(query): Query<HashMap<String, String>>,
+                           body: axum::body::Body| async move {
+            tokens_in_handler
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(query.get("token").cloned().unwrap_or_default());
+            // Real receivers stream the whole body BEFORE the checksum
+            // comparison (official, mock peer, our own upload_stream) — a 422
+            // can only be produced after the body was fully read.
+            let mut body = body;
+            while let Some(frame) = http_body_util::BodyExt::frame(&mut body).await {
+                frame.expect("body frame");
+            }
+            if calls_in_handler.fetch_add(1, Ordering::SeqCst) == 0 {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({ "error": "Checksum mismatch" })),
+                )
+                    .into_response()
+            } else {
+                StatusCode::OK.into_response()
+            }
+        };
+        let app = Router::new()
+            .route(&format!("{API_ROOT}/prepare-upload"), axum::routing::post(prepare_ok))
+            .route(&format!("{API_ROOT}/upload"), axum::routing::post(upload));
+        let port = serve(app).await;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let file = temp.path().join("retry-me.txt");
+        std::fs::write(&file, b"payload").expect("write payload");
+
+        let (state, _dir) = test_state();
+        let session_id = send_to_peer(
+            Arc::clone(&state),
+            "127.0.0.1".into(),
+            port,
+            vec![SendItem::File(file)],
+            None,
+        )
+        .await
+        .expect("send completed after the retry");
+
+        let record = record_of(&state, &session_id);
+        assert_eq!(record.status, TransferStatus::Done, "422 retry must end Done");
+        assert_eq!(record.direction, Direction::Send);
+        assert_eq!(
+            upload_calls.load(Ordering::SeqCst),
+            2,
+            "exactly one retry after the 422"
+        );
+        let seen = tokens_seen.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(seen.len(), 2, "two upload attempts");
+        assert_eq!(seen[0], seen[1], "the retry must reuse the SAME token");
+        assert!(!seen[0].is_empty(), "token comes from the prepare response");
     }
 }

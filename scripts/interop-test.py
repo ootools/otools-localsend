@@ -19,6 +19,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -863,8 +864,11 @@ def send_files():
 @register_scenario
 @scenario
 def send_text():
-    """DLL send_text -> mock serve: message.txt arrives with the exact utf8
-    bytes; the DLL record is Done."""
+    """DLL send_text -> mock serve: the official message wire shape — a single
+    text/plain entry named <uuid v4>.txt carrying the text in `preview`
+    (AddMessageAction + send_provider.dart:121-122); the plain mock saves it
+    byte-exact; a --message-204 mock (official message path) accepts it with
+    204 and zero uploads."""
     drain_events()
     mock = MockPeer(
         ["serve", "--alias", "TextTarget", "--dir", str(CTX["work"] / "mock-text")]
@@ -878,16 +882,27 @@ def send_text():
     )
     session_id = result["sessionId"]
 
+    # The prepare must carry the official message shape: one entry whose
+    # preview embeds the text.
+    prep = mock.wait_event("prepare", lambda e: e.get("status") == 200, timeout=30)
+    assert prep, f"mock never saw the prepare: {mock.diagnostics()}"
+    assert prep["files"] == 1, f"single entry expected: {prep}"
+    assert prep["previews"] == [text], f"preview must embed the text: {prep}"
+
     done = mock.wait_event("done", lambda e: e.get("status") == "done", timeout=60)
     assert done, f"mock never saw the message: {mock.diagnostics()}"
     uploads = mock.of_type("uploaded")
     assert len(uploads) == 1, f"exactly one virtual file expected: {uploads}"
     upload = uploads[0]
-    assert upload["fileName"] == "message.txt", f"unexpected wire name: {upload}"
+    wire_name = upload["fileName"]
+    assert wire_name.endswith(".txt") and len(wire_name) == 40, (
+        f"wire name must be <uuid v4>.txt: {wire_name!r}"
+    )
+    assert uuid.UUID(wire_name[:-4]).version == 4, f"uuid v4 stem expected: {wire_name}"
     expected = text.encode("utf-8")
     assert upload["bytes"] == len(expected), f"byte length mismatch: {upload}"
     content = Path(upload["path"]).read_bytes()
-    assert content == expected, "message.txt bytes must match the text exactly"
+    assert content == expected, "virtual txt bytes must match the text exactly"
 
     wait_dll_event(
         "transfer-done",
@@ -897,10 +912,46 @@ def send_text():
     record = find_record(session_id)
     assert record["status"] == "Done", f"record status: {record['status']}"
     assert record["direction"] == "Send"
-    assert record["files"][0]["fileName"] == "message.txt"
+    assert record["files"][0]["fileName"] == wire_name, "record matches the wire name"
     assert record["files"][0]["fileType"] == "text/plain"
+    assert record["files"][0]["preview"] == text, "record carries the message preview"
     drain_events()
-    return "message.txt received with exact utf8 bytes, record Done"
+
+    # Official message-accept path: a receiver that treats a single preview
+    # text entry as a message answers 204 — no upload happens at all, and the
+    # sender still finishes Done with zero uploaded files.
+    message_mock = MockPeer(
+        [
+            "serve",
+            "--alias",
+            "MessageTarget",
+            "--dir",
+            str(CTX["work"] / "mock-message"),
+            "--message-204",
+        ]
+    )
+    message_listening = message_mock.wait_event("listening", timeout=15)
+    assert message_listening, f"message mock never listened: {message_mock.diagnostics()}"
+    result2 = ok_data(
+        "send_text", {"ip": "127.0.0.1", "port": message_listening["port"], "text": text}
+    )
+    session2 = result2["sessionId"]
+    prep2 = message_mock.wait_event("prepare", lambda e: e.get("status") == 204, timeout=30)
+    assert prep2 and prep2["previews"] == [text], (
+        f"204 message path must see the preview: {prep2} {message_mock.diagnostics()}"
+    )
+    assert not message_mock.of_type("uploaded"), "the 204 message path uploads nothing"
+    wait_dll_event(
+        "transfer-done",
+        lambda d: d["sessionId"] == session2 and d["status"] == "done",
+        timeout=15,
+    )
+    record2 = find_record(session2)
+    assert record2["status"] == "Done", f"record2 status: {record2['status']}"
+    assert record2["files"][0]["fileName"].endswith(".txt")
+    assert record2["files"][0]["preview"] == text
+    drain_events()
+    return "uuid-v4 .txt + preview byte-exact; --message-204 mock accepts with zero uploads"
 
 
 if __name__ == "__main__":

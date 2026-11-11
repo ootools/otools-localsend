@@ -10,15 +10,18 @@
  *
  * Subcommands:
  *   serve [--alias MockPeer] [--port N] [--dir tmpdir]
- *       [--pin N] [--decline] [--slow-ms N]
+ *       [--pin N] [--decline] [--slow-ms N] [--message-204]
  *       A standalone receiver: UDP multicast announce on 224.0.0.167:53317
  *       every 5s while listening for peer frames (Windows ECONNRESET is
  *       swallowed), answering announce:true frames with a POST /register to
  *       the origin; self-signed HTTPS v2 endpoints register / prepare-upload
  *       / upload / cancel / info. prepare-upload ACCEPTS all files by
  *       default; --decline / --pin N (or the control endpoint) change that.
- *       Uploaded bytes stream to --dir. Every observation is printed as one
- *       JSON line per event, e.g. {"event":"prepare","sessionId":...},
+ *       --message-204 mirrors the official message path: a single text/plain
+ *       file carrying a non-empty preview is accepted with 204 and no upload
+ *       (the text already rode in the preview). Uploaded bytes stream to
+ *       --dir. Every observation is printed as one JSON line per event, e.g.
+ *       {"event":"prepare","sessionId":...,"previews":[...]},
  *       {"event":"uploaded","fileId":...,"bytes":N},{"event":"done"}.
  *   send --to <ip:port> --file <path> [--file <path2> ...] [--pin N]
  *        [--text "..."] [--decline] [--corrupt-sha] [--abort-prepare]
@@ -339,6 +342,9 @@ async function cmdServe(opts) {
     mode: opts.decline ? 'decline' : opts.pin ? 'pin' : 'accept-all',
     pin: opts.pin ?? null,
     slowMs: Number(opts['slow-ms'] ?? 0),
+    // Official message path: accept a single text/plain entry with a
+    // non-empty preview by answering 204 (no upload happens at all).
+    message204: opts['message-204'] === true,
   };
   /** sessionId → {id, status, sender, files: Map(fileId → entry), tokens: Map, uploaded: Set} */
   const sessions = new Map();
@@ -459,6 +465,10 @@ async function cmdServe(opts) {
           status,
           sessionId: value?.sessionId,
           files: entries.length,
+          // Official senders embed the text into `preview` for a single-text
+          // send (send_provider.dart) — recorded so tests can assert the
+          // message wire shape.
+          previews: entries.map((entry) => entry?.preview ?? null),
           sender: sender.alias,
         });
         jsonReply(res, status, value);
@@ -470,6 +480,18 @@ async function cmdServe(opts) {
         if (provided !== receiver.pin) return answer(401, { error: 'Invalid PIN' });
       }
       if (entries.length === 0) return answer(400, { error: 'No files provided' });
+      if (
+        receiver.message204 &&
+        entries.length === 1 &&
+        entries[0].fileType === 'text/plain' &&
+        typeof entries[0].preview === 'string' &&
+        entries[0].preview.length > 0
+      ) {
+        // Official receive_session_state.dart: a single text file with a
+        // preview renders as a message bubble and is accepted without any
+        // file transfer — nothing to upload, so 204.
+        return answer(204);
+      }
       const busy = [...sessions.values()].some((session) => session.status === 'transferring');
       if (busy) return answer(409, { error: 'Blocked by another session' });
 

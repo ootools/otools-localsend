@@ -1,6 +1,16 @@
-/* 深色友好的基线：骨架阶段固定深色调，Task 11 接入主题方案时再抽离。 */
+/* 宿主主题适配基线。
+ *
+ * 宿主给插件 webview 注入 html.light / html.dark 类与 colorScheme
+ * （webview/core.rs build_child_webview_theme_script），浏览器直跑时两个类
+ * 都不存在 —— 默认呈现暗色。组件里用的是固定 zinc 工具类（约百处调用点），
+ * 这里按类名在 html.light 下整体映射到浅色等价色，组件零改动。
+ */
 :root {
   color-scheme: dark;
+}
+
+html.light {
+  color-scheme: light;
 }
 
 html,
@@ -11,4 +21,68 @@ body,
 
 body {
   margin: 0;
+}
+
+/* 控件基线：未写背景类的 button 会被 UA 按钮底色（ButtonFace）渲染——
+ * color-scheme 切换时与 zinc 文字同调，看起来像"样式丢失"的灰块。 */
+button {
+  appearance: none;
+  background-color: transparent;
+  color: inherit;
+  font: inherit;
+}
+
+/* ---- html.light 主题映射（zinc 暗色 → 浅色等价） ---- */
+html.light .bg-zinc-950 {
+  background-color: #f4f4f5;
+}
+html.light .bg-zinc-900 {
+  background-color: #ffffff;
+}
+html.light .bg-zinc-800 {
+  background-color: #e4e4e7;
+}
+html.light .text-zinc-100 {
+  color: #18181b;
+}
+html.light .text-zinc-200 {
+  color: #27272a;
+}
+html.light .text-zinc-300 {
+  color: #3f3f46;
+}
+html.light .text-zinc-400 {
+  color: #52525b;
+}
+html.light .text-zinc-500 {
+  color: #71717a;
+}
+html.light .text-zinc-600 {
+  color: #71717a;
+}
+html.light .border-zinc-800 {
+  border-color: #e4e4e7;
+}
+html.light .border-zinc-700 {
+  border-color: #d4d4d8;
+}
+html.light .border-zinc-500 {
+  border-color: #a1a1aa;
+}
+
+/* 浅色下的 hover 层对比度修正（组件里用到的 zinc hover 变体）。 */
+html.light .hover\:bg-zinc-800:hover {
+  background-color: #ececef;
+}
+html.light .hover\:border-zinc-700:hover {
+  border-color: #c4c4cc;
+}
+html.light .hover\:border-zinc-500:hover {
+  border-color: #8b8b93;
+}
+html.light .hover\:text-zinc-100:hover {
+  color: #09090b;
+}
+html.light .hover\:text-zinc-300:hover {
+  color: #18181b;
 }

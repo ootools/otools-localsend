@@ -350,6 +350,27 @@ html.light .file-pick-head button:hover { color: var(--accent-ink); }
 .kv dd { color: var(--text); min-width: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
 .kv .bad { color: #e0857c; }
 
+/* ---------- 下载页 ---------- */
+
+.compat-note { font-size: 13px; line-height: 1.75; color: var(--text2); }
+.compat-note b { color: var(--text); }
+
+.dl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+.dl-head { display: flex; align-items: center; gap: 11px; margin-bottom: 10px; }
+.dl-links { display: flex; flex-wrap: wrap; gap: 8px; }
+.link-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 5px 12px; border-radius: 999px;
+  font-size: 12px; font-weight: 600;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
+  transition: all .15s ease;
+}
+.link-chip:hover { background: color-mix(in srgb, var(--accent) 20%, transparent); }
+html.light .link-chip { color: var(--accent-ink); }
+html.light .link-chip:hover { background: color-mix(in srgb, var(--accent) 18%, transparent); }
+
 /* ---------- 滚动条 ---------- */
 
 ::-webkit-scrollbar { width: 9px; height: 9px; }

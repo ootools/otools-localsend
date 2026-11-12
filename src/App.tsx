@@ -9,15 +9,17 @@ import { acceptSession, declineSession } from "./api";
 import { IncomingDialog } from "./components/IncomingDialog";
 import { usePollEvents } from "./hooks/usePollEvents";
 import { DevicesPage } from "./pages/Devices";
+import { DownloadPage } from "./pages/Download";
 import { SettingsPage } from "./pages/Settings";
 import { TransfersPage } from "./pages/Transfers";
 import { formatError } from "./format";
 
-type TabId = "devices" | "transfers" | "settings";
+type TabId = "devices" | "transfers" | "download" | "settings";
 
 const TABS: Array<{ id: TabId; label: string; icon: string; title: string; subtitle: string }> = [
   { id: "devices", label: "设备", icon: "📡", title: "附近设备", subtitle: "同一局域网内运行 LocalSend 的设备" },
   { id: "transfers", label: "传输", icon: "🔁", title: "传输记录", subtitle: "收发历史与实时进度" },
+  { id: "download", label: "下载", icon: "📥", title: "下载客户端", subtitle: "为手机等其它设备获取官方 LocalSend 客户端" },
   { id: "settings", label: "设置", icon: "⚙️", title: "设置", subtitle: "本机身份、接收偏好与服务状态" },
 ];
 
@@ -177,6 +179,7 @@ export function App() {
             <DevicesPage store={store} onGoToTransfers={() => setTab("transfers")} />
           )}
           {tab === "transfers" && <TransfersPage store={store} />}
+          {tab === "download" && <DownloadPage />}
           {tab === "settings" && <SettingsPage store={store} />}
         </div>
       </main>

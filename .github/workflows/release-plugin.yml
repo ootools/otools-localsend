@@ -42,11 +42,17 @@ jobs:
         include:
           - os: windows-latest
             artifact: plugin-lib-windows
-          - os: macos-14
-            artifact: plugin-lib-macos
+            optional: false
           - os: ubuntu-latest
             artifact: plugin-lib-linux
+            optional: false
+          # free 组织无 macOS 托管 runner（configuration not supported）：
+          # macOS 库由本地 Mac 构建后并入发布产物，CI 里允许缺席。
+          - os: macos-14
+            artifact: plugin-lib-macos
+            optional: true
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.optional }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -110,18 +116,9 @@ jobs:
       - name: 汇集各平台原生库
         uses: actions/download-artifact@v4
         with:
-          name: plugin-lib-windows
+          pattern: plugin-lib-*
           path: lib
-      - name: 汇集 macOS 原生库
-        uses: actions/download-artifact@v4
-        with:
-          name: plugin-lib-macos
-          path: lib
-      - name: 汇集 Linux 原生库
-        uses: actions/download-artifact@v4
-        with:
-          name: plugin-lib-linux
-          path: lib
+          merge-multiple: true
       - name: 汇集前端产物
         uses: actions/download-artifact@v4
         with:
@@ -147,9 +144,14 @@ jobs:
         run: |
           set -euo pipefail
           node scripts/pack-plugin.mjs --out dist-pack --version "$VERSION"
-          node scripts/pack-plugin.mjs --out dist-pack --version "$VERSION" --platform windows
-          node scripts/pack-plugin.mjs --out dist-pack --version "$VERSION" --platform macos
-          node scripts/pack-plugin.mjs --out dist-pack --version "$VERSION" --platform linux
+          for p in windows macos linux; do
+            libcase="Windows.dll"; [ "$p" = macos ] && libcase="macOS.dylib"; [ "$p" = linux ] && libcase="Linux.so"
+            if [ -f "lib/$libcase" ]; then
+              node scripts/pack-plugin.mjs --out dist-pack --version "$VERSION" --platform "$p"
+            else
+              echo "skip $p package (no lib/$libcase in this release)"
+            fi
+          done
       - name: 独立验证插件包
         env:
           VERSION: ${{ steps.meta.outputs.version }}

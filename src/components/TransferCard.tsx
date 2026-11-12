@@ -12,12 +12,12 @@ interface TransferCardProps {
   progress?: Record<string, number>;
 }
 
-const STATUS_STYLES: Record<string, string> = {
-  Pending: "border-amber-800 bg-amber-950/60 text-amber-300",
-  Transferring: "border-sky-800 bg-sky-950/60 text-sky-300",
-  Done: "border-emerald-800 bg-emerald-950/60 text-emerald-300",
-  Cancelled: "border-zinc-700 bg-zinc-900 text-zinc-400",
-  Failed: "border-red-900 bg-red-950/60 text-red-300",
+const STATUS_CHIPS: Record<string, string> = {
+  Pending: "chip chip-pending",
+  Transferring: "chip chip-transferring",
+  Done: "chip chip-done",
+  Cancelled: "chip chip-cancelled",
+  Failed: "chip chip-failed",
 };
 
 function filePercent(record: TransferRecord, percent?: number): number {
@@ -33,37 +33,29 @@ export function TransferCard({ record, progress }: TransferCardProps) {
   const totalSize = record.files.reduce((sum, file) => sum + (file.size ?? 0), 0);
 
   return (
-    <div className="rounded-lg border border-zinc-800 bg-zinc-900 p-3">
-      <div className="flex items-center gap-2">
+    <div className="card">
+      <div className="xfer-head">
         <span
           aria-label={record.direction === "Send" ? "发送" : "接收"}
-          className={
-            record.direction === "Send"
-              ? "inline-flex h-5 w-5 shrink-0 items-center justify-center rounded bg-sky-950 text-xs text-sky-300"
-              : "inline-flex h-5 w-5 shrink-0 items-center justify-center rounded bg-emerald-950 text-xs text-emerald-300"
-          }
+          className={`tile ${record.direction === "Send" ? "tile-out" : "tile-in"}`}
+          aria-hidden
         >
           {record.direction === "Send" ? "↑" : "↓"}
         </span>
-        <span className="min-w-0 flex-1 truncate text-sm font-medium text-zinc-100">
-          {record.peerAlias || "未知设备"}
+        <span className="xfer-peer">
+          <b>{record.peerAlias || "未知设备"}</b>
         </span>
-        <span className="shrink-0 text-xs text-zinc-500">{formatTimestamp(record.createdAt)}</span>
-        <span
-          className={
-            "shrink-0 rounded border px-1.5 py-0.5 text-xs " +
-            (STATUS_STYLES[record.status] ?? STATUS_STYLES.Cancelled)
-          }
-        >
+        <span className="xfer-time">{formatTimestamp(record.createdAt)}</span>
+        <span className={STATUS_CHIPS[record.status] ?? STATUS_CHIPS.Cancelled}>
           {transferStatusLabel(record.status)}
         </span>
       </div>
 
-      <p className="mt-1 text-xs text-zinc-500">
+      <p className="xfer-meta">
         {record.files.length} 个文件 · {formatBytes(totalSize)}
       </p>
 
-      <ul className="mt-2 space-y-2">
+      <ul className="xfer-files">
         {record.files.map((file) => (
           <FileRow
             key={file.id}
@@ -88,29 +80,26 @@ function FileRow({
   destination?: string;
 }) {
   return (
-    <li className="min-w-0">
-      <div className="flex items-center justify-between gap-2 text-xs">
-        <span className="min-w-0 truncate text-zinc-300" title={file.fileName}>
+    <li className="xfer-file">
+      <div className="xfer-file-row">
+        <span className="name" title={file.fileName}>
           {file.fileName || file.id}
         </span>
-        <span className="shrink-0 text-zinc-500">{formatBytes(file.size ?? 0)}</span>
+        <span className="size">{formatBytes(file.size ?? 0)}</span>
       </div>
       {typeof percent === "number" && (
         <div
-          className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-zinc-800"
+          className="progress"
           role="progressbar"
           aria-valuenow={percent}
           aria-valuemin={0}
           aria-valuemax={100}
         >
-          <div
-            className="h-full rounded-full bg-sky-500 transition-[width]"
-            style={{ width: `${percent}%` }}
-          />
+          <div className="progress-fill" style={{ width: `${percent}%` }} />
         </div>
       )}
       {destination && (
-        <p className="mt-0.5 truncate text-[11px] text-zinc-600" title={destination}>
+        <p className="xfer-dest" title={destination}>
           {destination}
         </p>
       )}

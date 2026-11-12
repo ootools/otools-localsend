@@ -86,48 +86,49 @@ export function DevicesPage({ store, onGoToTransfers }: DevicesPageProps) {
 
   if (store.hostError) {
     return (
-      <div className="rounded-lg border border-zinc-800 bg-zinc-900 p-4 text-sm" role="alert">
-        <p className="font-medium text-zinc-200">宿主未注入</p>
-        <p className="mt-1 text-zinc-500">
-          未检测到 OTools 宿主桥接，仅作本地预览占位：{store.hostError}
-        </p>
+      <div className="banner banner-warn" role="alert">
+        <span aria-hidden>🔌</span>
+        <span>
+          <b>宿主未注入</b> — 未检测到 OTools 宿主桥接，仅作本地预览占位：{store.hostError}
+        </span>
       </div>
     );
   }
 
   return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h2 className="text-sm font-medium text-zinc-300">
-          附近设备（{store.devices.length}）
-        </h2>
+    <div>
+      <div className="topbar-actions" style={{ padding: "0 0 12px", justifyContent: "space-between" }}>
+        <span className="send-target">
+          共 <b>{store.devices.length}</b> 台设备
+        </span>
         <button
           type="button"
           onClick={() => void refresh()}
           disabled={busy !== null}
-          className="rounded-md border border-zinc-700 px-3 py-1.5 text-xs text-zinc-300 hover:border-zinc-500 hover:text-zinc-100 disabled:opacity-50"
+          className="btn btn-sm"
         >
-          {busy === "refresh" ? "搜索中…" : "刷新发现"}
+          {busy === "refresh" ? "搜索中…" : "↻ 刷新发现"}
         </button>
       </div>
 
       {error && (
-        <p className="rounded-md border border-red-900 bg-red-950/60 px-3 py-2 text-xs text-red-300" role="alert">
-          {error}
-        </p>
+        <div className="banner banner-error" role="alert">
+          <span aria-hidden>⚠️</span>
+          <span>{error}</span>
+        </div>
       )}
 
       {store.devices.length === 0 ? (
-        <div className="rounded-lg border border-dashed border-zinc-800 p-6 text-center text-sm text-zinc-500">
-          <p>未发现设备</p>
-          <ul className="mt-3 space-y-1 text-xs text-zinc-600">
+        <div className="empty">
+          <p>未发现附近的 LocalSend 设备</p>
+          <ul>
             <li>· 确认与对方设备在同一局域网网段</li>
             <li>· 检查防火墙是否放行 UDP/TCP 53317</li>
             <li>· 对方 LocalSend 需保持开启可见</li>
           </ul>
         </div>
       ) : (
-        <div className="grid gap-2">
+        <div className="dev-list">
           {store.devices.map((entry) => (
             <DeviceCard
               key={entry.info.fingerprint}
@@ -140,37 +141,37 @@ export function DevicesPage({ store, onGoToTransfers }: DevicesPageProps) {
       )}
 
       {selected && (
-        <div className="space-y-3 rounded-lg border border-zinc-800 bg-zinc-900 p-4">
-          <p className="text-sm text-zinc-300">
-            发送给 <span className="font-medium text-zinc-100">{selected.info.alias}</span>
-            <span className="ml-2 text-xs text-zinc-500">
+        <div className="card send-card">
+          <p className="send-target">
+            发送给 <b>{selected.info.alias}</b>
+            <small>
               {selected.ip}:{selected.info.port}
-            </span>
+            </small>
           </p>
 
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="send-row">
             <button
               type="button"
               onClick={() => void sendFilesFlow()}
               disabled={busy !== null}
-              className="rounded-md bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-50"
+              className="btn btn-primary btn-sm"
             >
-              {busy === "file" ? "发送中…" : "发送文件"}
+              {busy === "file" ? "发送中…" : "📎 发送文件"}
             </button>
             <button
               type="button"
               onClick={() => void sendTextFlow()}
               disabled={busy !== null}
-              className="rounded-md border border-sky-700 px-3 py-1.5 text-xs font-medium text-sky-300 hover:border-sky-500 disabled:opacity-50"
+              className="btn btn-sm"
             >
-              {busy === "text" ? "发送中…" : "发送文本"}
+              {busy === "text" ? "发送中…" : "💬 发送文本"}
             </button>
             <input
               type="text"
               value={pin}
               onChange={(event) => setPin(event.target.value)}
               placeholder="对方 PIN（可选）"
-              className="w-36 rounded-md border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-sky-600 focus:outline-none"
+              className="field send-pin"
             />
           </div>
 
@@ -179,7 +180,7 @@ export function DevicesPage({ store, onGoToTransfers }: DevicesPageProps) {
             onChange={(event) => setText(event.target.value)}
             placeholder="输入要发送的文本…"
             rows={3}
-            className="w-full resize-y rounded-md border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-sky-600 focus:outline-none"
+            className="field"
           />
         </div>
       )}

@@ -65,30 +65,26 @@ export function IncomingDialog({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      className="modal-back"
       role="dialog"
       aria-modal="true"
       aria-label="传输请求"
     >
-      <div className="w-full max-w-md rounded-lg border border-zinc-700 bg-zinc-900 p-4 shadow-xl">
-        <p className="text-sm font-medium text-zinc-100">
-          {sender?.alias || "未知设备"} 请求传输
-        </p>
-        <p className="mt-0.5 text-xs text-zinc-500">
+      <div className="modal">
+        <h3>{sender?.alias || "未知设备"} 请求传输</h3>
+        <p className="modal-sub">
           {deviceTypeEmoji(sender?.deviceType)}
           {sender?.deviceModel ? ` ${sender.deviceModel} · ` : ""}
           {textMode ? "文本消息" : `${request.files.length} 个文件`}
         </p>
 
         {textMode && textEntry ? (
-          <div className="mt-3 rounded-lg rounded-tl-sm border border-zinc-700 bg-zinc-800 p-3">
-            <p className="select-text whitespace-pre-wrap break-words text-sm text-zinc-100">
-              {textEntry.preview}
-            </p>
+          <div className="modal-body">
+            <div className="msg-bubble">{textEntry.preview}</div>
           </div>
         ) : (
-          <div className="mt-3">
-            <div className="flex items-center justify-between text-xs text-zinc-500">
+          <div className="modal-body">
+            <div className="file-pick-head">
               <span>选择要接收的文件</span>
               <button
                 type="button"
@@ -99,27 +95,26 @@ export function IncomingDialog({
                       : new Set(request.files.map((file) => file.id)),
                   )
                 }
-                className="text-sky-400 hover:text-sky-300"
                 disabled={busy}
               >
                 {allSelected ? "全不选" : "全选"}
               </button>
             </div>
-            <ul className="mt-2 max-h-56 space-y-1 overflow-y-auto">
+            <ul className="file-list">
               {request.files.map((file) => (
                 <li key={file.id}>
-                  <label className="flex cursor-pointer items-center gap-2 rounded px-1 py-1 text-xs text-zinc-300 hover:bg-zinc-800">
+                  <label className="file-row">
                     <input
                       type="checkbox"
                       checked={selected.has(file.id)}
                       onChange={() => toggle(file.id)}
                       disabled={busy}
-                      className="h-3.5 w-3.5 accent-sky-600"
+                      style={{ width: 14, height: 14, flex: "none" }}
                     />
-                    <span className="min-w-0 flex-1 truncate" title={file.fileName}>
+                    <span className="name" title={file.fileName}>
                       {file.fileName || file.id}
                     </span>
-                    <span className="shrink-0 text-zinc-500">{formatBytes(file.size ?? 0)}</span>
+                    <span className="size">{formatBytes(file.size ?? 0)}</span>
                   </label>
                 </li>
               ))}
@@ -128,18 +123,14 @@ export function IncomingDialog({
         )}
 
         {error && (
-          <p className="mt-3 rounded-md border border-red-900 bg-red-950/60 px-3 py-2 text-xs text-red-300" role="alert">
-            {error}
-          </p>
+          <div className="banner banner-error modal-error" role="alert">
+            <span aria-hidden>⚠️</span>
+            <span>{error}</span>
+          </div>
         )}
 
-        <div className="mt-4 flex items-center justify-end gap-2">
-          <button
-            type="button"
-            onClick={onDecline}
-            disabled={busy}
-            className="rounded-md border border-zinc-700 px-3 py-1.5 text-xs text-zinc-300 hover:border-zinc-500 hover:text-zinc-100 disabled:opacity-50"
-          >
+        <div className="modal-actions">
+          <button type="button" onClick={onDecline} disabled={busy} className="btn btn-sm btn-danger">
             拒绝
           </button>
           {!textMode && (
@@ -147,7 +138,7 @@ export function IncomingDialog({
               type="button"
               onClick={() => onAcceptSelected(selectedIds)}
               disabled={busy || selectedIds.length === 0}
-              className="rounded-md border border-sky-700 px-3 py-1.5 text-xs font-medium text-sky-300 hover:border-sky-500 disabled:opacity-50"
+              className="btn btn-sm"
             >
               接受所选{selectedIds.length > 0 ? `（${selectedIds.length}）` : ""}
             </button>
@@ -156,7 +147,7 @@ export function IncomingDialog({
             type="button"
             onClick={onAcceptAll}
             disabled={busy}
-            className="rounded-md bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-50"
+            className="btn btn-primary btn-sm"
           >
             {busy ? "处理中…" : "全部接受"}
           </button>

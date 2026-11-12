@@ -190,6 +190,118 @@ export async function onEvent<T>(
 // ---------------------------------------------------------------------------
 
 /**
+ * 预览模式（?preview=1）：无宿主时返回仿真数据，用于纯浏览器里的 UI 迭代
+ * （设备卡/传输卡/弹窗在降级态下不可见）。宿主内该参数不存在，零影响。
+ */
+const PREVIEW_MODE =
+  typeof location !== "undefined" &&
+  new URLSearchParams(location.search).has("preview");
+
+const previewFingerprint = "a".repeat(64);
+const previewDevice = (
+  alias: string,
+  model: string,
+  type: string,
+  ip: string,
+  seen: number,
+): DeviceEntry => ({
+  info: {
+    alias,
+    version: "2.2",
+    deviceModel: model,
+    deviceType: type,
+    fingerprint: `${alias}-${ip}`,
+    port: 53317,
+    protocol: "https",
+    download: false,
+  },
+  ip,
+  lastSeenMs: seen,
+});
+
+const previewIncoming: IncomingRequestEvent = {
+  sessionId: "preview-incoming",
+  sender: {
+    alias: "小米 14",
+    version: "2.2",
+    deviceModel: "Xiaomi 14",
+    deviceType: "mobile",
+    fingerprint: "preview-sender",
+    port: 53317,
+    protocol: "https",
+    download: false,
+  },
+  files: [
+    { id: "p1", fileName: "旅游照片合集.zip", size: 1_284_337_664, fileType: "application/zip", sha256: null, preview: null, metadata: null },
+    { id: "p2", fileName: "会议纪要.docx", size: 38_912, fileType: "application/msword", sha256: null, preview: null, metadata: null },
+    { id: "p3", fileName: "设计稿-终版.pdf", size: 9_420_288, fileType: "application/pdf", sha256: null, preview: null, metadata: null },
+  ],
+};
+
+let previewEventsPending = true;
+
+const PREVIEW_DATA: Record<string, unknown> = {
+  settings_get: {
+    alias: "My-PC", deviceModel: "Windows 11 Pro", deviceType: "desktop",
+    port: 53317, downloadDir: "D:\\Downloads", pin: null,
+    autoSave: false, notifyOnIncoming: true,
+  },
+  device_list: {
+    devices: [
+      previewDevice("iPhone 15 Pro", "iOS 18", "mobile", "192.168.31.20", 3_000),
+      previewDevice("MacBook Pro", "macOS 15", "desktop", "192.168.31.33", 41_000),
+      previewDevice("客厅 N100", "Debian", "headless", "192.168.31.7", 5_400_000),
+    ],
+    udpPort: 53318,
+  },
+  server_status: { port: 53318, protocol: "https", fingerprint: previewFingerprint, error: null },
+  transfer_list: {
+    transfers: [
+      {
+        sessionId: "t1", direction: "Receive", peerAlias: "iPhone 15 Pro",
+        status: "Transferring", createdAt: Date.now() - 30_000,
+        files: [
+          { id: "f1", fileName: " vacation.zip", size: 1_284_337_664, fileType: "application/zip", sha256: null, preview: null, metadata: null },
+          { id: "f2", fileName: "IMG_0042.HEIC", size: 4_800_512, fileType: "image/heic", sha256: null, preview: null, metadata: null },
+        ],
+      },
+      {
+        sessionId: "t2", direction: "Send", peerAlias: "MacBook Pro",
+        status: "Done", createdAt: Date.now() - 3_600_000,
+        files: [
+          { id: "f3", fileName: "季度报表.xlsx", size: 238_912, fileType: "application/vnd.ms-excel", sha256: null, preview: null, metadata: null },
+        ],
+      },
+      {
+        sessionId: "t3", direction: "Receive", peerAlias: "小米 14",
+        status: "Done", createdAt: Date.now() - 86_400_000,
+        files: [
+          { id: "f4", fileName: "message.txt", size: 24, fileType: "text/plain", sha256: null, preview: "晚上一起吃饭？", metadata: null },
+        ],
+        destinations: { f4: "D:\\Downloads\\message.txt" },
+      },
+    ],
+  },
+  discover_now: { ok: true },
+};
+
+function previewInvoke(method: string): unknown {
+  if (method === "poll_events") {
+    if (previewEventsPending) {
+      previewEventsPending = false;
+      return { events: [{ event: EVENTS.incomingRequest, data: previewIncoming }] };
+    }
+    return { events: [] };
+  }
+  if (method in PREVIEW_DATA) return PREVIEW_DATA[method];
+  if (["send_files", "send_text"].includes(method)) return { sessionId: `preview-${method}` };
+  if (["session_accept", "session_decline", "session_cancel", "settings_set"].includes(method)) {
+    return {};
+  }
+  throw new Error(`预览模式未仿真该 method: ${method}`);
+}
+
+/**
  * 宿主桥 invoke：桌面宿主会把 native 的 {ok, data | error} 信封解包后才交给
  * JS，但远程宿主可能原样转发 —— 这里对信封做防御性解包（ai-switch 同款）。
  */
@@ -197,6 +309,7 @@ async function callNative<T>(
   method: string,
   payload?: Record<string, unknown>,
 ): Promise<T> {
+  if (PREVIEW_MODE) return previewInvoke(method) as T;
   const result = await invoke<T>(method, payload ?? {});
   if (result && typeof result === "object" && "ok" in result) {
     const envelope = result as { ok: boolean; data?: T; error?: unknown };

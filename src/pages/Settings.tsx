@@ -39,9 +39,6 @@ const DEVICE_TYPES: Array<{ value: string; label: string }> = [
   { value: "headless", label: "无头设备" },
 ];
 
-const inputClass =
-  "w-full rounded-md border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-sky-600 focus:outline-none";
-
 export function SettingsPage({ store }: { store: PluginStore }) {
   const [draft, setDraft] = useState<Draft | null>(null);
   const [busy, setBusy] = useState(false);
@@ -102,18 +99,18 @@ export function SettingsPage({ store }: { store: PluginStore }) {
 
   if (store.hostError) {
     return (
-      <div className="rounded-lg border border-zinc-800 bg-zinc-900 p-4 text-sm" role="alert">
-        <p className="font-medium text-zinc-200">宿主未注入</p>
-        <p className="mt-1 text-zinc-500">
-          未检测到 OTools 宿主桥接，仅作本地预览占位：{store.hostError}
-        </p>
+      <div className="banner banner-warn" role="alert">
+        <span aria-hidden>🔌</span>
+        <span>
+          <b>宿主未注入</b> — 未检测到 OTools 宿主桥接，仅作本地预览占位：{store.hostError}
+        </span>
       </div>
     );
   }
 
   if (!draft) {
     return (
-      <p className="text-sm text-zinc-500" role="status">
+      <p className="xfer-meta" role="status">
         {store.ready ? "设置不可用" : "正在读取设置…"}
       </p>
     );
@@ -126,36 +123,36 @@ export function SettingsPage({ store }: { store: PluginStore }) {
     : "—";
 
   return (
-    <div className="space-y-4">
-      <section className="rounded-lg border border-zinc-800 bg-zinc-900 p-4">
-        <h2 className="text-sm font-medium text-zinc-300">本机</h2>
-        <div className="mt-3 grid gap-3">
-          <label className="grid gap-1 text-xs text-zinc-500">
+    <div className="settings">
+      <section className="card set-card">
+        <h3>本机</h3>
+        <div className="set-grid">
+          <label className="field-label">
             别名
             <input
               type="text"
               value={draft.alias}
               onChange={(event) => setDraft({ ...draft, alias: event.target.value })}
-              className={inputClass}
+              className="field"
             />
           </label>
-          <div className="grid grid-cols-2 gap-3">
-            <label className="grid gap-1 text-xs text-zinc-500">
+          <div className="set-cols">
+            <label className="field-label">
               设备型号（可选）
               <input
                 type="text"
                 value={draft.deviceModel}
                 onChange={(event) => setDraft({ ...draft, deviceModel: event.target.value })}
                 placeholder="如 Windows 11"
-                className={inputClass}
+                className="field"
               />
             </label>
-            <label className="grid gap-1 text-xs text-zinc-500">
+            <label className="field-label">
               设备类型
               <select
                 value={draft.deviceType}
                 onChange={(event) => setDraft({ ...draft, deviceType: event.target.value })}
-                className={inputClass}
+                className="field"
               >
                 {DEVICE_TYPES.map((option) => (
                   <option key={option.value} value={option.value}>
@@ -165,7 +162,7 @@ export function SettingsPage({ store }: { store: PluginStore }) {
               </select>
             </label>
           </div>
-          <label className="grid gap-1 text-xs text-zinc-500">
+          <label className="field-label">
             端口（重启宿主后生效）
             <input
               type="number"
@@ -173,98 +170,94 @@ export function SettingsPage({ store }: { store: PluginStore }) {
               max={65535}
               value={draft.port}
               onChange={(event) => setDraft({ ...draft, port: event.target.value })}
-              className={inputClass}
+              className="field"
             />
           </label>
-          <label className="grid gap-1 text-xs text-zinc-500">
+          <label className="field-label">
             下载目录（留空则保存在插件数据目录）
-            <span className="flex gap-2">
+            <span className="send-row" style={{ flexWrap: "nowrap" }}>
               <input
                 type="text"
                 value={draft.downloadDir}
                 onChange={(event) => setDraft({ ...draft, downloadDir: event.target.value })}
                 placeholder="如 D:\\Downloads"
-                className={inputClass}
+                className="field"
               />
               <button
                 type="button"
                 onClick={() => void pickDownloadDir()}
-                className="shrink-0 rounded-md border border-zinc-700 px-2 py-1.5 text-xs text-zinc-300 hover:border-zinc-500 hover:text-zinc-100"
+                className="btn btn-sm"
+                style={{ flex: "none" }}
               >
                 选择目录
               </button>
             </span>
           </label>
-          <label className="grid gap-1 text-xs text-zinc-500">
+          <label className="field-label">
             PIN（可选，接收时校验）
             <input
               type="text"
               value={draft.pin}
               onChange={(event) => setDraft({ ...draft, pin: event.target.value })}
               placeholder="留空则不校验"
-              className={inputClass}
+              className="field"
             />
           </label>
-          <label className="flex items-center gap-2 text-xs text-zinc-300">
+          <label className="set-check">
             <input
               type="checkbox"
               checked={draft.autoSave}
               onChange={(event) => setDraft({ ...draft, autoSave: event.target.checked })}
-              className="h-3.5 w-3.5 accent-sky-600"
             />
             自动保存（免确认直接接收）
           </label>
-          <label className="flex items-center gap-2 text-xs text-zinc-300">
+          <label className="set-check">
             <input
               type="checkbox"
               checked={draft.notifyOnIncoming}
               onChange={(event) => setDraft({ ...draft, notifyOnIncoming: event.target.checked })}
-              className="h-3.5 w-3.5 accent-sky-600"
             />
             面板隐藏时弹出传输请求通知
           </label>
         </div>
 
         {error && (
-          <p className="mt-3 rounded-md border border-red-900 bg-red-950/60 px-3 py-2 text-xs text-red-300" role="alert">
-            {error}
-          </p>
+          <div className="banner banner-error" style={{ marginTop: 12, marginBottom: 0 }} role="alert">
+            <span aria-hidden>⚠️</span>
+            <span>{error}</span>
+          </div>
         )}
-        <div className="mt-3 flex items-center gap-2">
+        <div className="set-save">
           <button
             type="button"
             onClick={() => void save()}
             disabled={busy}
-            className="rounded-md bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-50"
+            className="btn btn-primary btn-sm"
           >
             {busy ? "保存中…" : "保存设置"}
           </button>
           {saved && (
-            <span className="text-xs text-emerald-400" role="status">
-              已保存
+            <span className="save-ok" role="status">
+              ✓ 已保存
             </span>
           )}
         </div>
       </section>
 
-      <section className="rounded-lg border border-zinc-800 bg-zinc-900 p-4">
-        <h2 className="text-sm font-medium text-zinc-300">服务状态（生效中）</h2>
-        <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-xs">
-          <dt className="text-zinc-500">服务端口</dt>
-          <dd className="text-zinc-100">
+      <section className="card set-card">
+        <h3>服务状态（生效中）</h3>
+        <dl className="kv">
+          <dt>服务端口</dt>
+          <dd>
             {server ? (server.port > 0 ? server.port : "未绑定") : "—"}
-            {server?.error ? (
-              <span className="ml-2 text-red-400">异常</span>
-            ) : null}
+            {server?.error ? <span className="bad">（异常）</span> : null}
           </dd>
-          <dt className="text-zinc-500">协议</dt>
-          <dd className="text-zinc-100">{server?.protocol ?? "—"}</dd>
-          <dt className="text-zinc-500">证书指纹</dt>
-          <dd className="break-all text-zinc-100" title={fingerprint ?? undefined}>
-            {fingerprintShort}
-          </dd>
-          <dt className="text-zinc-500">UDP 发现端口</dt>
-          <dd className="text-zinc-100">{store.udpPort > 0 ? store.udpPort : "未监听"}</dd>
+          <dt>协议</dt>
+          <dd>{server?.protocol ?? "—"}</dd>
+          <dt>证书指纹</dt>
+          <dd title={fingerprint ?? undefined}>{fingerprintShort}</dd>
+          <dt>UDP 发现端口</dt>
+          <dd>{store.udpPort > 0 ? store.udpPort : "未监听"}</dd>
         </dl>
       </section>
     </div>

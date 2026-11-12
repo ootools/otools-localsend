@@ -1,6 +1,6 @@
 /**
- * 设备卡片：别名 / 型号 / 类型图标 / IP:端口 / 最近可见时间。
- * key 由父级按 fingerprint 提供；点击整卡选中用于发送。
+ * 设备卡片：类型图标方块 / 别名 / 型号 / IP:端口 / 最近可见时间。
+ * key 由父级按 fingerprint 提供；点击整卡选中用于发送（选中态描边）。
  */
 
 import { deviceTypeEmoji, deviceTypeLabel, formatRelativeTime } from "../format";
@@ -19,33 +19,27 @@ export function DeviceCard({ entry, selected, onSelect }: DeviceCardProps) {
       type="button"
       onClick={onSelect}
       aria-pressed={selected}
-      className={
-        selected
-          ? "w-full rounded-lg border border-sky-500 bg-zinc-900 p-3 text-left transition-colors"
-          : "w-full rounded-lg border border-zinc-800 bg-zinc-900 p-3 text-left transition-colors hover:border-zinc-700"
-      }
+      className={selected ? "dev-card dev-on" : "dev-card"}
     >
-      <div className="flex items-center gap-2">
-        <span aria-hidden className="text-lg">
-          {deviceTypeEmoji(info.deviceType)}
+      <span className="dev-row">
+        <span className="tile" aria-hidden>{deviceTypeEmoji(info.deviceType)}</span>
+        <span className="dev-name">
+          <b>{info.alias || "未知设备"}</b>
+          <small>
+            {deviceTypeLabel(info.deviceType)}
+            {info.deviceModel ? ` · ${info.deviceModel}` : ""}
+          </small>
         </span>
-        <span className="min-w-0 flex-1 truncate text-sm font-medium text-zinc-100">
-          {info.alias || "未知设备"}
+        <span className="dev-seen" title="最近可见">{formatRelativeTime(lastSeenMs)}</span>
+      </span>
+      <span className="dev-row" style={{ marginTop: 6 }}>
+        <span className="dev-name">
+          <small style={{ fontFamily: "var(--mono)" }}>
+            {ip}
+            {info.port ? `:${info.port}` : ""}
+          </small>
         </span>
-        <span className="shrink-0 text-xs text-zinc-500">
-          {deviceTypeLabel(info.deviceType)}
-        </span>
-      </div>
-      <div className="mt-1 flex items-center justify-between gap-2 text-xs text-zinc-500">
-        <span className="truncate">
-          {ip}
-          {info.port ? `:${info.port}` : ""}
-          {info.deviceModel ? ` · ${info.deviceModel}` : ""}
-        </span>
-        <span className="shrink-0" title="最近可见">
-          {formatRelativeTime(lastSeenMs)}
-        </span>
-      </div>
+      </span>
     </button>
   );
 }

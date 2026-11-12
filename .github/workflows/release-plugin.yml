@@ -44,6 +44,8 @@ jobs:
             artifact: plugin-lib-windows
           - os: macos-latest
             artifact: plugin-lib-macos
+          - os: ubuntu-latest
+            artifact: plugin-lib-linux
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -115,6 +117,11 @@ jobs:
         with:
           name: plugin-lib-macos
           path: lib
+      - name: 汇集 Linux 原生库
+        uses: actions/download-artifact@v4
+        with:
+          name: plugin-lib-linux
+          path: lib
       - name: 汇集前端产物
         uses: actions/download-artifact@v4
         with:
@@ -133,11 +140,16 @@ jobs:
       - name: 发布脚本回归测试
         shell: bash
         run: node --test scripts/*.test.mjs
-      - name: 打包正式插件并生成摘要
+      - name: 打包各平台独立包与通用包
         env:
           VERSION: ${{ steps.meta.outputs.version }}
         shell: bash
-        run: node scripts/pack-plugin.mjs --out dist-pack --version "$VERSION"
+        run: |
+          set -euo pipefail
+          node scripts/pack-plugin.mjs --out dist-pack --version "$VERSION"
+          node scripts/pack-plugin.mjs --out dist-pack --version "$VERSION" --platform windows
+          node scripts/pack-plugin.mjs --out dist-pack --version "$VERSION" --platform macos
+          node scripts/pack-plugin.mjs --out dist-pack --version "$VERSION" --platform linux
       - name: 独立验证插件包
         env:
           VERSION: ${{ steps.meta.outputs.version }}

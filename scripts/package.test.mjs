@@ -177,6 +177,46 @@ test('pack rejects missing ABI symbols without modifying the actual build', (t) 
   assert.match(output(result), /otools_plugin_invoke/);
 });
 
+test('pack --platform filters libraries and names the archive per platform', (t) => {
+  const root = fixture(t);
+  fs.writeFileSync(path.join(root, 'lib', 'macOS.dylib'), Buffer.from('MZ\0otools_plugin_invoke\0otools_plugin_free\0'));
+  fs.writeFileSync(path.join(root, 'lib', 'Linux.so'), Buffer.from('ELF\0otools_plugin_invoke\0otools_plugin_free\0'));
+
+  assert.equal(run('pack-plugin.mjs', root, '--platform', 'macos').status, 0);
+  assert.equal(run('pack-plugin.mjs', root, '--platform', 'windows').status, 0);
+  assert.equal(run('pack-plugin.mjs', root, '--platform', 'linux').status, 0);
+  assert.equal(run('pack-plugin.mjs', root).status, 0); // universal
+
+  const read = (name) => readZip(fs.readFileSync(path.join(root, 'dist-pack', name)));
+  const macos = read('otools-localsend-0.1.0-macos.oplg');
+  assert.ok(macos.has('lib/macOS.dylib'));
+  assert.ok(!macos.has('lib/Windows.dll') && !macos.has('lib/Linux.so'));
+  const windows = read('otools-localsend-0.1.0-windows.oplg');
+  assert.ok(windows.has('lib/Windows.dll') && !windows.has('lib/macOS.dylib'));
+  const universal = read('otools-localsend-0.1.0.oplg');
+  for (const lib of ['lib/Windows.dll', 'lib/macOS.dylib', 'lib/Linux.so']) {
+    assert.ok(universal.has(lib), `${lib} missing from universal package`);
+  }
+
+  // 目录校验：三个独立包 + 通用包全部过验，SHA256SUMS 覆盖所有包
+  const checked = run('verify-plugin.mjs', root);
+  assert.equal(checked.status, 0, output(checked));
+  assert.match(output(checked), /Verified 4 package/);
+
+  // 任一包缺失（SHA256SUMS 未覆盖）→ 拒绝
+  fs.rmSync(path.join(root, 'dist-pack', 'otools-localsend-0.1.0-linux.oplg'));
+  const failed = run('verify-plugin.mjs', root);
+  assert.notEqual(failed.status, 0);
+  assert.match(output(failed), /Incomplete SHA256 manifest/);
+});
+
+test('pack rejects an unknown platform selector', (t) => {
+  const root = fixture(t);
+  const result = run('pack-plugin.mjs', root, '--platform', 'freebsd');
+  assert.notEqual(result.status, 0);
+  assert.match(output(result), /Unknown platform/);
+});
+
 test('pack rejects unexpected native-directory contents instead of shipping secrets', (t) => {
   const root = fixture(t);
   fs.writeFileSync(path.join(root, 'lib', 'key.pem'), 'private key');

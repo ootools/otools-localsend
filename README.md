@@ -15,8 +15,12 @@ LocalSend 协议 v2 兼容的局域网互传 OTools 面板插件：与手机、�
 
 ## 安装
 
-- 插件市场安装 `otools-localsend`，或
-- 手动安装发布包：GitHub Release 中的 `otools-localsend-<version>.oplg`
+- 插件市场安装 `otools-localsend`（市场分发通用包，含全部平台原生库），或
+- 手动安装发布包：GitHub Release 按平台选择
+  - `otools-localsend-<v>-windows.oplg`（仅 Windows.dll）
+  - `otools-localsend-<v>-macos.oplg`（仅 macOS.dylib）
+  - `otools-localsend-<v>-linux.oplg`（仅 Linux.so）
+  - `otools-localsend-<v>.oplg`（通用包，含全部平台）
 
 ## 使用
 

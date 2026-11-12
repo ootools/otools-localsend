@@ -6,8 +6,8 @@
  */
 
 import { useMemo, useState } from "react";
-import { pickFiles } from "otools-plugin-sdk/dialog";
-import { discoverNow, sendFiles, sendText } from "../api";
+import { pickFromHostTree } from "otools-plugin-sdk/host-file-tree";
+import { discoverNow, isPreviewMode, sendFiles, sendText } from "../api";
 import { DeviceCard } from "../components/DeviceCard";
 import { formatError } from "../format";
 import type { PluginStore } from "../hooks/usePollEvents";
@@ -51,8 +51,21 @@ export function DevicesPage({ store, onGoToTransfers }: DevicesPageProps) {
     setBusy("file");
     setError(null);
     try {
-      const paths = await pickFiles({ title: "选择要发送的文件" });
-      if (!paths || paths.length === 0) return; // 用户取消
+      let paths: string[] | null = null;
+      if (isPreviewMode()) {
+        // 预览模式：仿真宿主文件树的选择结果。
+        paths = ["D:\\Photos\\IMG_0042.jpg", "D:\\Docs\\季度报表.xlsx"];
+      } else {
+        // 文件选择走宿主自绘文件树（SDK pickFromHostTree）：面板内渲染、
+        // 选出的是宿主侧路径，桌面/远程访问行为一致；原生对话框不再依赖。
+        const picked = await pickFromHostTree({
+          title: "选择要发送的文件",
+          directory: false,
+          multiple: true,
+        });
+        if (picked.kind !== "picked" || picked.paths.length === 0) return; // 用户取消
+        paths = picked.paths;
+      }
       await sendFiles(selected.ip, selected.info.port, paths, pin.trim() || undefined);
       await store.refreshTransfers();
       onGoToTransfers();

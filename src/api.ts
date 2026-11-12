@@ -197,6 +197,11 @@ const PREVIEW_MODE =
   typeof location !== "undefined" &&
   new URLSearchParams(location.search).has("preview");
 
+/** 供 UI 层在预览模式下仿真宿主交互（如文件选择）。 */
+export function isPreviewMode(): boolean {
+  return PREVIEW_MODE;
+}
+
 const previewFingerprint = "a".repeat(64);
 const previewDevice = (
   alias: string,
@@ -285,8 +290,7 @@ const PREVIEW_DATA: Record<string, unknown> = {
   discover_now: { ok: true },
 };
 
-function previewInvoke(method: string): unknown {
-  if (method === "poll_events") {
+function previewInvoke(method: string): unknown {  if (method === "poll_events") {
     if (previewEventsPending) {
       previewEventsPending = false;
       return { events: [{ event: EVENTS.incomingRequest, data: previewIncoming }] };

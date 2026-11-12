@@ -5,9 +5,9 @@ LocalSend 协议 v2 兼容的局域网互传 OTools 面板插件：与手机、�
 
 - 发现：UDP 组播 `224.0.0.167:53317`（announce / register 按官方语义回源）
 - 传输：自签 HTTPS `53317`，端点 `register` / `prepare-upload` / `upload` / `cancel` / `info`
-- 实现：Rust native（`lib/Windows.dll` + `lib/macOS.dylib`，宿主 `ot-plugin-ffi` ABI）+ React 面板
+- 实现：Rust native（`lib/Windows.dll`、`lib/macOS.dylib`、`lib/Linux.so`，宿主 `ot-plugin-ffi` ABI）+ React 面板
 - autostart：宿主会话启动时执行 `start_localsend`，服务常驻后台接收
-- 平台：Windows + macOS（Linux 原生库后续版本提供）
+- 平台：Windows x64、macOS Intel / Apple Silicon（Universal2）、Linux x64
 
 上游：[LocalSend](https://github.com/localsend/localsend)（快照 `v1.18.2`）与
 [localsend/protocol](https://github.com/localsend/protocol) v2.2。溯源见 [UPSTREAM.md](UPSTREAM.md)，
@@ -50,8 +50,26 @@ LocalSend），会自动递增到空闲端口，并在公告中上报实际端�
 - 若 UDP 发现端口回退（本机 53317 被占用）：本插件的公告仍发往标准组播端口，其他设备
   **可以**发现本插件并回源 register；但其他设备的公告也发往标准端口，本插件已回退**收不到**，
   因此本插件无法通过组播主动发现其他设备，发现依赖对方收到公告后回源。
-- v1 未实现：浏览器反向传输（`prepare-download` / `download`）、收藏设备同步、protocol v3、
-  Linux 原生库。
+- v1 未实现：浏览器反向传输（`prepare-download` / `download`）、收藏设备同步、protocol v3。
+
+## CI 与 macOS 原生库
+
+公开仓库可使用 GitHub 标准 macOS 托管 runner，无需用户手工构建动态库。
+`macos-native.yml` 固定使用受支持的 `macos-15-intel`，分别编译 `x86_64-apple-darwin`
+和 `aarch64-apple-darwin`，经 `lipo` 合并、临时签名、架构校验及实际加载冒烟后，
+上传一个 `lib/macOS.dylib`。两种 Mac CPU 共用同一个安装包，最低部署版本为 macOS 11.0。
+
+发布流程等待 Windows、macOS、Linux 三个平台构建成功，再生成三个独立包与通用包。
+装配和发布前均用 `--require-all-platforms` 校验：缺少任一平台库或独立安装包就失败，
+不会把缺 Mac 库的包作为通用包发布。原有 v0.3.2 及以前已发布的包缺少 Mac 动态库，
+Mac 用户需要更新到包含 Universal2 库的新版本。
+
+本地构建仍可用于开发调试；在 Mac 上执行：
+
+```bash
+node scripts/build-native.mjs
+python3 -I scripts/smoke-native.py --library lib/macOS.dylib
+```
 
 ## 开发
 

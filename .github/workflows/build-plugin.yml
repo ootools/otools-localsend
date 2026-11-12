@@ -1,9 +1,5 @@
-# 构建插件原生库（lib/Windows.dll）与前端（dist/）并上传产物。
-# 触发：push 到 main、PR、手动。
-#
-# v1 仅产出 lib/Windows.dll，因此固定 windows-latest。
-# scripts/build-native.mjs（Task 3）与 scripts/build-web.mjs（Task 10）就位之前，
-# 本工作流会因脚本缺失而失败，属预期；不使用 continue-on-error。
+# 构建插件原生库与前端，并在 macOS 上编译/加载 Universal2 动态库。
+# 触发：push 到 main、PR、手动。Mac 验证不允许跳过或忽略失败。
 name: build-plugin
 
 on:
@@ -13,6 +9,9 @@ on:
   workflow_dispatch:
 
 jobs:
+  macos:
+    uses: ./.github/workflows/macos-native.yml
+
   build:
     runs-on: windows-latest
     steps:

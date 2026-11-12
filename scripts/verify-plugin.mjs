@@ -9,14 +9,13 @@
  * 必须且只能含对应平台库。
  *
  * 用法：node scripts/verify-plugin.mjs [dist-pack]（或 --out dist-pack）
+ * 正式发布传 --require-all-platforms，要求三个独立包和含三库的通用包。
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { option, readZip, validateManifest, validateEntries } from './package-utils.mjs';
-
-const PLATFORM_BY_SUFFIX = { windows: 'Windows.dll', macos: 'macOS.dylib', linux: 'Linux.so' };
+import { option, readZip, validateManifest, validateEntries, PLATFORM_LIBS, requireAllPlatformLibraries } from './package-utils.mjs';
 
 try {
   const root = path.resolve(option('root', path.join(path.dirname(fileURLToPath(import.meta.url)), '..')));
@@ -29,6 +28,13 @@ try {
   const archives = fs.readdirSync(directory).filter((name) =>
     name.startsWith(`${manifest.packid}-${manifest.version}`) && name.endsWith('.oplg'));
   if (!archives.length) throw new Error(`No .oplg for ${manifest.packid}-${manifest.version} in ${directory}`);
+  const requireAll = process.argv.includes('--require-all-platforms');
+  if (requireAll) {
+    for (const suffix of ['', ...Object.keys(PLATFORM_LIBS).map((platform) => `-${platform}`)]) {
+      const filename = `${manifest.packid}-${manifest.version}${suffix}.oplg`;
+      if (!archives.includes(filename)) throw new Error(`Missing release package ${filename}`);
+    }
+  }
 
   const requiredSums = new Set([...archives, 'plugin.json', 'logo.svg']);
   for (const line of fs.readFileSync(path.join(directory, 'SHA256SUMS'), 'utf8').trim().split(/\r?\n/)) {
@@ -47,8 +53,9 @@ try {
     if (!entries.get('logo.svg')?.equals(fs.readFileSync(path.join(directory, 'logo.svg')))) throw new Error(`Packaged icon mismatch: ${filename}`);
     const libraries = validateEntries(manifest, entries);
     const suffix = filename.slice(`${manifest.packid}-${manifest.version}`.length, -'.oplg'.length);
+    if (requireAll && suffix === '') requireAllPlatformLibraries(entries);
     if (suffix.startsWith('-')) {
-      const expected = PLATFORM_BY_SUFFIX[suffix.slice(1)];
+      const expected = PLATFORM_LIBS[suffix.slice(1)];
       if (!expected) throw new Error(`Unknown package platform suffix: ${filename}`);
       if (libraries.length !== 1 || libraries[0] !== `lib/${expected}`) {
         throw new Error(`Platform package ${filename} must contain exactly lib/${expected}`);

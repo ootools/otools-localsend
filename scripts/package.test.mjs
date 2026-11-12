@@ -53,7 +53,7 @@ function output(result) {
 }
 
 function updateSums(out) {
-  const names = ['otools-localsend-0.1.0.oplg', 'plugin.json', 'logo.svg'];
+  const names = [...fs.readdirSync(out).filter((name) => name.endsWith('.oplg')).sort(), 'plugin.json', 'logo.svg'];
   fs.writeFileSync(path.join(out, 'SHA256SUMS'), names.map((name) =>
     `${createHash('sha256').update(fs.readFileSync(path.join(out, name))).digest('hex')}  ${name}`,
   ).join('\n') + '\n');
@@ -208,6 +208,45 @@ test('pack --platform filters libraries and names the archive per platform', (t)
   const failed = run('verify-plugin.mjs', root);
   assert.notEqual(failed.status, 0);
   assert.match(output(failed), /Incomplete SHA256 manifest/);
+});
+
+test('release packaging refuses to call an incomplete library set universal', (t) => {
+  const root = fixture(t);
+  const result = run('pack-plugin.mjs', root, '--require-all-platforms');
+  assert.notEqual(result.status, 0, 'release packaging silently accepted a Windows-only universal package');
+  assert.match(output(result), /Missing release library.*macOS\.dylib/);
+});
+
+test('release verification rejects missing Mac and Linux packages', (t) => {
+  const root = fixture(t);
+  assert.equal(run('pack-plugin.mjs', root).status, 0);
+  const result = run('verify-plugin.mjs', root, '--require-all-platforms');
+  assert.notEqual(result.status, 0, 'release verification silently accepted an incomplete release');
+  assert.match(output(result), /Missing release package/);
+});
+
+test('strict release verification accepts all four packages and all three universal libraries', (t) => {
+  const root = fixture(t);
+  const symbols = Buffer.from('test ABI fixture\0otools_plugin_invoke\0otools_plugin_free\0');
+  fs.writeFileSync(path.join(root, 'lib', 'macOS.dylib'), symbols);
+  fs.writeFileSync(path.join(root, 'lib', 'Linux.so'), symbols);
+  for (const platform of ['all', 'windows', 'macos', 'linux']) {
+    const packed = run('pack-plugin.mjs', root, '--platform', platform, '--require-all-platforms');
+    assert.equal(packed.status, 0, output(packed));
+  }
+  const checked = run('verify-plugin.mjs', root, '--require-all-platforms');
+  assert.equal(checked.status, 0, output(checked));
+  assert.match(output(checked), /Verified 4 package/);
+
+  const out = path.join(root, 'dist-pack');
+  const universal = path.join(out, 'otools-localsend-0.1.0.oplg');
+  const entries = readZip(fs.readFileSync(universal));
+  entries.delete('lib/macOS.dylib');
+  fs.writeFileSync(universal, writeZip([...entries].map(([name, data]) => ({ name, data }))));
+  updateSums(out);
+  const incomplete = run('verify-plugin.mjs', root, '--require-all-platforms');
+  assert.notEqual(incomplete.status, 0, 'valid checksums hid a missing Mac library in the universal package');
+  assert.match(output(incomplete), /Missing release library.*macOS\.dylib/);
 });
 
 test('pack rejects an unknown platform selector', (t) => {

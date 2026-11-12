@@ -12,6 +12,18 @@ export function option(name, fallback) {
   return index < 0 ? fallback : process.argv[index + 1] || fallback;
 }
 
+export const PLATFORM_LIBS = Object.freeze({
+  windows: 'Windows.dll',
+  macos: 'macOS.dylib',
+  linux: 'Linux.so',
+});
+
+export function requireAllPlatformLibraries(entries) {
+  for (const library of Object.values(PLATFORM_LIBS)) {
+    if (!entries.has(`lib/${library}`)) throw new Error(`Missing release library lib/${library}`);
+  }
+}
+
 export function validPath(name) {
   return typeof name === 'string' && name.length > 0 && !/[\\:\x00]/.test(name)
     && !name.split('/').some((part) => !part || part === '.' || part === '..');

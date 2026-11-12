@@ -1,0 +1,61 @@
+name: macOS native
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS Universal2 (Intel + Apple Silicon)
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+          key: macos-universal2
+      - name: Test native code on macOS
+        run: cargo test --locked --manifest-path native/Cargo.toml
+      - name: Build both macOS architectures
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          node scripts/build-native.mjs --target x86_64-apple-darwin
+          node scripts/build-native.mjs --target aarch64-apple-darwin
+      - name: Merge and sign Universal2 library
+        shell: bash
+        run: |
+          set -euo pipefail
+          lipo -create \
+            native/target/x86_64-apple-darwin/release/libotools_localsend_native.dylib \
+            native/target/aarch64-apple-darwin/release/libotools_localsend_native.dylib \
+            -output lib/macOS.dylib
+          lipo -verify_arch x86_64 arm64 lib/macOS.dylib
+          codesign --force --sign - --timestamp=none lib/macOS.dylib
+          codesign --verify --strict --verbose=2 lib/macOS.dylib
+          file lib/macOS.dylib
+          lipo -archs lib/macOS.dylib
+          otool -L lib/macOS.dylib
+          xcrun vtool -show-build lib/macOS.dylib
+      - name: Load and smoke-test macOS library
+        run: python3 -I scripts/smoke-native.py --library lib/macOS.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-lib-macos
+          path: lib/macOS.dylib
+          if-no-files-found: error
+          retention-days: 14

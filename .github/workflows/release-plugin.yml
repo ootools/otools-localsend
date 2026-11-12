@@ -1,6 +1,6 @@
 # 发布插件：v* tag（或手动）触发构建 → 打包 .oplg → 校验 → GitHub Release → 市场同步。
-# 原生库按平台矩阵构建（Windows + Linux）；macOS 托管 runner 对 free 组织不可用，
-# 其动态库由本地 Mac 构建后手动并入发布产物。
+# 三平台库全部由 CI 构建；macOS 为 Intel + Apple Silicon Universal2。
+# 任一平台缺失时禁止发布，不能把不完整的安装包当成通用包。
 # 市场上架由仓库变量 OTOOLS_PUBLISH_MARKET == 'true' 门控，secrets 名沿用模板：XYCLOUD_PAT 等。
 name: release-plugin
 run-name: "插件${{ inputs.dry_run && '验证' || '发布' }} · ${{ inputs.display_version || github.ref_name }}"
@@ -43,7 +43,6 @@ jobs:
         include:
           - os: windows-latest
             artifact: plugin-lib-windows
-            optional: false
           - os: ubuntu-latest
             artifact: plugin-lib-linux
     runs-on: ${{ matrix.os }}
@@ -63,6 +62,9 @@ jobs:
           path: lib
           if-no-files-found: error
           retention-days: 14
+
+  macos:
+    uses: ./.github/workflows/macos-native.yml
 
   web:
     name: 构建前端
@@ -90,7 +92,7 @@ jobs:
 
   build:
     name: 装配打包
-    needs: [native, web]
+    needs: [native, macos, web]
     runs-on: windows-latest
     outputs:
       version: ${{ steps.meta.outputs.version }}
@@ -107,8 +109,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      # macOS 库不在 CI 构建（free 组织无 macOS 托管 runner）：
-      # 由本地 Mac 构建后手动并入发布产物（见 README「macOS 原生库」）。
+      # 三平台产物均来自本次 CI；Mac 构建失败会阻止本任务执行。
       - name: 汇集各平台原生库
         uses: actions/download-artifact@v4
         with:
@@ -139,20 +140,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          node scripts/pack-plugin.mjs --out dist-pack --version "$VERSION"
+          node scripts/pack-plugin.mjs --out dist-pack --version "$VERSION" --require-all-platforms
           for p in windows macos linux; do
-            libcase="Windows.dll"; [ "$p" = macos ] && libcase="macOS.dylib"; [ "$p" = linux ] && libcase="Linux.so"
-            if [ -f "lib/$libcase" ]; then
-              node scripts/pack-plugin.mjs --out dist-pack --version "$VERSION" --platform "$p"
-            else
-              echo "skip $p package (no lib/$libcase in this release)"
-            fi
+            node scripts/pack-plugin.mjs --out dist-pack --version "$VERSION" --platform "$p" --require-all-platforms
           done
       - name: 独立验证插件包
         env:
           VERSION: ${{ steps.meta.outputs.version }}
           PACKID: ${{ steps.meta.outputs.packid }}
-        run: node scripts/verify-plugin.mjs dist-pack
+        run: node scripts/verify-plugin.mjs dist-pack --require-all-platforms
       - uses: actions/upload-artifact@v4
         with:
           name: oplg
@@ -196,7 +192,7 @@ jobs:
         env:
           VERSION: ${{ needs.build.outputs.version }}
           PACKID: ${{ needs.build.outputs.packid }}
-        run: node scripts/verify-plugin.mjs release-assets
+        run: node scripts/verify-plugin.mjs release-assets --require-all-platforms
       - name: 检查市场凭证配置（不发送凭证、不上架）
         if: ${{ needs.build.outputs.market_requested == 'true' }}
         env:

@@ -14,15 +14,14 @@
  * meta.json（release 工作流按这套扁平结构上传/复验）。
  *
  * 用法：node scripts/pack-plugin.mjs [--out dist-pack] [--version 0.1.0]
- *       [--platform all|windows|macos|linux]
+ *       [--platform all|windows|macos|linux] [--require-all-platforms]
+ * 正式发布必须传 --require-all-platforms，缺少任一平台原生库即拒绝打包。
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { option, walk, writeZip, validateManifest, validateEntries } from './package-utils.mjs';
-
-const PLATFORM_LIBS = { windows: 'Windows.dll', macos: 'macOS.dylib', linux: 'Linux.so' };
+import { option, walk, writeZip, validateManifest, validateEntries, PLATFORM_LIBS, requireAllPlatformLibraries } from './package-utils.mjs';
 
 try {
   const root = path.resolve(option('root', path.join(path.dirname(fileURLToPath(import.meta.url)), '..')));
@@ -46,6 +45,7 @@ try {
     if (!fs.existsSync(full)) continue;
     for (const relative of walk(full)) entries.set(`${directory}/${relative}`, fs.readFileSync(path.join(full, relative)));
   }
+  if (process.argv.includes('--require-all-platforms')) requireAllPlatformLibraries(entries);
   if (platform !== 'all') {
     const keep = `lib/${PLATFORM_LIBS[platform]}`;
     for (const name of [...entries.keys()]) {

@@ -55,16 +55,3 @@ jobs:
           path: lib/
           if-no-files-found: error
 
-  # macOS 原生库编译检查：free 组织无 macOS 托管 runner，允许缺席；
-  # macOS 库由本地 Mac 构建后并入发布产物。
-  native-macos:
-    runs-on: macos-14
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: native
-      - name: 构建原生库（macOS）
-        run: node scripts/build-native.mjs

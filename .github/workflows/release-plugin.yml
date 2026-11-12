@@ -1,5 +1,6 @@
 # 发布插件：v* tag（或手动）触发构建 → 打包 .oplg → 校验 → GitHub Release → 市场同步。
-# 原生库按平台矩阵构建（Windows + macOS；Linux 后续），装配任务合并后打包。
+# 原生库按平台矩阵构建（Windows + Linux）；macOS 托管 runner 对 free 组织不可用，
+# 其动态库由本地 Mac 构建后手动并入发布产物。
 # 市场上架由仓库变量 OTOOLS_PUBLISH_MARKET == 'true' 门控，secrets 名沿用模板：XYCLOUD_PAT 等。
 name: release-plugin
 run-name: "插件${{ inputs.dry_run && '验证' || '发布' }} · ${{ inputs.display_version || github.ref_name }}"
@@ -45,14 +46,7 @@ jobs:
             optional: false
           - os: ubuntu-latest
             artifact: plugin-lib-linux
-            optional: false
-          # free 组织无 macOS 托管 runner（configuration not supported）：
-          # macOS 库由本地 Mac 构建后并入发布产物，CI 里允许缺席。
-          - os: macos-14
-            artifact: plugin-lib-macos
-            optional: true
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.optional }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -113,6 +107,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      # macOS 库不在 CI 构建（free 组织无 macOS 托管 runner）：
+      # 由本地 Mac 构建后手动并入发布产物（见 README「macOS 原生库」）。
       - name: 汇集各平台原生库
         uses: actions/download-artifact@v4
         with:

@@ -11,6 +11,21 @@
   "key": ["localsend", "LocalSend", "互传", "局域网", "文件传输", "AirDrop", "传输"],
   "openMode": "panel",
   "openInBrowser": false,
+  "native": {
+    "enabled": true,
+    "libDir": "lib",
+    "autoReload": false
+  },
+  "autostart": {
+    "enabled": true,
+    "once": true,
+    "tasks": [
+      {
+        "command": "start_localsend",
+        "args": {}
+      }
+    ]
+  },
   "devUrl": "http://127.0.0.1:6497",
   "quickDev": true,
   "hasAd": false,

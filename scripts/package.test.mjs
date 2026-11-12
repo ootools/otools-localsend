@@ -1,0 +1,181 @@
+/** Packaging checks run in isolated fixtures; never replace the real DLL. */
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { test } from 'node:test';
+import { writeZip, readZip, validateManifest, validateEntries } from './package-utils.mjs';
+
+const scripts = path.dirname(fileURLToPath(import.meta.url));
+const manifest = {
+  packid: 'otools-localsend', uuid: 'otools-localsend', version: '0.1.0',
+  entry: 'dist/index.html', openMode: 'panel',
+  native: { enabled: true, libDir: 'lib', autoReload: false },
+  autostart: { enabled: true, once: true, tasks: [{ command: 'start_localsend', args: {} }] },
+};
+
+function fixtureEntries() {
+  return new Map([
+    ['plugin.json', Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`)],
+    ['logo.svg', Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>')],
+    ['LICENSE', Buffer.from('Test license fixture')],
+    ['THIRD_PARTY_NOTICES.md', Buffer.from('Test notices fixture')],
+    ['UPSTREAM.md', Buffer.from('Test provenance fixture')],
+    ['LICENSES/sdk-MIT.txt', Buffer.from('Test SDK license fixture')],
+    ['dist/index.html', Buffer.from('<script type="module" src="./assets/index.js"></script>')],
+    ['dist/assets/index.js', Buffer.from('window.otools&&console.log("bridge")')],
+    ['lib/Windows.dll', Buffer.from('MZ\0otools_plugin_invoke\0otools_plugin_free\0')],
+  ]);
+}
+
+function fixture(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'otools-localsend-package-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  for (const [name, data] of fixtureEntries()) {
+    const target = path.join(root, name);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, data);
+  }
+  return root;
+}
+
+function run(script, root, ...args) {
+  return spawnSync(process.execPath, [path.join(scripts, script), '--root', root, ...args], {
+    cwd: scripts, encoding: 'utf8', timeout: 30_000,
+  });
+}
+
+function output(result) {
+  return `${result.stdout ?? ''}${result.stderr ?? ''}`;
+}
+
+function updateSums(out) {
+  const names = ['otools-localsend-0.1.0.oplg', 'plugin.json', 'logo.svg'];
+  fs.writeFileSync(path.join(out, 'SHA256SUMS'), names.map((name) =>
+    `${createHash('sha256').update(fs.readFileSync(path.join(out, name))).digest('hex')}  ${name}`,
+  ).join('\n') + '\n');
+}
+
+test('ZIP roundtrip preserves all file bytes', () => {
+  const entries = fixtureEntries();
+  const result = readZip(writeZip([...entries].map(([name, data]) => ({ name, data }))));
+  assert.equal(result.size, entries.size);
+  for (const [name, bytes] of entries) assert.deepEqual(result.get(name), bytes);
+});
+
+test('archive paths reject traversal, absolute paths and duplicates', () => {
+  for (const name of ['../evil', 'C:/evil', '/etc/passwd', 'dist/../evil']) {
+    assert.throws(() => writeZip([{ name, data: Buffer.from('x') }]), /Invalid archive path/);
+  }
+  assert.throws(() => writeZip([
+    { name: 'a.txt', data: Buffer.from('one') },
+    { name: 'a.txt', data: Buffer.from('two') },
+  ]), /duplicate/i);
+});
+
+test('manifest requires the native receiver and once-only autostart', () => {
+  assert.throws(() => validateManifest({ ...manifest, packid: 'other' }), /packid/);
+  assert.throws(() => validateManifest({ ...manifest, uuid: 'other' }), /uuid/);
+  assert.throws(() => validateManifest({ ...manifest, autostart: undefined }), /autostart/);
+  assert.throws(() => validateManifest({ ...manifest, autostart: { ...manifest.autostart, enabled: false } }), /autostart/);
+  assert.throws(() => validateManifest({ ...manifest, autostart: { ...manifest.autostart, once: false } }), /autostart/);
+  assert.throws(() => validateManifest({ ...manifest, native: { enabled: false, libDir: 'lib' } }), /native/);
+});
+
+test('v1 package needs Windows.dll even if another platform library exists', () => {
+  const entries = fixtureEntries();
+  entries.set('lib/Linux.so', entries.get('lib/Windows.dll'));
+  entries.delete('lib/Windows.dll');
+  assert.throws(() => validateEntries(manifest, entries), /Windows\.dll/);
+});
+
+test('entry bundle needs package-relative assets and the bridge', () => {
+  const absolute = fixtureEntries();
+  absolute.set('dist/index.html', Buffer.from('<script src="/assets/index.js"></script>'));
+  assert.throws(() => validateEntries(manifest, absolute), /package-relative/);
+  const missing = fixtureEntries();
+  missing.delete('dist/assets/index.js');
+  assert.throws(() => validateEntries(manifest, missing), /Missing frontend asset/);
+  const noBridge = fixtureEntries();
+  noBridge.set('dist/assets/index.js', Buffer.from('console.log(1)'));
+  assert.throws(() => validateEntries(manifest, noBridge), /bridge marker/);
+});
+
+test('pack then verify produces a production archive without unrelated data', (t) => {
+  const root = fixture(t);
+  fs.writeFileSync(path.join(root, 'plugin.json'), JSON.stringify({ ...manifest, devUrl: 'http://127.0.0.1:6497', quickDev: true }));
+  fs.writeFileSync(path.join(root, 'user-private-key.pem'), 'must never ship');
+  assert.equal(run('pack-plugin.mjs', root).status, 0);
+  const checked = run('verify-plugin.mjs', root);
+  assert.equal(checked.status, 0, output(checked));
+  const out = path.join(root, 'dist-pack');
+  const entries = readZip(fs.readFileSync(path.join(out, 'otools-localsend-0.1.0.oplg')));
+  assert.ok(entries.has('lib/Windows.dll'));
+  assert.ok(entries.has('LICENSES/sdk-MIT.txt'));
+  assert.ok(!entries.has('user-private-key.pem'));
+  const packaged = JSON.parse(entries.get('plugin.json'));
+  assert.equal(packaged.devUrl, undefined);
+  assert.equal(packaged.quickDev, undefined);
+  assert.equal(packaged.native.autoReload, false);
+});
+
+test('verify rejects corrupted SHA256 without trusting metadata', (t) => {
+  const root = fixture(t);
+  assert.equal(run('pack-plugin.mjs', root).status, 0);
+  const file = path.join(root, 'dist-pack', 'otools-localsend-0.1.0.oplg');
+  const bytes = fs.readFileSync(file);
+  bytes[Math.floor(bytes.length / 2)] ^= 0xff;
+  fs.writeFileSync(file, bytes);
+  const result = run('verify-plugin.mjs', root);
+  assert.notEqual(result.status, 0);
+  assert.match(output(result), /SHA256 mismatch/);
+});
+
+test('verify rejects a corrupt ZIP CRC even after checksums are recomputed', (t) => {
+  const root = fixture(t);
+  assert.equal(run('pack-plugin.mjs', root).status, 0);
+  const out = path.join(root, 'dist-pack');
+  const filename = path.join(out, 'otools-localsend-0.1.0.oplg');
+  const bytes = fs.readFileSync(filename);
+  const central = bytes.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+  assert.ok(central > 0);
+  bytes[central + 16] ^= 0xff;
+  fs.writeFileSync(filename, bytes);
+  updateSums(out);
+  const result = run('verify-plugin.mjs', root);
+  assert.notEqual(result.status, 0);
+  assert.match(output(result), /ZIP CRC\/size mismatch/);
+});
+
+test('verify rejects a missing native DLL even with a valid ZIP and checksums', (t) => {
+  const root = fixture(t);
+  assert.equal(run('pack-plugin.mjs', root).status, 0);
+  const out = path.join(root, 'dist-pack');
+  const filename = path.join(out, 'otools-localsend-0.1.0.oplg');
+  const entries = readZip(fs.readFileSync(filename));
+  entries.delete('lib/Windows.dll');
+  fs.writeFileSync(filename, writeZip([...entries].map(([name, data]) => ({ name, data }))));
+  updateSums(out);
+  const result = run('verify-plugin.mjs', root);
+  assert.notEqual(result.status, 0);
+  assert.match(output(result), /Windows\.dll/);
+});
+
+test('pack rejects missing ABI symbols without modifying the actual build', (t) => {
+  const root = fixture(t);
+  fs.writeFileSync(path.join(root, 'lib', 'Windows.dll'), 'MZ invalid plugin');
+  const result = run('pack-plugin.mjs', root);
+  assert.notEqual(result.status, 0);
+  assert.match(output(result), /otools_plugin_invoke/);
+});
+
+test('pack rejects unexpected native-directory contents instead of shipping secrets', (t) => {
+  const root = fixture(t);
+  fs.writeFileSync(path.join(root, 'lib', 'key.pem'), 'private key');
+  const result = run('pack-plugin.mjs', root);
+  assert.notEqual(result.status, 0);
+  assert.match(output(result), /Unexpected packaged file/);
+});

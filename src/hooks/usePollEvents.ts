@@ -25,6 +25,8 @@ import {
   type UnlistenFn,
 } from "../api";
 import { normalizeTransferStatus } from "../format";
+import { pendingIncomingFromTransfers } from "./incomingRebuild";
+import { devicesFromWire, upsertDeviceFromWire } from "./deviceState";
 import {
   isPermissionGranted,
   requestPermission,
@@ -34,12 +36,6 @@ import {
 const POLL_INTERVAL_MS = 1000;
 /** 设备表重同步：device-found 事件线上 lastSeenMs 恒为 0，靠周期刷新补真实值。 */
 const DEVICE_RESYNC_MS = 15000;
-
-/**
- * native 线上 lastSeenMs 是"距今经过毫秒"（elapsed，device-found 事件恒为 0，
- * discovery.rs:128），不是 unix 毫秒 —— 摄取点统一归一化为 unix 存储。
- */
-const seenAtUnixMs = (elapsedMs: number): number => Date.now() - elapsedMs;
 
 /** sessionId → fileId → percent（transfer-progress 聚合）。 */
 export type ProgressMap = Record<string, Record<string, number>>;
@@ -118,12 +114,7 @@ export function usePollEvents() {
       const { devices: list, udpPort: port } = await listDevices();
       if (!aliveRef.current) return;
       setUdpPort(port ?? 0);
-      // elapsed → unix 归一化后再按新近度排序。
-      setDevices(
-        list
-          .map((entry) => ({ ...entry, lastSeenMs: seenAtUnixMs(entry.lastSeenMs ?? 0) }))
-          .sort((a, b) => (b.lastSeenMs ?? 0) - (a.lastSeenMs ?? 0)),
-      );
+      setDevices(devicesFromWire(list, Date.now()));
     } catch {
       // 降级：保留现有列表。
     }
@@ -150,29 +141,7 @@ export function usePollEvents() {
 
   const upsertDevice = useCallback((entry: DeviceEntry) => {
     if (!entry || typeof entry.ip !== "string" || !entry.info?.fingerprint) return;
-    setDevices((list) => {
-      const index = list.findIndex(
-        (item) => item.info.fingerprint === entry.info.fingerprint,
-      );
-      if (index === -1) return [...list, entry];
-      const existing = list[index];
-      // 事件线 lastSeenMs 是 elapsed（device-found 恒 0）：归一化成 unix 后
-      // max 合并保留真实最近时间。
-      const merged: DeviceEntry = {
-        ...entry,
-        lastSeenMs: Math.max(existing.lastSeenMs ?? 0, seenAtUnixMs(entry.lastSeenMs ?? 0)),
-      };
-      if (
-        existing.ip === merged.ip &&
-        existing.lastSeenMs === merged.lastSeenMs &&
-        JSON.stringify(existing.info) === JSON.stringify(merged.info)
-      ) {
-        return list;
-      }
-      const next = [...list];
-      next[index] = merged;
-      return next;
-    });
+    setDevices((list) => upsertDeviceFromWire(list, entry, Date.now()));
   }, []);
 
   const removeDevice = useCallback((fingerprint: string) => {
@@ -377,14 +346,20 @@ export function usePollEvents() {
 
       if (devicesResult.status === "fulfilled") {
         setUdpPort(devicesResult.value.udpPort ?? 0);
-        setDevices(
-          devicesResult.value.devices
-            .map((entry) => ({ ...entry, lastSeenMs: seenAtUnixMs(entry.lastSeenMs ?? 0) }))
-            .sort((a, b) => (b.lastSeenMs ?? 0) - (a.lastSeenMs ?? 0)),
-        );
+        setDevices(devicesFromWire(devicesResult.value.devices, Date.now()));
       }
       if (transfersResult.status === "fulfilled") {
-        setTransfers(sortByNewestTransfers(transfersResult.value));
+        const records = sortByNewestTransfers(transfersResult.value);
+        setTransfers(records);
+        // 待确认的 Receive 会话在面板重开后必须重新弹窗（Task 11 审查交接）：
+        // native 在 prepare-upload 时已入队 Pending 记录，会话与 token 都还在
+        // 内存里，session_accept 直接可用。按 sessionId 入 seen 集（粘性去重
+        // 与事件线一致，双通道重复投递不会重开幽灵弹窗）。
+        const pending = pendingIncomingFromTransfers(records).filter(
+          (request) => !seenIncomingRef.current.has(request.sessionId),
+        );
+        for (const request of pending) seenIncomingRef.current.add(request.sessionId);
+        if (pending.length) setIncoming((queue) => [...queue, ...pending]);
       }
       if (statusResult.status === "fulfilled") {
         setServer(statusResult.value);

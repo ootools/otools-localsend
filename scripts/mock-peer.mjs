@@ -691,15 +691,18 @@ async function cmdSend(opts) {
   }
   if (typeof opts.text === 'string') {
     const content = Buffer.from(opts.text, 'utf8');
+    // Official AddMessageAction (v1.18.2): the virtual text file is named
+    // `<uuid v4>.txt` and the text rides in `preview` (send_provider.dart) —
+    // receivers render it as a message bubble instead of saving a file.
     files.push({
       id: crypto.randomUUID(),
-      fileName: 'message.txt',
+      fileName: `${crypto.randomUUID()}.txt`,
       fileType: 'text/plain',
       size: content.length,
       sha256: opts['corrupt-sha']
         ? '0'.repeat(64)
         : crypto.createHash('sha256').update(content).digest('hex'),
-      preview: null,
+      preview: opts.text,
       metadata: null,
       filePath: null,
       content,

@@ -778,14 +778,19 @@ pub fn prepare_upload(
         sessions.update_record(&mut inner, &session_id, status, None);
     }
 
-    sessions.events.send(
-        "incoming-request",
-        json!({
-            "sessionId": session_id,
-            "sender": sender,
-            "files": files_list,
-        }),
-    );
+    // Only manual-confirm sessions surface an incoming request (Task 7):
+    // auto-save sessions were answered 200 above and are already Transferring
+    // — there is nothing for the user to decide.
+    if status == TransferStatus::Pending {
+        sessions.events.send(
+            "incoming-request",
+            json!({
+                "sessionId": session_id,
+                "sender": sender,
+                "files": files_list,
+            }),
+        );
+    }
 
     match decision_rx {
         None => {
@@ -1716,14 +1721,13 @@ mod tests {
             "per-session temp dir prepared"
         );
 
+        // Auto-save answered 200 directly — the session is already
+        // Transferring, so no confirm request may be raised (Task 7: only
+        // manual Pending sessions emit incoming-request).
         let incoming = event_data(&events, "incoming-request");
-        assert_eq!(incoming.len(), 1, "exactly one incoming-request event");
-        assert_eq!(incoming[0]["sessionId"], session_id);
-        assert_eq!(incoming[0]["sender"]["alias"], "Mock Sender");
-        assert_eq!(
-            incoming[0]["files"].as_array().expect("files array").len(),
-            2,
-            "incoming-request carries the file list"
+        assert!(
+            incoming.is_empty(),
+            "auto-save prepare must not emit incoming-request: {incoming:?}"
         );
 
         let record = record_snapshot(&sessions, &session_id);
@@ -1756,10 +1760,9 @@ mod tests {
         assert_eq!(status, 409, "the accepted session now blocks a second one");
 
         let incoming = event_data(&events, "incoming-request");
-        assert_eq!(
-            incoming.len(),
-            1,
-            "rejected PIN attempts emit no incoming-request"
+        assert!(
+            incoming.is_empty(),
+            "neither rejected PIN attempts nor the auto-save accept may emit incoming-request: {incoming:?}"
         );
     }
 

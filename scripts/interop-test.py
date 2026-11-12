@@ -954,5 +954,95 @@ def send_text():
     return "uuid-v4 .txt + preview byte-exact; --message-204 mock accepts with zero uploads"
 
 
+@register_scenario
+@scenario
+def receive_auto_save():
+    """auto_save ON: prepare-upload answers 200 immediately and the transfer
+    completes WITHOUT any incoming-request — the confirm dialog is reserved
+    for manual Pending sessions (Task 7). Files land byte-identical."""
+    drain_events()
+    set_settings(lambda s: s.update(autoSave=True, downloadDir=str(CTX["downloads"])))
+    assert ok_data("settings_get")["autoSave"] is True, "autoSave not applied"
+
+    first = make_text_file(CTX["src"], "自动保存-a.txt", "auto save file one\n")
+    second = make_text_file(CTX["src"], "自动保存-b.txt", "auto save file two\n")
+    expected = {"自动保存-a.txt": sha256_file(first), "自动保存-b.txt": sha256_file(second)}
+
+    mock = MockPeer(
+        [
+            "send",
+            "--to",
+            f"127.0.0.1:{CTX['tcp_port']}",
+            "--file",
+            str(first),
+            "--file",
+            str(second),
+        ]
+    )
+
+    # Accumulate every drained DLL event from before the prepare until after
+    # transfer-done — the negative assertion below must see the WHOLE stream,
+    # not just the tail (wait_dll_event would silently discard evidence).
+    seen: list[dict] = []
+
+    deadline = time.monotonic() + 30
+    prep = None
+    while time.monotonic() < deadline and prep is None:
+        seen.extend(drain_events())
+        matches = [e for e in mock.of_type("prepare") if e.get("status") == 200]
+        if matches:
+            prep = matches[0]
+        time.sleep(0.05)
+    assert prep, f"auto-save prepare never answered 200: {mock.diagnostics()}"
+    session_id = prep.get("sessionId")
+    assert session_id, f"prepare event missing sessionId: {prep}"
+
+    done = mock.wait_event("done", lambda e: e.get("status") == "done", timeout=120)
+    assert done and done["status"] == "done", (
+        f"auto-save send did not finish: {done}; {mock.diagnostics()}"
+    )
+    uploads = mock.of_type("uploaded")
+    assert {u["fileName"] for u in uploads} == {"自动保存-a.txt", "自动保存-b.txt"}, uploads
+
+    deadline = time.monotonic() + 60
+    dll_done = False
+    while time.monotonic() < deadline and not dll_done:
+        seen.extend(drain_events())
+        dll_done = any(
+            e["event"] == "transfer-done"
+            and e["data"].get("sessionId") == session_id
+            and e["data"].get("status") == "done"
+            for e in seen
+        )
+        time.sleep(0.05)
+    assert dll_done, f"transfer-done never arrived; events seen: {[e['event'] for e in seen[-20:]]}"
+
+    # The core assertion: auto-save must NOT raise a confirm request anywhere
+    # on the wire (no live event, nothing left in poll_events).
+    leaked = [e for e in seen if e["event"] == "incoming-request"]
+    assert leaked == [], f"auto-save emitted incoming-request: {leaked}"
+
+    record = find_record(session_id)
+    assert record["status"] == "Done", f"record status: {record['status']}"
+    name_by_id = {f["id"]: f["fileName"] for f in record["files"]}
+    assert set(name_by_id.values()) == {"自动保存-a.txt", "自动保存-b.txt"}, (
+        f"unexpected file list: {list(name_by_id.values())}"
+    )
+    destinations = record.get("destinations") or {}
+    assert set(destinations) == set(name_by_id), (
+        f"destinations {list(destinations)} vs files {list(name_by_id)}"
+    )
+    for file_id, destination in destinations.items():
+        assert Path(destination).parent == CTX["downloads"], f"not in download dir: {destination}"
+        assert sha256_file(destination) == expected[name_by_id[file_id]], (
+            f"bytes differ for {name_by_id[file_id]}"
+        )
+
+    set_settings(lambda s: s.update(autoSave=False))
+    assert ok_data("settings_get")["autoSave"] is False, "autoSave not restored"
+    drain_events()
+    return "auto-save: immediate 200, zero incoming-request, Done + byte-identical files"
+
+
 if __name__ == "__main__":
     main()

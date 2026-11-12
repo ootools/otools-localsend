@@ -50,7 +50,11 @@ export interface DeviceInfo {
   download: boolean;
 }
 
-/** 发现注册表条目（lastSeenMs = 最近一次公告帧的 unix 毫秒）。 */
+/**
+ * 发现注册表条目。线上 lastSeenMs 为"距今经过毫秒"（elapsed，
+ * discovery.rs:128 `last_seen.elapsed()`；device-found 事件恒为 0），
+ * 存储层（usePollEvents）在摄取点归一化为 unix 毫秒后再排序/展示。
+ */
 export interface DeviceEntry {
   info: DeviceInfo;
   ip: string;

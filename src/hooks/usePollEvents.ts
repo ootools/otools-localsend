@@ -35,6 +35,12 @@ const POLL_INTERVAL_MS = 1000;
 /** 设备表重同步：device-found 事件线上 lastSeenMs 恒为 0，靠周期刷新补真实值。 */
 const DEVICE_RESYNC_MS = 15000;
 
+/**
+ * native 线上 lastSeenMs 是"距今经过毫秒"（elapsed，device-found 事件恒为 0，
+ * discovery.rs:128），不是 unix 毫秒 —— 摄取点统一归一化为 unix 存储。
+ */
+const seenAtUnixMs = (elapsedMs: number): number => Date.now() - elapsedMs;
+
 /** sessionId → fileId → percent（transfer-progress 聚合）。 */
 export type ProgressMap = Record<string, Record<string, number>>;
 
@@ -112,7 +118,12 @@ export function usePollEvents() {
       const { devices: list, udpPort: port } = await listDevices();
       if (!aliveRef.current) return;
       setUdpPort(port ?? 0);
-      setDevices([...list].sort((a, b) => (b.lastSeenMs ?? 0) - (a.lastSeenMs ?? 0)));
+      // elapsed → unix 归一化后再按新近度排序。
+      setDevices(
+        list
+          .map((entry) => ({ ...entry, lastSeenMs: seenAtUnixMs(entry.lastSeenMs ?? 0) }))
+          .sort((a, b) => (b.lastSeenMs ?? 0) - (a.lastSeenMs ?? 0)),
+      );
     } catch {
       // 降级：保留现有列表。
     }
@@ -130,7 +141,8 @@ export function usePollEvents() {
   }, []);
 
   const dismissIncoming = useCallback((sessionId: string) => {
-    seenIncomingRef.current.delete(sessionId);
+    // seen 集合保持粘性（不 delete）：同一 sessionId 永远不会合法地二次请求，
+    // 双通道重复投递不得在用户处理后重开幽灵对话框。
     setIncoming((queue) => queue.filter((item) => item.sessionId !== sessionId));
   }, []);
 
@@ -144,10 +156,11 @@ export function usePollEvents() {
       );
       if (index === -1) return [...list, entry];
       const existing = list[index];
-      // 事件线 lastSeenMs=0（native 不盖章）：max 合并保留真实最近时间。
+      // 事件线 lastSeenMs 是 elapsed（device-found 恒 0）：归一化成 unix 后
+      // max 合并保留真实最近时间。
       const merged: DeviceEntry = {
         ...entry,
-        lastSeenMs: Math.max(existing.lastSeenMs ?? 0, entry.lastSeenMs ?? 0),
+        lastSeenMs: Math.max(existing.lastSeenMs ?? 0, seenAtUnixMs(entry.lastSeenMs ?? 0)),
       };
       if (
         existing.ip === merged.ip &&
@@ -195,7 +208,7 @@ export function usePollEvents() {
     });
     if (normalized === "Cancelled") {
       // 会话已被 native 清理（过期/取消）—— 待确认弹窗随之失效，自动收走。
-      seenIncomingRef.current.delete(sessionId);
+      // seen 集合保持粘性，防止双通道残留投递重开幽灵对话框。
       setIncoming((queue) => queue.filter((item) => item.sessionId !== sessionId));
     }
   }, []);
@@ -365,9 +378,9 @@ export function usePollEvents() {
       if (devicesResult.status === "fulfilled") {
         setUdpPort(devicesResult.value.udpPort ?? 0);
         setDevices(
-          [...devicesResult.value.devices].sort(
-            (a, b) => (b.lastSeenMs ?? 0) - (a.lastSeenMs ?? 0),
-          ),
+          devicesResult.value.devices
+            .map((entry) => ({ ...entry, lastSeenMs: seenAtUnixMs(entry.lastSeenMs ?? 0) }))
+            .sort((a, b) => (b.lastSeenMs ?? 0) - (a.lastSeenMs ?? 0)),
         );
       }
       if (transfersResult.status === "fulfilled") {

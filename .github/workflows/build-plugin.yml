@@ -57,7 +57,7 @@ jobs:
 
   # macOS 原生库编译检查（发布时由 release-plugin 矩阵出正式产物）。
   native-macos:
-    runs-on: macos-latest
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

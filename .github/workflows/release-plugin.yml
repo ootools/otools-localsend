@@ -42,7 +42,7 @@ jobs:
         include:
           - os: windows-latest
             artifact: plugin-lib-windows
-          - os: macos-latest
+          - os: macos-14
             artifact: plugin-lib-macos
           - os: ubuntu-latest
             artifact: plugin-lib-linux

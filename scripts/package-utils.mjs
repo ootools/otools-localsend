@@ -183,7 +183,7 @@ export function validateEntries(manifest, entries) {
   entryAssetReferences(manifest, entries);
   validateEntryBridge(manifest, entries);
   const libraries = [...entries.keys()].filter((name) => /^lib\/(Windows\.dll|macOS\.dylib|Linux\.so)$/.test(name));
-  if (!entries.has('lib/Windows.dll')) throw new Error('Missing native library lib/Windows.dll; run build:native before packaging');
+  if (!libraries.length) throw new Error('Missing native library; run build:native before packaging');
   for (const name of libraries) {
     const data = entries.get(name);
     for (const symbol of ['otools_plugin_invoke', 'otools_plugin_free']) {

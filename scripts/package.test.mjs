@@ -85,11 +85,16 @@ test('manifest requires the native receiver and once-only autostart', () => {
   assert.throws(() => validateManifest({ ...manifest, native: { enabled: false, libDir: 'lib' } }), /native/);
 });
 
-test('v1 package needs Windows.dll even if another platform library exists', () => {
-  const entries = fixtureEntries();
-  entries.set('lib/Linux.so', entries.get('lib/Windows.dll'));
-  entries.delete('lib/Windows.dll');
-  assert.throws(() => validateEntries(manifest, entries), /Windows\.dll/);
+test('cross-platform packages are valid; zero libraries are not', () => {
+  const macOnly = fixtureEntries();
+  macOnly.set('lib/macOS.dylib', macOnly.get('lib/Windows.dll'));
+  macOnly.delete('lib/Windows.dll');
+  const libraries = validateEntries(manifest, macOnly);
+  assert.deepEqual(libraries, ['lib/macOS.dylib']);
+
+  const none = fixtureEntries();
+  none.delete('lib/Windows.dll');
+  assert.throws(() => validateEntries(manifest, none), /native library/i);
 });
 
 test('entry bundle needs package-relative assets and the bridge', () => {
@@ -161,7 +166,7 @@ test('verify rejects a missing native DLL even with a valid ZIP and checksums', 
   updateSums(out);
   const result = run('verify-plugin.mjs', root);
   assert.notEqual(result.status, 0);
-  assert.match(output(result), /Windows\.dll/);
+  assert.match(output(result), /native library/i);
 });
 
 test('pack rejects missing ABI symbols without modifying the actual build', (t) => {

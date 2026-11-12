@@ -1,6 +1,6 @@
 # 发布插件：v* tag（或手动）触发构建 → 打包 .oplg → 校验 → GitHub Release → 市场同步。
-# 市场上架由仓库变量 OTOOLS_PUBLISH_MARKET == 'true' 门控（Task 14 配置），
-# secrets 名沿用模板：XYCLOUD_PAT 等。发布脚本（Task 13 拷入）就位之前本工作流会失败，属预期。
+# 原生库按平台矩阵构建（Windows + macOS；Linux 后续），装配任务合并后打包。
+# 市场上架由仓库变量 OTOOLS_PUBLISH_MARKET == 'true' 门控，secrets 名沿用模板：XYCLOUD_PAT 等。
 name: release-plugin
 run-name: "插件${{ inputs.dry_run && '验证' || '发布' }} · ${{ inputs.display_version || github.ref_name }}"
 
@@ -34,7 +34,61 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  native:
+    name: 原生库（${{ matrix.os }}）
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: plugin-lib-windows
+          - os: macos-latest
+            artifact: plugin-lib-macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+      - name: 构建原生库
+        run: node scripts/build-native.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: lib
+          if-no-files-found: error
+          retention-days: 14
+
+  web:
+    name: 构建前端
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+      - name: 构建前端
+        run: node scripts/build-web.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-web
+          path: dist
+          if-no-files-found: error
+          retention-days: 14
+
   build:
+    name: 装配打包
+    needs: [native, web]
     runs-on: windows-latest
     outputs:
       version: ${{ steps.meta.outputs.version }}
@@ -48,14 +102,24 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      # pnpm 版本取 package.json 的 packageManager 字段（对齐 ai-switch）；
-      # 不要在此硬编码 version 输入，否则与 packageManager 冲突会导致 action 报错。
-      - name: 安装 pnpm
-        uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-          cache: pnpm
+      - name: 汇集各平台原生库
+        uses: actions/download-artifact@v4
+        with:
+          name: plugin-lib-windows
+          path: lib
+      - name: 汇集 macOS 原生库
+        uses: actions/download-artifact@v4
+        with:
+          name: plugin-lib-macos
+          path: lib
+      - name: 汇集前端产物
+        uses: actions/download-artifact@v4
+        with:
+          name: plugin-web
+          path: dist
       - name: 校验版本、标签和发布开关
         id: meta
         env:
@@ -69,16 +133,6 @@ jobs:
       - name: 发布脚本回归测试
         shell: bash
         run: node --test scripts/*.test.mjs
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: native
-      - name: 安装依赖
-        run: pnpm install --frozen-lockfile
-      - name: 构建原生库
-        run: node scripts/build-native.mjs
-      - name: 构建前端
-        run: node scripts/build-web.mjs
       - name: 打包正式插件并生成摘要
         env:
           VERSION: ${{ steps.meta.outputs.version }}

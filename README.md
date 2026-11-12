@@ -5,8 +5,9 @@ LocalSend 协议 v2 兼容的局域网互传 OTools 面板插件：与手机、�
 
 - 发现：UDP 组播 `224.0.0.167:53317`（announce / register 按官方语义回源）
 - 传输：自签 HTTPS `53317`，端点 `register` / `prepare-upload` / `upload` / `cancel` / `info`
-- 实现：Rust native（`lib/Windows.dll`，宿主 `ot-plugin-ffi` ABI）+ React 面板
+- 实现：Rust native（`lib/Windows.dll` + `lib/macOS.dylib`，宿主 `ot-plugin-ffi` ABI）+ React 面板
 - autostart：宿主会话启动时执行 `start_localsend`，服务常驻后台接收
+- 平台：Windows + macOS（Linux 原生库后续版本提供）
 
 上游：[LocalSend](https://github.com/localsend/localsend)（快照 `v1.18.2`）与
 [localsend/protocol](https://github.com/localsend/protocol) v2.2。溯源见 [UPSTREAM.md](UPSTREAM.md)，
@@ -45,7 +46,8 @@ LocalSend），会自动递增到空闲端口，并在公告中上报实际端�
 - 若 UDP 发现端口回退（本机 53317 被占用）：本插件的公告仍发往标准组播端口，其他设备
   **可以**发现本插件并回源 register；但其他设备的公告也发往标准端口，本插件已回退**收不到**，
   因此本插件无法通过组播主动发现其他设备，发现依赖对方收到公告后回源。
-- v1 未实现：浏览器反向传输（`prepare-download` / `download`）、收藏设备同步、protocol v3。
+- v1 未实现：浏览器反向传输（`prepare-download` / `download`）、收藏设备同步、protocol v3、
+  Linux 原生库。
 
 ## 开发
 

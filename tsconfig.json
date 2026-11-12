@@ -14,7 +14,11 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
-    "jsx": "react-jsx"
+    "jsx": "react-jsx",
+    "paths": {
+      "otools-plugin-sdk": ["./vendor/otools-plugin-sdk/src/index.ts"],
+      "otools-plugin-sdk/*": ["./vendor/otools-plugin-sdk/src/*.ts"]
+    }
   },
   "include": ["src"],
   "references": [{ "path": "./tsconfig.node.json" }]

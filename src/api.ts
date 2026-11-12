@@ -74,8 +74,12 @@ export interface TransferRecord {
   files: FileEntry[];
   status: TransferStatus;
   createdAt: number;
-  /** 已收文件的最终落盘绝对路径，按 fileId 索引；发送方向的记录为空。 */
-  destinations: Record<string, string>;
+  /**
+   * 已收文件的最终落盘绝对路径，按 fileId 索引；发送方向的记录为空。
+   * 线上注意：native 在 destinations 为空时整个字段缺席（Task 10 审查交接），
+   * 因此声明为可选，消费端一律 `record.destinations ?? {}` 归一化。
+   */
+  destinations?: Record<string, string>;
 }
 
 /** 本机设置（settings.json）。 */

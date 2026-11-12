@@ -1,5 +1,16 @@
-import { useEffect, useState } from "react";
-import { getSettings, type Settings } from "./api";
+/**
+ * 应用壳：顶部服务状态条（server-status 事件驱动，Review Focus #1 ——
+ * 失败必须显式报错，绝不静默）+ 设备/传输/设置三页 + 传入请求弹窗队列。
+ */
+
+import { useState } from "react";
+import { acceptSession, declineSession } from "./api";
+import { IncomingDialog } from "./components/IncomingDialog";
+import { usePollEvents } from "./hooks/usePollEvents";
+import { DevicesPage } from "./pages/Devices";
+import { SettingsPage } from "./pages/Settings";
+import { TransfersPage } from "./pages/Transfers";
+import { formatError } from "./format";
 
 type TabId = "devices" | "transfers" | "settings";
 
@@ -9,97 +20,121 @@ const TABS: Array<{ id: TabId; label: string }> = [
   { id: "settings", label: "设置" },
 ];
 
-function formatError(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  return String(error);
-}
-
-/**
- * 设置页预览 — Task 10 的桥接证明：settings_get 成功即 native 桥通。
- * Task 11 会重写为完整设置表单（alias/port/downloadDir/pin/... → settings_set）。
- */
-function SettingsPreview() {
-  const [settings, setSettings] = useState<Settings | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    let alive = true;
-    getSettings()
-      .then((loaded) => {
-        if (!alive) return;
-        setSettings(loaded);
-        setError(null);
-      })
-      .catch((cause: unknown) => {
-        if (!alive) return;
-        // 浏览器直跑（无宿主注入）时 SDK invoke 抛错 —— 降级为占位而不是崩溃。
-        setError(formatError(cause));
-      })
-      .finally(() => {
-        if (alive) setLoading(false);
-      });
-    return () => {
-      alive = false;
-    };
-  }, []);
-
-  if (loading) {
+function ServerStatusBar({
+  ready,
+  hostError,
+  error,
+  port,
+}: {
+  ready: boolean;
+  hostError: string | null;
+  error: string | null;
+  port: number;
+}) {
+  if (!ready) {
     return (
-      <p className="text-sm text-zinc-500" role="status">
-        正在读取设置…
-      </p>
+      <span className="inline-flex items-center gap-2 text-zinc-500">
+        <span className="inline-block h-2 w-2 rounded-full bg-zinc-600" />
+        正在获取服务状态…
+      </span>
     );
   }
-
+  // 宿主桥未注入（浏览器直跑）：显式降级态，绝不静默。
+  if (hostError) {
+    return (
+      <span className="inline-flex min-w-0 items-center gap-2 text-red-400" title={hostError}>
+        <span className="inline-block h-2 w-2 shrink-0 rounded-full bg-red-500" />
+        <span className="truncate">宿主桥未注入 — 请在 OTools 宿主中打开本插件</span>
+      </span>
+    );
+  }
   if (error) {
     return (
-      <div
-        className="rounded-lg border border-zinc-800 bg-zinc-900 p-4 text-sm"
-        role="alert"
+      <span
+        className="inline-flex min-w-0 items-center gap-2 text-red-400"
+        title={error}
       >
-        <p className="font-medium text-zinc-200">宿主未注入</p>
-        <p className="mt-1 text-zinc-500">
-          未检测到 OTools 宿主桥接，仅作本地预览占位：{error}
-        </p>
-      </div>
+        <span className="inline-block h-2 w-2 shrink-0 rounded-full bg-red-500" />
+        <span className="truncate">
+          服务异常：{error} — 请检查端口是否被占用，或在防火墙放行 UDP/TCP 53317
+        </span>
+      </span>
     );
   }
-
+  if (port > 0) {
+    return (
+      <span className="inline-flex items-center gap-2 text-emerald-400">
+        <span className="inline-block h-2 w-2 rounded-full bg-emerald-500" />
+        服务运行中 · 端口 {port}
+      </span>
+    );
+  }
   return (
-    <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-sm">
-      <dt className="text-zinc-500">别名</dt>
-      <dd className="text-zinc-100">{settings?.alias}</dd>
-      <dt className="text-zinc-500">端口</dt>
-      <dd className="text-zinc-100">{settings?.port}</dd>
-      <dt className="text-zinc-500">设备类型</dt>
-      <dd className="text-zinc-100">{settings?.deviceType}</dd>
-      <dt className="text-zinc-500">自动保存</dt>
-      <dd className="text-zinc-100">{settings?.autoSave ? "开" : "关"}</dd>
-      <dt className="text-zinc-500">接收通知</dt>
-      <dd className="text-zinc-100">{settings?.notifyOnIncoming ? "开" : "关"}</dd>
-    </dl>
-  );
-}
-
-function TabPlaceholder({ label }: { label: string }) {
-  return (
-    <p className="text-sm text-zinc-500">{label}页占位 — Task 11 实现。</p>
+    <span className="inline-flex items-center gap-2 text-amber-400">
+      <span className="inline-block h-2 w-2 rounded-full bg-amber-500" />
+      服务启动中…（等待宿主 autostart）
+    </span>
   );
 }
 
 export function App() {
-  const [tab, setTab] = useState<TabId>("settings");
+  const store = usePollEvents();
+  const [tab, setTab] = useState<TabId>("devices");
+  const [dialogBusy, setDialogBusy] = useState(false);
+  const [dialogError, setDialogError] = useState<string | null>(null);
+
+  const activeRequest = store.incoming[0] ?? null;
+
+  const respondAndClose = async (respond: () => Promise<void>) => {
+    if (dialogBusy || !activeRequest) return;
+    setDialogBusy(true);
+    setDialogError(null);
+    try {
+      await respond();
+    } catch (cause) {
+      setDialogError(formatError(cause));
+      return; // 失败留在弹窗内展示错误
+    } finally {
+      setDialogBusy(false);
+    }
+    store.dismissIncoming(activeRequest.sessionId);
+    await store.refreshTransfers();
+  };
+
+  const acceptAll = () => {
+    if (!activeRequest) return;
+    const sessionId = activeRequest.sessionId;
+    void respondAndClose(() => acceptSession(sessionId, "all"));
+  };
+
+  const acceptSelected = (fileIds: string[]) => {
+    if (!activeRequest) return;
+    const sessionId = activeRequest.sessionId;
+    void respondAndClose(() => acceptSession(sessionId, fileIds));
+  };
+
+  const decline = () => {
+    if (!activeRequest) return;
+    const sessionId = activeRequest.sessionId;
+    // 拒绝只负责 decline 并关闭；会话可能已被 native 过期清理，报错无意义。
+    void respondAndClose(async () => {
+      try {
+        await declineSession(sessionId);
+      } catch {
+        // 会话已不存在 —— 仍然关闭。
+      }
+    });
+  };
 
   return (
     <div className="flex h-full flex-col bg-zinc-950 text-zinc-100">
-      {/* 顶部状态条占位：Task 11 用 server-status 事件驱动（含端口回退与
-          防火墙错误态）。 */}
       <header className="flex items-center gap-2 border-b border-zinc-800 bg-zinc-900 px-4 py-2 text-sm">
-        <span className="inline-block h-2 w-2 rounded-full bg-zinc-600" />
-        <span className="text-zinc-500">
-          服务状态条占位（Task 11 接入 server-status）
-        </span>
+        <ServerStatusBar
+          ready={store.ready}
+          hostError={store.hostError}
+          error={store.server?.error ?? null}
+          port={store.server?.port ?? 0}
+        />
       </header>
 
       <nav className="flex gap-1 border-b border-zinc-800 bg-zinc-900 px-2">
@@ -120,10 +155,24 @@ export function App() {
       </nav>
 
       <main className="flex-1 overflow-y-auto p-4">
-        {tab === "devices" && <TabPlaceholder label="设备" />}
-        {tab === "transfers" && <TabPlaceholder label="传输" />}
-        {tab === "settings" && <SettingsPreview />}
+        {tab === "devices" && (
+          <DevicesPage store={store} onGoToTransfers={() => setTab("transfers")} />
+        )}
+        {tab === "transfers" && <TransfersPage store={store} />}
+        {tab === "settings" && <SettingsPage store={store} />}
       </main>
+
+      {activeRequest && (
+        <IncomingDialog
+          key={activeRequest.sessionId}
+          request={activeRequest}
+          busy={dialogBusy}
+          error={dialogError}
+          onAcceptAll={acceptAll}
+          onAcceptSelected={acceptSelected}
+          onDecline={decline}
+        />
+      )}
     </div>
   );
 }

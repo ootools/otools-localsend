@@ -302,8 +302,10 @@ def wait_service_running(timeout=30.0):
 
 
 def restart_service():
-    started = ok_data("start_localsend")
-    assert started.get("started") is True, started
+    requested_at = time.monotonic()
+    requested = ok_data("start_localsend")
+    assert time.monotonic() - requested_at < 2, "service restart blocked on listener binding"
+    assert requested["started"] is True, requested
     status, devices = wait_service_running()
     CTX["tcp_port"] = status["port"]
     CTX["udp_port"] = devices["udpPort"]

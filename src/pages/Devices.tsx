@@ -5,9 +5,9 @@
  * 端口，端口回退后可能 ≠ 53317），而不是本机 udpPort / serverStatus.port。
  */
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { pickFromHostTree } from "otools-plugin-sdk/host-file-tree";
-import { discoverNow, isPreviewMode, sendFiles, sendText } from "../api";
+import { discoverNow, isPreviewMode, sendFiles, sendText, serverStatus } from "../api";
 import { DeviceCard } from "../components/DeviceCard";
 import { formatError } from "../format";
 import type { PluginStore } from "../hooks/usePollEvents";
@@ -25,6 +25,9 @@ export function DevicesPage({ store, onGoToTransfers }: DevicesPageProps) {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState<Busy>(null);
   const [error, setError] = useState<string | null>(null);
+  const storeRef = useRef(store);
+  storeRef.current = store;
+  const serviceAvailable = store.ready && !store.hostError && !store.serviceBusy && !store.stopConfirmation && store.server?.state === "running";
 
   const selected = useMemo(
     () => store.devices.find((d) => d.info.fingerprint === selectedFingerprint) ?? null,
@@ -47,7 +50,8 @@ export function DevicesPage({ store, onGoToTransfers }: DevicesPageProps) {
   };
 
   const sendFilesFlow = async () => {
-    if (!selected || busy) return;
+    if (!selected || busy || !serviceAvailable) return;
+    const revision = store.server!.revision;
     setBusy("file");
     setError(null);
     try {
@@ -66,6 +70,14 @@ export function DevicesPage({ store, onGoToTransfers }: DevicesPageProps) {
         if (picked.kind !== "picked" || picked.paths.length === 0) return; // 用户取消
         paths = picked.paths;
       }
+      const status = await serverStatus();
+      const current = storeRef.current;
+      if (!current.ready || current.hostError || current.serviceBusy || current.stopConfirmation ||
+        current.server?.state !== "running" || current.server.revision !== revision ||
+        status.state !== "running" || status.revision !== revision) {
+        setError("服务状态已变化，请在服务运行后重新选择文件");
+        return;
+      }
       await sendFiles(selected.ip, selected.info.port, paths, pin.trim() || undefined);
       await store.refreshTransfers();
       onGoToTransfers();
@@ -77,7 +89,7 @@ export function DevicesPage({ store, onGoToTransfers }: DevicesPageProps) {
   };
 
   const sendTextFlow = async () => {
-    if (!selected || busy) return;
+    if (!selected || busy || !serviceAvailable) return;
     const body = text.trim();
     if (!body) {
       setError("文本内容不能为空");
@@ -166,7 +178,7 @@ export function DevicesPage({ store, onGoToTransfers }: DevicesPageProps) {
             <button
               type="button"
               onClick={() => void sendFilesFlow()}
-              disabled={busy !== null}
+              disabled={busy !== null || !serviceAvailable}
               className="btn btn-primary btn-sm"
             >
               {busy === "file" ? "发送中…" : "📎 发送文件"}
@@ -174,7 +186,7 @@ export function DevicesPage({ store, onGoToTransfers }: DevicesPageProps) {
             <button
               type="button"
               onClick={() => void sendTextFlow()}
-              disabled={busy !== null}
+              disabled={busy !== null || !serviceAvailable}
               className="btn btn-sm"
             >
               {busy === "text" ? "发送中…" : "💬 发送文本"}

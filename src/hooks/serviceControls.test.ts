@@ -21,7 +21,7 @@ function store(over: Partial<PluginStore> = {}): PluginStore {
   return {
     ready: true, hostError: null, server: server(), settings: null,
     udpPort: 53318, devices: [], incoming: [], transfers: [], progress: {},
-    serviceBusy: false, serviceError: null, stopConfirmation: null,
+    serviceBusy: false, serviceError: null, stopConfirmation: null, stopReturnFocus: null,
     startService: async () => {}, stopService: async () => {},
     confirmStopService: async () => {}, cancelStopService: () => {},
     refreshServer: async () => {}, refreshDevices: async () => {},
@@ -100,11 +100,12 @@ test("shared service errors are visible in both compact and Settings controls", 
 
 test("single stop confirmation shows native count, preserves-data copy and calls parent callbacks", () => {
   const actions: string[] = [];
-  const dialog = StopServiceDialog({
+  const mounted = mountHook(() => StopServiceDialog({
     activeTransfers: 7, busy: false, error: null, preview: true,
     onCancel: () => { actions.push("cancel"); },
     onConfirm: () => { actions.push("force"); },
-  });
+  }));
+  const dialog = mounted.current();
   const html = renderToStaticMarkup(dialog);
   assert.match(html, /role="dialog"/);
   assert.match(html, /aria-modal="true"/);
@@ -114,9 +115,12 @@ test("single stop confirmation shows native count, preserves-data copy and calls
   buttons(dialog).find((item) => text(item.props.children) === "取消")?.props.onClick?.();
   buttons(dialog).find((item) => text(item.props.children) === "确认停止")?.props.onClick?.();
   assert.deepEqual(actions, ["cancel", "force"]);
-  const busy = StopServiceDialog({ activeTransfers: 7, busy: true, error: "retry", onCancel: () => {}, onConfirm: () => {} });
+  const busyMounted = mountHook(() => StopServiceDialog({ activeTransfers: 7, busy: true, error: "retry", onCancel: () => {}, onConfirm: () => {} }));
+  const busy = busyMounted.current();
   assert.equal(buttons(busy).every((item) => item.props.disabled === true), true);
   assert.match(renderToStaticMarkup(busy), /role="alert"/);
+  busyMounted.unmount();
+  mounted.unmount();
 });
 
 test("Settings still exposes service controls when settings are unavailable or the host is missing", () => {
@@ -150,6 +154,10 @@ test("App coordinates one native-count confirmation over Pending incoming and re
   };
   const calls: string[] = [];
   const previous = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const oldDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+  const initiatingButton = { focus: () => {}, isConnected: true };
+  const testDocument = { activeElement: initiatingButton as unknown };
+  Object.defineProperty(globalThis, "document", { configurable: true, value: testDocument });
   Object.defineProperty(globalThis, "window", { configurable: true, value: {
     setInterval: () => 1, clearInterval: () => {},
     __TAURI_INTERNALS__: {
@@ -171,6 +179,8 @@ test("App coordinates one native-count confirmation over Pending incoming and re
   const app = mountHook(App);
   t.after(async () => {
     app.unmount(); await app.flush();
+    if (oldDocument) Object.defineProperty(globalThis, "document", oldDocument);
+    else Reflect.deleteProperty(globalThis, "document");
     if (previous) Object.defineProperty(globalThis, "window", previous);
     else Reflect.deleteProperty(globalThis, "window");
   });
@@ -182,11 +192,13 @@ test("App coordinates one native-count confirmation over Pending incoming and re
   assert.ok(incoming);
   assert.equal(typeof incoming.props.onStopService, "function");
   (incoming.props.onStopService as () => void)();
+  testDocument.activeElement = { focus: () => {} }; // Busy button blur before async native confirmation.
   await app.flush();
   const withConfirmation = elements(app.current());
   const dialogs = withConfirmation.filter((element) => element.type === StopServiceDialog);
   assert.equal(dialogs.length, 1);
   assert.equal(dialogs[0].props.activeTransfers, 7);
+  assert.equal(dialogs[0].props.returnFocus, initiatingButton, "async confirmation must retain the actual initiating button before busy blur");
   assert.equal(withConfirmation.find((element) => element.type === IncomingDialog)?.props.hidden, true);
   const count = calls.length;
   (dialogs[0].props.onCancel as () => void)();
@@ -194,4 +206,77 @@ test("App coordinates one native-count confirmation over Pending incoming and re
   assert.equal(cancelled.filter((element) => element.type === StopServiceDialog).length, 0);
   assert.equal(cancelled.find((element) => element.type === IncomingDialog)?.props.hidden, false);
   assert.equal(calls.length, count, "cancelling confirmation must not call native");
+});
+
+test("review 3: unknown-status Pending is suspended without blocking navigation or losing its request on recovery", async (t) => {
+  let available = false;
+  const requestRecord = {
+    sessionId: "pending", direction: "Receive", peerAlias: "Phone", status: "Pending", createdAt: 1,
+    files: [{ id: "file", fileName: "pending.txt", size: 1, fileType: "text/plain", sha256: null, preview: null, metadata: null }],
+  };
+  const calls: string[] = [];
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", { configurable: true, value: {
+    setInterval: () => 1, clearInterval: () => {},
+    __TAURI_INTERNALS__: {
+      transformCallback: () => 1,
+      invoke: async (method: string) => {
+        calls.push(method);
+        switch (method) {
+          case "settings_get": return { alias: "Saved PC", deviceModel: null, deviceType: "desktop", port: 53317, downloadDir: null, pin: null, autoSave: false, notifyOnIncoming: false };
+          case "server_status": if (!available) throw new Error("status unavailable"); return server();
+          case "device_list": return { devices: [], udpPort: 0 };
+          case "transfer_list": return { transfers: [requestRecord] };
+          case "poll_events": return { events: [] };
+          default: throw new Error("listen unavailable in test");
+        }
+      },
+    },
+  } });
+  const app = mountHook(App);
+  t.after(async () => {
+    app.unmount(); await app.flush();
+    if (previous) Object.defineProperty(globalThis, "window", previous);
+    else Reflect.deleteProperty(globalThis, "window");
+  });
+  await app.flush();
+  const unknown = elements(app.current()).find((element) => element.type === IncomingDialog);
+  assert.ok(unknown);
+  assert.equal(unknown.props.hidden, true, "unknown status must not trap navigation with a disabled modal");
+  (unknown.props.onAcceptAll as () => void)();
+  (unknown.props.onStopService as () => void)();
+  assert.equal(calls.some((method) => method === "session_accept" || method === "stop_localsend"), false);
+  const settingsButton = buttons(app.current()).find((button) => text(button.props.children).includes("设置"));
+  settingsButton?.props.onClick?.();
+  assert.ok(elements(app.current()).some((element) => element.type === SettingsPage));
+  available = true;
+  const shared = elements(app.current()).find((element) => element.type === ServiceControls)?.props.store as PluginStore;
+  await shared.refreshServer();
+  await app.flush();
+  const recovered = elements(app.current()).find((element) => element.type === IncomingDialog);
+  assert.ok(recovered);
+  assert.equal(recovered.key, unknown.key);
+  assert.equal(recovered.props.hidden, false);
+  assert.equal((recovered.props.request as { sessionId: string }).sessionId, "pending");
+});
+
+test("review 3: suspending the mounted IncomingDialog retains selected file ids without taking focus", () => {
+  let hidden = false;
+  const selected: string[][] = [];
+  const request = {
+    sessionId: "pending", sender: { alias: "Phone", version: "2.2", deviceModel: null, deviceType: "mobile", fingerprint: "peer", port: 53317, protocol: "https", download: false },
+    files: ["first", "second"].map((id) => ({ id, fileName: `${id}.txt`, size: 1, fileType: "text/plain", sha256: null, preview: null, metadata: null })),
+  };
+  const dialog = mountHook(() => IncomingDialog({
+    request, hidden, busy: false, error: null, onAcceptAll: () => {},
+    onAcceptSelected: (ids) => selected.push(ids), onDecline: () => {},
+  }));
+  const firstCheckbox = elements(dialog.current()).find((element) => element.type === "input");
+  (firstCheckbox?.props.onChange as () => void)();
+  hidden = true;
+  dialog.current();
+  hidden = false;
+  buttons(dialog.current()).find((button) => text(button.props.children).includes("接受所选"))?.props.onClick?.();
+  assert.deepEqual(selected, [["second"]]);
+  dialog.unmount();
 });

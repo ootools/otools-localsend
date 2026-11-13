@@ -34,7 +34,7 @@ export function App() {
   const current = TABS.find((entry) => entry.id === tab) ?? TABS[0];
 
   const respondAndClose = async (respond: () => Promise<void>) => {
-    if (dialogBusy || store.serviceBusy || store.stopConfirmation || store.server?.state !== "running" || !activeRequest) return;
+    if (dialogBusy || !store.ready || store.hostError || store.serviceBusy || store.stopConfirmation || store.server?.state !== "running" || !activeRequest) return;
     setDialogBusy(true);
     setDialogError(null);
     try {
@@ -149,7 +149,7 @@ export function App() {
           onDecline={decline}
           onStopService={() => void store.stopService()}
           serviceBusy={store.serviceBusy || store.server?.state !== "running"}
-          hidden={store.stopConfirmation !== null}
+          hidden={!store.ready || !!store.hostError || store.server?.state !== "running" || store.stopConfirmation !== null}
         />
       )}
       {store.stopConfirmation && (
@@ -158,6 +158,7 @@ export function App() {
           busy={store.serviceBusy}
           error={store.serviceError}
           preview={isPreviewMode()}
+          returnFocus={store.stopReturnFocus}
           onCancel={store.cancelStopService}
           onConfirm={() => void store.confirmStopService()}
         />

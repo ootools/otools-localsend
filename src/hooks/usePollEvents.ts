@@ -22,6 +22,7 @@ import {
   stopService as nativeStopService,
   type DeviceEntry,
   type IncomingRequestEvent,
+  type ServerStatus,
   type Settings,
   type TransferRecord,
   type UnlistenFn,
@@ -90,6 +91,10 @@ function sortByNewestTransfers(records: TransferRecord[]): TransferRecord[] {
   return [...records].sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
 }
 
+function isTerminal(status: TransferRecord["status"]): boolean {
+  return status === "Done" || status === "Cancelled" || status === "Failed";
+}
+
 export function usePollEvents() {
   const [ready, setReady] = useState(false);
   const [hostError, setHostError] = useState<string | null>(null);
@@ -107,10 +112,18 @@ export function usePollEvents() {
 
   const settingsRef = useRef<Settings | null>(null);
   const aliveRef = useRef(false);
+  const readyRef = useRef(false);
+  const hostErrorRef = useRef<string | null>(null);
   const seenIncomingRef = useRef(new Set<string>());
+  const handledIncomingRef = useRef(new Set<string>());
+  const terminalSessionsRef = useRef(new Map<string, TransferRecord["status"]>());
+  const transfersRef = useRef<TransferRecord[]>([]);
+  const generationRef = useRef(0);
+  const lastStatusRef = useRef<ServerStatus | null>(null);
+  const transfersRequestRef = useRef(0);
+  const devicesRequestRef = useRef(0);
   const unlistenersRef = useRef<UnlistenFn[]>([]);
   const timersRef = useRef<number[]>([]);
-  const lastLifecycleRef = useRef<string | null>(null);
   const controllerRef = useRef<ReturnType<typeof createServiceController> | null>(null);
   if (!controllerRef.current) {
     controllerRef.current = createServiceController({
@@ -120,20 +133,37 @@ export function usePollEvents() {
       onChange: (next) => { if (aliveRef.current) setService(next); },
       onStatus: (status) => {
         if (!aliveRef.current) return;
+        const previous = lastStatusRef.current;
+        const changed = previous?.state !== status.state || previous?.revision !== status.revision;
+        lastStatusRef.current = status;
+        if (changed) {
+          generationRef.current++;
+          if (status.state === "stopped" || status.state === "failed") {
+            for (const record of transfersRef.current) {
+              if (record.direction === "Receive" && record.status === "Pending") handledIncomingRef.current.add(record.sessionId);
+            }
+          }
+        }
         setLive((current) => liveServiceStateForStatus(current, status));
-        // 结果/重查询也走这里；不能只在 server-status 事件中刷新关联数据。
-        if (lastLifecycleRef.current !== status.state) {
-          lastLifecycleRef.current = status.state;
+        // 只在有效原生快照被接受后恢复宿主可用性；所有 resync 都是被动读取。
+        markNativeSuccess();
+        if (changed) {
           if (status.state === "running") void refreshDevices();
-          if (status.state === "stopped") void refreshTransfers();
+          if (status.state === "running" || status.state === "stopped" || status.state === "failed") void refreshTransfers();
         }
       },
     });
   }
   const controller = controllerRef.current;
+  const stopReturnFocusRef = useRef<HTMLElement | null>(null);
 
   const startService = useCallback(() => controllerRef.current!.start(), []);
-  const stopService = useCallback((force = false) => controllerRef.current!.stop(force), []);
+  const stopService = useCallback((force = false) => {
+    if (!force && !controllerRef.current!.getState().serviceBusy && !controllerRef.current!.getState().stopConfirmation) {
+      stopReturnFocusRef.current = typeof document === "undefined" ? null : document.activeElement as HTMLElement | null;
+    }
+    return controllerRef.current!.stop(force);
+  }, []);
   const confirmStopService = useCallback(() => controllerRef.current!.confirmStop(), []);
   const cancelStopService = useCallback(() => controllerRef.current!.cancelStop(), []);
   const refreshServer = useCallback(() => controllerRef.current!.refreshStatus(), []);
@@ -150,28 +180,87 @@ export function usePollEvents() {
 
   // --- 刷新动作 -----------------------------------------------------------
 
+  function markNativeSuccess() {
+    if (!aliveRef.current || !readyRef.current || !hostErrorRef.current) return;
+    hostErrorRef.current = null;
+    setHostError(null);
+    controllerRef.current!.setAvailability(true, null);
+    void refreshSettings();
+    void refreshTransfers();
+    void refreshDevices();
+  }
+
+  const applyTransferSnapshot = useCallback((records: TransferRecord[]) => {
+    const previous = new Map(transfersRef.current.map((record) => [record.sessionId, record]));
+    const next = records.map((record) => {
+      const old = previous.get(record.sessionId);
+      const terminal = terminalSessionsRef.current.get(record.sessionId);
+      if (isTerminal(record.status) && !terminal) terminalSessionsRef.current.set(record.sessionId, record.status);
+      if (terminal && record.status !== terminal) {
+        return old ?? { ...record, status: terminal };
+      }
+      if (old && isTerminal(old.status)) {
+        return { ...record, status: old.status, destinations: { ...old.destinations, ...record.destinations } };
+      }
+      return record;
+    });
+    // 原生列表不能因晚到的快照丢掉已观察到的终态记录及成功路径。
+    for (const old of previous.values()) {
+      if (isTerminal(old.status) && !next.some((record) => record.sessionId === old.sessionId)) next.push(old);
+    }
+    const sorted = sortByNewestTransfers(next);
+    transfersRef.current = sorted;
+    setTransfers(sorted);
+    const pending = pendingIncomingFromTransfers(sorted).filter((request) => (
+      !terminalSessionsRef.current.has(request.sessionId) && !handledIncomingRef.current.has(request.sessionId)
+    ));
+    const pendingIds = new Set(pending.map((request) => request.sessionId));
+    const lifecycle = controllerRef.current!.getState().server?.state;
+    const retainPending = lifecycle !== "stopped" && lifecycle !== "failed";
+    setLive((current) => {
+      const queue = current.incoming.filter((request) => (
+        !terminalSessionsRef.current.has(request.sessionId) &&
+        !handledIncomingRef.current.has(request.sessionId) &&
+        (!previous.has(request.sessionId) || pendingIds.has(request.sessionId))
+      ));
+      if (retainPending) {
+        for (const request of pending) {
+          seenIncomingRef.current.add(request.sessionId);
+          if (!queue.some((item) => item.sessionId === request.sessionId)) queue.push(request);
+        }
+      }
+      const progress = Object.fromEntries(Object.entries(current.progress).filter(([id]) => !terminalSessionsRef.current.has(id)));
+      return { ...current, incoming: retainPending ? queue : [], progress };
+    });
+  }, []);
+
   const refreshTransfers = useCallback(async () => {
+    const request = ++transfersRequestRef.current;
+    const generation = generationRef.current;
     try {
       const records = await listTransfers();
-      if (!aliveRef.current) return;
-      setTransfers(sortByNewestTransfers(records));
+      if (!aliveRef.current || request !== transfersRequestRef.current || generation !== generationRef.current) return;
+      applyTransferSnapshot(records);
+      markNativeSuccess();
     } catch {
       // 降级：保留现有列表。
     }
-  }, []);
+  }, [applyTransferSnapshot]);
 
   const refreshDevices = useCallback(async () => {
+    const request = ++devicesRequestRef.current;
+    const generation = generationRef.current;
     const before = controllerRef.current!.getState().server;
     if (!serviceAllowsLiveTraffic(before)) return;
     try {
       const { devices: list } = await listDevices();
-      if (!aliveRef.current) return;
+      if (!aliveRef.current || request !== devicesRequestRef.current || generation !== generationRef.current) return;
       const current = controllerRef.current!.getState().server;
-      // 停服/重启之间返回的旧设备快照不得复活上一代的设备和 UDP 端口。
       if (!serviceAllowsLiveTraffic(current) || before?.revision !== current?.revision) return;
       setLive((liveState) => ({
         ...liveState, udpPort: current!.udpPort, devices: devicesFromWire(list, Date.now()),
       }));
+      markNativeSuccess();
     } catch {
       // 降级：保留现有列表。
     }
@@ -191,6 +280,8 @@ export function usePollEvents() {
   const dismissIncoming = useCallback((sessionId: string) => {
     // seen 集合保持粘性（不 delete）：同一 sessionId 永远不会合法地二次请求，
     // 双通道重复投递不得在用户处理后重开幽灵对话框。
+    handledIncomingRef.current.add(sessionId);
+    seenIncomingRef.current.add(sessionId);
     setIncoming((queue) => queue.filter((item) => item.sessionId !== sessionId));
   }, [setIncoming]);
 
@@ -211,7 +302,7 @@ export function usePollEvents() {
 
   const applyProgress = useCallback((sessionId: string, fileId: string, percent: number) => {
     if (!serviceAllowsLiveTraffic(controllerRef.current!.getState().server)) return;
-    if (!sessionId || !fileId || typeof percent !== "number") return;
+    if (!sessionId || !fileId || typeof percent !== "number" || terminalSessionsRef.current.has(sessionId)) return;
     setProgress((map) => {
       const fileMap = map[sessionId] ?? {};
       if (fileMap[fileId] === percent) return map;
@@ -220,31 +311,27 @@ export function usePollEvents() {
   }, [setProgress]);
 
   const applyTransferDone = useCallback((sessionId: string, status: string) => {
-    const normalized = normalizeTransferStatus(status);
-    setTransfers((list) => {
-      const index = list.findIndex((item) => item.sessionId === sessionId);
-      if (index === -1 || list[index].status === normalized) return list;
-      const next = [...list];
-      next[index] = { ...next[index], status: normalized as TransferRecord["status"] };
-      return next;
-    });
+    const normalized = normalizeTransferStatus(status) as TransferRecord["status"];
+    if (!isTerminal(normalized)) return;
+    const terminal = terminalSessionsRef.current.get(sessionId) ?? normalized;
+    terminalSessionsRef.current.set(sessionId, terminal);
+    handledIncomingRef.current.add(sessionId);
+    const records = transfersRef.current.map((record) => record.sessionId === sessionId ? { ...record, status: terminal } : record);
+    transfersRef.current = records;
+    setTransfers(records);
     setProgress((map) => {
       if (!(sessionId in map)) return map;
       const next = { ...map };
       delete next[sessionId];
       return next;
     });
-    if (normalized === "Cancelled") {
-      // 会话已被 native 清理（过期/取消）—— 待确认弹窗随之失效，自动收走。
-      // seen 集合保持粘性，防止双通道残留投递重开幽灵对话框。
-      setIncoming((queue) => queue.filter((item) => item.sessionId !== sessionId));
-    }
+    setIncoming((queue) => queue.filter((item) => item.sessionId !== sessionId));
   }, [setIncoming, setProgress]);
 
   const applyIncomingRequest = useCallback((request: IncomingRequestEvent) => {
     if (!serviceAllowsLiveTraffic(controllerRef.current!.getState().server)) return;
     if (!request?.sessionId || !Array.isArray(request.files)) return;
-    if (seenIncomingRef.current.has(request.sessionId)) return;
+    if (seenIncomingRef.current.has(request.sessionId) || handledIncomingRef.current.has(request.sessionId) || terminalSessionsRef.current.has(request.sessionId)) return;
     seenIncomingRef.current.add(request.sessionId);
     setIncoming((queue) =>
       queue.some((item) => item.sessionId === request.sessionId)
@@ -263,7 +350,8 @@ export function usePollEvents() {
   }, []);
 
   const handleEvent = useCallback(
-    (name: string, data: unknown) => {
+    (name: string, data: unknown, generation = generationRef.current) => {
+      if (name !== EVENTS.serverStatus && name !== EVENTS.transferDone && generation !== generationRef.current) return;
       try {
         switch (name) {
           case EVENTS.deviceFound:
@@ -326,6 +414,8 @@ export function usePollEvents() {
 
   useEffect(() => {
     aliveRef.current = true;
+    readyRef.current = false;
+    generationRef.current++;
     let cancelled = false;
     controller.setAvailability(false, null);
 
@@ -333,21 +423,35 @@ export function usePollEvents() {
       if (cancelled || !aliveRef.current) return;
 
       const drain = async () => {
-        if (!aliveRef.current) return;
-        try {
-          const events = await pollEvents();
-          if (!aliveRef.current) return;
-          for (const queued of events) {
-            handleEvent(queued.event, queued.data);
-          }
-          // 异步 starting/stopping 和未知态即使漏事件也能收敛；这里只查询，绝不启动。
+        if (cancelled || !aliveRef.current) return;
+        const generation = generationRef.current;
+        // 事件与状态是独立通道：poll_events 失败或挂起不阻断状态恢复。
+        const recoverStatus = async () => {
           const current = controller.getState();
-          if (!current.serviceBusy && (!current.server || ["starting", "stopping"].includes(current.server.state))) {
+          if (!current.serviceBusy && (hostErrorRef.current || !current.server || ["starting", "stopping"].includes(current.server.state))) {
             await controller.refreshStatus();
           }
-        } catch {
-          // 无宿主（浏览器直跑）或桥失效：静默，重建阶段的降级态已覆盖。
-        }
+        };
+        const consume = async () => {
+          try {
+            const events = await pollEvents();
+            if (cancelled || !aliveRef.current) return;
+            // 一批里先处理完整快照和终态；较新生命周期让同批旧 live 负载失效。
+            for (const queued of events) {
+              if (queued.event === EVENTS.serverStatus || queued.event === EVENTS.transferDone) {
+                handleEvent(queued.event, queued.data, generation);
+              }
+            }
+            for (const queued of events) {
+              if (queued.event !== EVENTS.serverStatus && queued.event !== EVENTS.transferDone) {
+                handleEvent(queued.event, queued.data, generation);
+              }
+            }
+          } catch {
+            // 事件通道降级，不影响独立的 server_status 查询。
+          }
+        };
+        await Promise.all([consume(), recoverStatus()]);
       };
 
       const subscribe = async () => {
@@ -355,7 +459,9 @@ export function usePollEvents() {
           if (cancelled || !aliveRef.current) return;
           try {
             const unlisten = await onEvent<unknown>(name, (payload) => {
-              handleEvent(name, payload);
+              if (cancelled || !aliveRef.current) return;
+              const generation = generationRef.current;
+              handleEvent(name, payload, generation);
             });
             if (cancelled || !aliveRef.current) {
               void unlisten();
@@ -379,6 +485,9 @@ export function usePollEvents() {
     void rebuild();
 
     async function rebuild() {
+      const generation = generationRef.current;
+      const transfersRequest = ++transfersRequestRef.current;
+      const devicesRequest = ++devicesRequestRef.current;
       const [devicesResult, transfersResult, statusResult, settingsResult] =
         await Promise.allSettled([
           listDevices(),
@@ -388,24 +497,14 @@ export function usePollEvents() {
         ]);
       if (cancelled || !aliveRef.current) return;
 
-      if (devicesResult.status === "fulfilled") {
+      if (devicesResult.status === "fulfilled" && devicesRequest === devicesRequestRef.current && generation === generationRef.current) {
         setLive((current) => ({
           ...current, udpPort: devicesResult.value.udpPort ?? 0,
           devices: devicesFromWire(devicesResult.value.devices, Date.now()),
         }));
       }
-      if (transfersResult.status === "fulfilled") {
-        const records = sortByNewestTransfers(transfersResult.value);
-        setTransfers(records);
-        // 待确认的 Receive 会话在面板重开后必须重新弹窗（Task 11 审查交接）：
-        // native 在 prepare-upload 时已入队 Pending 记录，会话与 token 都还在
-        // 内存里，session_accept 直接可用。按 sessionId 入 seen 集（粘性去重
-        // 与事件线一致，双通道重复投递不会重开幽灵弹窗）。
-        const pending = pendingIncomingFromTransfers(records).filter(
-          (request) => !seenIncomingRef.current.has(request.sessionId),
-        );
-        for (const request of pending) seenIncomingRef.current.add(request.sessionId);
-        if (pending.length) setIncoming((queue) => [...queue, ...pending]);
+      if (transfersResult.status === "fulfilled" && transfersRequest === transfersRequestRef.current && generation === generationRef.current) {
+        applyTransferSnapshot(transfersResult.value);
       }
       if (statusResult.status === "fulfilled") {
         applyServerStatus(statusResult.value);
@@ -423,7 +522,9 @@ export function usePollEvents() {
       const missingHost = devicesResult.status === "rejected" &&
         transfersResult.status === "rejected" && statusResult.status === "rejected"
         ? asErrorText(devicesResult.reason) || "宿主桥不可用" : null;
+      hostErrorRef.current = missingHost;
       setHostError(missingHost);
+      readyRef.current = true;
       controller.setAvailability(true, missingHost);
       setReady(true);
       // 重建完成之后才允许实时事件进入（Review Focus #3）。
@@ -433,19 +534,22 @@ export function usePollEvents() {
     return () => {
       cancelled = true;
       aliveRef.current = false;
+      readyRef.current = false;
+      generationRef.current++;
       controller.setAvailability(false, null);
       for (const timer of timersRef.current) window.clearInterval(timer);
       timersRef.current = [];
       for (const unlisten of unlistenersRef.current) void unlisten();
       unlistenersRef.current = [];
     };
-  }, [applyServerStatus, controller, handleEvent, refreshDevices, setIncoming]);
+  }, [applyServerStatus, applyTransferSnapshot, controller, handleEvent, refreshDevices]);
 
   return {
     ready,
     hostError,
     settings,
     ...service,
+    stopReturnFocus: stopReturnFocusRef.current,
     ...live,
     transfers,
     startService,

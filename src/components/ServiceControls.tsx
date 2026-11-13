@@ -1,5 +1,6 @@
 import { isPreviewMode } from "../api";
 import { serviceControlView } from "../hooks/serviceState";
+import { useModalFocus } from "../hooks/useModalFocus";
 import type { PluginStore } from "../hooks/usePollEvents";
 
 /** 无局部 busy 或确认：侧栏与设置卡只消费同一父级控制器。 */
@@ -38,17 +39,19 @@ export function ServiceControls({ store, compact = false }: { store: PluginStore
 
 /** 只由 App 渲染一次；覆盖收件确认时不丢失原来的 Pending 队列。 */
 export function StopServiceDialog({
-  activeTransfers, busy, error, preview = false, onCancel, onConfirm,
+  activeTransfers, busy, error, preview = false, returnFocus = null, onCancel, onConfirm,
 }: {
   activeTransfers: number;
   busy: boolean;
   error: string | null;
   preview?: boolean;
+  returnFocus?: HTMLElement | null;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
+  const dialogRef = useModalFocus(busy, onCancel, returnFocus);
   return (
-    <div className="modal-back service-confirm-back" role="dialog" aria-modal="true" aria-label="停止服务确认">
+    <div ref={dialogRef} tabIndex={-1} className="modal-back service-confirm-back" role="dialog" aria-modal="true" aria-label="停止服务确认">
       <div className="modal service-confirm">
         <h3>停止 LocalSend 服务？</h3>
         {preview && <p className="preview-label">预览模拟 · 不控制真实原生服务</p>}
@@ -58,7 +61,7 @@ export function StopServiceDialog({
         </p>
         {error && <div className="banner banner-error modal-error" role="alert">{error}</div>}
         <div className="modal-actions">
-          <button type="button" onClick={onCancel} disabled={busy} className="btn btn-sm" autoFocus>取消</button>
+          <button type="button" onClick={onCancel} disabled={busy} className="btn btn-sm">取消</button>
           <button type="button" onClick={onConfirm} disabled={busy} className="btn btn-sm btn-danger">
             {busy ? "停止中…" : "确认停止"}
           </button>

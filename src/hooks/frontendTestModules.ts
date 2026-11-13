@@ -5,7 +5,7 @@ import ts from "typescript";
 import React from "react";
 
 /** A small hook lifecycle driver; production hooks and their native boundary stay real. */
-export function mountHook<T>(hook: () => T) {
+export function mountHook<T>(hook: () => T, commit?: (value: T) => void) {
   type Cell = { value?: unknown; dependencies?: readonly unknown[]; cleanup?: () => void };
   const cells: Cell[] = [];
   let index = 0;
@@ -65,11 +65,13 @@ export function mountHook<T>(hook: () => T) {
     const previous = internals.ReactCurrentDispatcher.current;
     internals.ReactCurrentDispatcher.current = dispatcher;
     try { value = hook(); } finally { internals.ReactCurrentDispatcher.current = previous; }
+    commit?.(value);
     for (const effect of effects.splice(0)) effect();
   };
   render();
   return {
     current: () => { if (dirty) render(); return value; },
+    rerender: () => { render(); return value; },
     flush: async () => {
       for (let turn = 0; turn < 8; turn++) {
         await new Promise<void>((resolve) => setImmediate(resolve));
@@ -82,9 +84,11 @@ export function mountHook<T>(hook: () => T) {
 }
 
 /** Node tests exercise actual TSX components without adding a DOM/test dependency. */
-export function registerFrontendTestModules() {
+export function registerFrontendTestModules(testModules: Record<string, string> = {}) {
+  const mapped = new Map(Object.entries(testModules).map(([specifier, source]) => [specifier, `data:text/javascript,${encodeURIComponent(source)}`]));
   return registerHooks({
     resolve(specifier, context, nextResolve) {
+      if (mapped.has(specifier)) return { url: mapped.get(specifier)!, shortCircuit: true };
       if (specifier.startsWith("otools-plugin-sdk/")) {
         return {
           url: new URL(`../../vendor/otools-plugin-sdk/src/${specifier.slice("otools-plugin-sdk/".length)}.ts`, import.meta.url).href,

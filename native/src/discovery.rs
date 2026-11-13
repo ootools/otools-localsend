@@ -16,6 +16,7 @@
 
 use crate::event_bridge::WebEventBroadcaster;
 use crate::models::DeviceInfo;
+use crate::service::wait_cancelled;
 use crate::settings::Settings;
 use serde::Serialize;
 use serde_json::Value;
@@ -27,7 +28,7 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 
 /// Multicast group shared by all LocalSend v2 devices.
 pub const MULTICAST_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 167);
@@ -332,6 +333,22 @@ pub async fn run_discovery(state: Arc<DiscoveryShared>, settings_port: u16) {
     }
 }
 
+/// One already-bound generation. Dropping the session future on cancellation
+/// closes UDP; an intentional stop never enters the legacy rebind loop.
+pub(crate) async fn run_bound_discovery(
+    state: Arc<DiscoveryShared>,
+    socket: UdpSocket,
+    mut cancel: watch::Receiver<bool>,
+) {
+    tokio::select! {
+        biased;
+        _ = wait_cancelled(&mut cancel) => {},
+        _ = discovery_session(&state, &socket) => {},
+    }
+    drop(socket);
+    state.udp_port.store(0, Ordering::SeqCst);
+}
+
 async fn discovery_session(state: &DiscoveryShared, socket: &UdpSocket) {
     // The first announce goes out immediately after binding.
     let mut next_announce = Instant::now();
@@ -428,16 +445,22 @@ async fn handle_frame(state: &DiscoveryShared, bytes: &[u8], source: SocketAddr)
 /// ports up to `port + PORT_FALLBACK_ATTEMPTS`. Returns the socket and the
 /// port it actually bound (the caller records it in
 /// [`DiscoveryShared::udp_port`]).
-fn bind_discovery_socket(port: u16) -> io::Result<(StdUdpSocket, u16)> {
+pub(crate) fn bind_discovery_socket(port: u16) -> io::Result<(StdUdpSocket, u16)> {
     let mut last_error = None;
     for candidate in port..=port.saturating_add(PORT_FALLBACK_ATTEMPTS) {
         match bind_multicast_socket(candidate) {
-            Ok(socket) => return Ok((socket, candidate)),
+            Ok(socket) => {
+                let actual = socket.local_addr()?.port();
+                return Ok((socket, actual));
+            }
             Err(error) => last_error = Some(error),
         }
     }
     Err(last_error.unwrap_or_else(|| {
-        io::Error::new(io::ErrorKind::AddrNotAvailable, "no discovery port candidate")
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "no discovery port candidate",
+        )
     }))
 }
 
@@ -547,7 +570,10 @@ mod tests {
     fn device_table_gc_expires_stale() {
         let table = DeviceTable::new("l".repeat(64));
         let stale_fingerprint = "a".repeat(64);
-        table.upsert(sample_info(&stale_fingerprint, "Stale"), ipv4(192, 168, 1, 10));
+        table.upsert(
+            sample_info(&stale_fingerprint, "Stale"),
+            ipv4(192, 168, 1, 10),
+        );
 
         assert_eq!(
             table.gc(Duration::ZERO),
@@ -557,7 +583,10 @@ mod tests {
         assert!(table.list().is_empty(), "gc removed the expired entry");
 
         let fresh_fingerprint = "b".repeat(64);
-        table.upsert(sample_info(&fresh_fingerprint, "Fresh"), ipv4(192, 168, 1, 11));
+        table.upsert(
+            sample_info(&fresh_fingerprint, "Fresh"),
+            ipv4(192, 168, 1, 11),
+        );
         assert!(
             table.gc(Duration::from_secs(75)).is_empty(),
             "the official 75s ttl keeps fresh devices"

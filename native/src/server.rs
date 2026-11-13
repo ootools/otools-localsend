@@ -22,6 +22,7 @@ use crate::crypto::CertMaterial;
 use crate::discovery::{self, DiscoveryShared};
 use crate::event_bridge::{coalesce_progress, WebEventBroadcaster};
 use crate::models::{DeviceInfo, Direction, FileEntry, TransferRecord, TransferStatus};
+use crate::service::{wait_cancelled, ServiceScope};
 use crate::settings::Settings;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, State};
@@ -37,17 +38,15 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch, Notify};
 
 /// A stalled receive session older than this is swept so it cannot pin the
 /// single-active-session rule forever (cancelled with a `transfer-done`).
 const SESSION_EXPIRY_MS: u64 = 30 * 60 * 1000;
-/// Pause between HTTPS bind attempts (matches the discovery loop's cadence).
-const BIND_RETRY_PAUSE: Duration = Duration::from_secs(5);
 /// Maximum failed PIN attempts per IP before requests are blocked with 429
 /// (official `MAX_PIN_ATTEMPTS`, packages/core/src/http/server/common/pin.rs).
 const MAX_PIN_ATTEMPTS: u32 = 3;
@@ -109,6 +108,87 @@ pub struct ReceiveSession {
     /// Manual mode only: resolves the suspended prepare-upload handler.
     /// Taken and sent outside the inner lock (never held across `send`).
     pub decision_tx: Option<oneshot::Sender<Decision>>,
+    cancel_tx: watch::Sender<bool>,
+    cancel_rx: watch::Receiver<bool>,
+    /// Leases cover open writers and terminal file moves, not just body reads.
+    uploads: Arc<UploadActivity>,
+}
+
+#[derive(Default)]
+struct UploadActivity {
+    count: AtomicUsize,
+    changed: Notify,
+}
+
+impl UploadActivity {
+    async fn wait_idle(&self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.count.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+/// Created under the session lock before opening a file. Cancellation cannot
+/// remove its directory until this lease (including flush/close/commit) ends.
+struct UploadLease {
+    session: Arc<UploadActivity>,
+    all: Arc<UploadActivity>,
+}
+
+impl UploadLease {
+    fn new(session: Arc<UploadActivity>, all: Arc<UploadActivity>) -> Self {
+        session.count.fetch_add(1, Ordering::SeqCst);
+        all.count.fetch_add(1, Ordering::SeqCst);
+        Self { session, all }
+    }
+}
+
+impl Drop for UploadLease {
+    fn drop(&mut self) {
+        for activity in [&self.session, &self.all] {
+            activity.count.fetch_sub(1, Ordering::SeqCst);
+            activity.changed.notify_waiters();
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CancelCleanup {
+    temp_dir: PathBuf,
+    keep: HashSet<String>,
+    uploads: Arc<UploadActivity>,
+}
+
+fn clean_cancelled_files(plan: &CancelCleanup) -> io::Result<()> {
+    if plan.keep.is_empty() {
+        return match std::fs::remove_dir_all(&plan.temp_dir) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        };
+    }
+    // Never delete verified files, even when other files of the same session
+    // were cancelled. A whole-tmp sweep would also erase earlier Done sessions.
+    let entries = match std::fs::read_dir(&plan.temp_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !plan
+            .keep
+            .contains(&entry.file_name().to_string_lossy().into_owned())
+        {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 struct Inner {
@@ -137,6 +217,26 @@ pub struct ReceiveSessions {
     tmp_root: PathBuf,
     transfers_path: PathBuf,
     events: Arc<WebEventBroadcaster>,
+    scope: RwLock<Option<Arc<ServiceScope>>>,
+    uploads: Arc<UploadActivity>,
+    cleanups: Mutex<Vec<tokio::task::JoinHandle<Result<(), String>>>>,
+    retry_cleanups: Arc<Mutex<HashMap<PathBuf, CancelCleanup>>>,
+}
+
+/// A timeout drops the waiting future, not task ownership. Put unjoined
+/// cleanups back so a retry/unload can still wait for every filesystem task.
+struct CleanupBatch<'a> {
+    owner: &'a Mutex<Vec<tokio::task::JoinHandle<Result<(), String>>>>,
+    tasks: Vec<tokio::task::JoinHandle<Result<(), String>>>,
+}
+
+impl Drop for CleanupBatch<'_> {
+    fn drop(&mut self) {
+        self.owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .append(&mut self.tasks);
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -186,6 +286,10 @@ impl ReceiveSessions {
             tmp_root: data_dir.join("tmp"),
             transfers_path,
             events,
+            scope: RwLock::new(None),
+            uploads: Arc::new(UploadActivity::default()),
+            cleanups: Mutex::new(Vec::new()),
+            retry_cleanups: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -196,7 +300,98 @@ impl ReceiveSessions {
 
     fn has_active(&self) -> bool {
         let inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        inner.sessions.values().any(|session| !session.status.is_terminal())
+        inner
+            .sessions
+            .values()
+            .any(|session| !session.status.is_terminal())
+    }
+
+    pub(crate) fn set_scope(&self, scope: Arc<ServiceScope>) {
+        *self
+            .scope
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(scope);
+    }
+
+    fn scope(&self) -> Option<Arc<ServiceScope>> {
+        self.scope
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// Live sessions only; historical Pending records loaded after a crash are
+    /// not jobs and are never used to decide whether stop needs confirmation.
+    pub(crate) fn active_count(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .sessions
+            .values()
+            .filter(|session| !session.status.is_terminal())
+            .count()
+    }
+
+    pub(crate) fn cancel_all(&self) {
+        let ids: Vec<String> = self
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .sessions
+            .values()
+            .filter(|session| !session.status.is_terminal())
+            .map(|session| session.session_id.clone())
+            .collect();
+        for id in ids {
+            let _ = self.cancel_session(&id);
+        }
+    }
+
+    pub(crate) fn writers_idle(&self) -> bool {
+        self.uploads.count.load(Ordering::SeqCst) == 0
+    }
+
+    /// Wait outside every mutex. A writer's lease ends only after its file is
+    /// closed and its terminal move is complete, then cancelled dirs can go.
+    pub(crate) async fn drain(&self) -> Result<(), String> {
+        self.uploads.wait_idle().await;
+        loop {
+            let tasks = std::mem::take(
+                &mut *self
+                    .cleanups
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()),
+            );
+            if tasks.is_empty() {
+                let plans: Vec<CancelCleanup> = self
+                    .retry_cleanups
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .values()
+                    .cloned()
+                    .collect();
+                for plan in plans {
+                    clean_cancelled_files(&plan)
+                        .map_err(|error| format!("clean cancelled session: {error}"))?;
+                    self.retry_cleanups
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .remove(&plan.temp_dir);
+                }
+                return Ok(());
+            }
+            let mut batch = CleanupBatch {
+                owner: &self.cleanups,
+                tasks,
+            };
+            while let Some(task) = batch.tasks.last_mut() {
+                let result = task
+                    .await
+                    .map_err(|error| format!("receive cleanup task: {error}"));
+                batch.tasks.pop();
+                result??;
+            }
+        }
     }
 
     /// Cancel every non-terminal session older than [`SESSION_EXPIRY_MS`].
@@ -212,70 +407,29 @@ impl ReceiveSessions {
     ///   prepare-upload handler was dropped — the sender vanished without a
     ///   decision) is aborted like the official PendingSessionGuard.
     fn sweep_expired(&self) {
-        let dead_pending: Vec<String> = {
-            let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-            let mut dead_pending = Vec::new();
-            inner.sessions.retain(|_, session| {
-                if session.status.is_terminal() {
-                    return false; // evicted; the history record stays
-                }
-                let sender_gone = session.status == TransferStatus::Pending
-                    && session
-                        .decision_tx
-                        .as_ref()
-                        .is_some_and(|tx| tx.is_closed());
-                if sender_gone {
-                    // NOT removed here: abort_session below owns the removal
-                    // plus the Cancelled record, temp dir and event.
-                    dead_pending.push(session.session_id.clone());
-                }
-                true
-            });
-            dead_pending
-        };
-        for session_id in &dead_pending {
-            // abort_session re-locks: it marks the record Cancelled, clears
-            // the (still empty) temp dir and reports the transfer-done.
-            self.abort_session(session_id);
-        }
-
         let now = now_ms();
-        let expired: Vec<(String, PathBuf, Option<oneshot::Sender<Decision>>)> = {
+        let expired: Vec<String> = {
             let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-            let expired: Vec<(String, PathBuf, Option<oneshot::Sender<Decision>>)> = inner
-                .sessions
-                .values_mut()
-                .filter(|session| {
-                    !session.status.is_terminal()
-                        && now.saturating_sub(session.created_at) >= SESSION_EXPIRY_MS
-                })
-                .map(|session| {
-                    (
-                        session.session_id.clone(),
-                        session.temp_dir.clone(),
-                        session.decision_tx.take(),
-                    )
-                })
-                .collect();
-            for (session_id, _, _) in &expired {
-                inner.sessions.remove(session_id);
-                self.update_record(&mut inner, session_id, TransferStatus::Cancelled, None);
-            }
-            // PIN failure counters from before the pause window expire too.
             inner
                 .pin_failures
                 .retain(|_, (_, last)| last.elapsed() < Duration::from_millis(SESSION_EXPIRY_MS));
-            expired
+            inner
+                .sessions
+                .values()
+                .filter(|session| {
+                    !session.status.is_terminal()
+                        && (now.saturating_sub(session.created_at) >= SESSION_EXPIRY_MS
+                            || (session.status == TransferStatus::Pending
+                                && session
+                                    .decision_tx
+                                    .as_ref()
+                                    .is_some_and(|tx| tx.is_closed())))
+                })
+                .map(|session| session.session_id.clone())
+                .collect()
         };
-        for (session_id, temp_dir, decision_tx) in expired {
-            let _ = std::fs::remove_dir_all(temp_dir);
-            if let Some(decision_tx) = decision_tx {
-                let _ = decision_tx.send(Decision::Decline);
-            }
-            self.events.send(
-                "transfer-done",
-                json!({ "sessionId": session_id, "status": "cancelled" }),
-            );
+        for id in expired {
+            self.abort_session(&id);
         }
     }
 
@@ -291,30 +445,73 @@ impl ReceiveSessions {
     }
 
     fn cancel_session(&self, session_id: &str) -> Result<(), String> {
-        let (temp_dir, decision_tx) = {
+        let (cleanup, decision_tx) = {
             let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-            let Some(session) = inner.sessions.get_mut(session_id) else {
+            let Some(mut session) = inner.sessions.remove(session_id) else {
                 return Err(format!("session not found: {session_id}"));
             };
-            let temp_dir = session.temp_dir.clone();
-            let was_active = !session.status.is_terminal();
-            let decision_tx = session.decision_tx.take();
-            inner.sessions.remove(session_id);
-            if was_active {
-                self.update_record(&mut inner, session_id, TransferStatus::Cancelled, None);
-            }
-            (temp_dir, decision_tx)
+            let _ = session.cancel_tx.send(true);
+            let destinations = session
+                .uploaded
+                .iter()
+                .map(|id| {
+                    (
+                        id.clone(),
+                        session.temp_dir.join(id).to_string_lossy().into_owned(),
+                    )
+                })
+                .collect();
+            inner.progress.retain(|(id, _), _| id != session_id);
+            self.update_record(
+                &mut inner,
+                session_id,
+                TransferStatus::Cancelled,
+                Some(destinations),
+            );
+            (
+                CancelCleanup {
+                    temp_dir: session.temp_dir,
+                    keep: session.uploaded,
+                    uploads: session.uploads,
+                },
+                session.decision_tx.take(),
+            )
         };
-        let _ = std::fs::remove_dir_all(temp_dir);
         if let Some(decision_tx) = decision_tx {
-            // A still-connected sender receives the 403 through its suspended
-            // prepare-upload handler; a disconnected one needs no reply.
             let _ = decision_tx.send(Decision::Decline);
         }
         self.events.send(
             "transfer-done",
             json!({ "sessionId": session_id, "status": "cancelled" }),
         );
+        if cleanup.uploads.count.load(Ordering::SeqCst) == 0 {
+            if let Err(error) = clean_cancelled_files(&cleanup) {
+                self.retry_cleanups
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(cleanup.temp_dir.clone(), cleanup);
+                return Err(format!("clean cancelled session: {error}"));
+            }
+        } else {
+            // The writer will wake on its sticky cancel, flush/close, and drop
+            // its lease. Never unlink a directory while it is still writable.
+            let retries = Arc::clone(&self.retry_cleanups);
+            let task = tokio::spawn(async move {
+                cleanup.uploads.wait_idle().await;
+                if let Err(error) = clean_cancelled_files(&cleanup) {
+                    retries
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .insert(cleanup.temp_dir.clone(), cleanup);
+                    return Err(format!("clean cancelled session: {error}"));
+                }
+                Ok(())
+            });
+            self.cleanups
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(task);
+        }
         Ok(())
     }
 
@@ -340,24 +537,7 @@ impl ReceiveSessions {
     /// Sender-disconnect cleanup (official PendingSessionGuard): remove the
     /// session, record it Cancelled and free the single-session slot.
     fn abort_session(&self, session_id: &str) {
-        let temp_dir = {
-            let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-            let Some(session) = inner.sessions.get(session_id) else {
-                return;
-            };
-            let temp_dir = session.temp_dir.clone();
-            let was_active = !session.status.is_terminal();
-            inner.sessions.remove(session_id);
-            if was_active {
-                self.update_record(&mut inner, session_id, TransferStatus::Cancelled, None);
-            }
-            temp_dir
-        };
-        let _ = std::fs::remove_dir_all(temp_dir);
-        self.events.send(
-            "transfer-done",
-            json!({ "sessionId": session_id, "status": "cancelled" }),
-        );
+        let _ = self.cancel_session(session_id);
     }
 
     /// Issue tokens for the requested files of a Pending session, move it to
@@ -370,6 +550,11 @@ impl ReceiveSessions {
         session_id: &str,
         file_ids: Option<Vec<String>>,
     ) -> Result<Vec<String>, String> {
+        let scope = self.scope();
+        let _admission = match &scope {
+            Some(scope) => Some(scope.admit()?),
+            None => None,
+        };
         let (accepted, tokens, decision_tx, finished_empty) = {
             let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
             let session = inner
@@ -468,7 +653,12 @@ impl ReceiveSessions {
 
     fn patch_record_destinations(&self, session_id: &str, destinations: HashMap<String, String>) {
         let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        self.update_record(&mut inner, session_id, TransferStatus::Done, Some(destinations));
+        self.update_record(
+            &mut inner,
+            session_id,
+            TransferStatus::Done,
+            Some(destinations),
+        );
     }
 
     /// Snapshot of the persisted history for `transfer_list`.
@@ -595,7 +785,10 @@ fn safe_file_name(entry: &FileEntry) -> String {
         .chars()
         .filter(|c| !matches!(c, '/' | '\\' | ':') && !c.is_control())
         .collect();
-    match Path::new(cleaned.trim()).file_name().and_then(|name| name.to_str()) {
+    match Path::new(cleaned.trim())
+        .file_name()
+        .and_then(|name| name.to_str())
+    {
         Some(name) if !name.is_empty() && name != "." && name != ".." => name.to_string(),
         _ => format!("file-{}", entry.id),
     }
@@ -619,7 +812,10 @@ fn check_pin_attempt(
     provided: Option<&str>,
     expected: &str,
 ) -> PinCheck {
-    let mut inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
+    let mut inner = sessions
+        .inner
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let count = inner
         .pin_failures
         .get(&remote_ip)
@@ -669,6 +865,19 @@ pub fn prepare_upload(
     pin: Option<String>,
     remote_ip: IpAddr,
 ) -> PrepareOutcome {
+    let scope = sessions.scope();
+    let _admission = match &scope {
+        Some(scope) => match scope.admit() {
+            Ok(gate) => Some(gate),
+            Err(_) => {
+                return PrepareOutcome::Immediate {
+                    status: 503,
+                    body: json!({ "error": "LocalSend service is not running" }),
+                }
+            }
+        },
+        None => None,
+    };
     sessions.sweep_expired();
     // Official order: the PIN is validated before the body is even parsed,
     // so a wrong PIN beats an empty files map.
@@ -740,6 +949,7 @@ pub fn prepare_upload(
     let mut files_list: Vec<FileEntry> = files.values().cloned().collect();
     files_list.sort_by(|a, b| a.id.cmp(&b.id));
     let created_at = now_ms();
+    let (cancel_tx, cancel_rx) = watch::channel(false);
     let session = ReceiveSession {
         session_id: session_id.clone(),
         sender: sender.clone(),
@@ -753,12 +963,22 @@ pub fn prepare_upload(
         failed: HashSet::new(),
         attempts: HashMap::new(),
         decision_tx: session_tx,
+        cancel_tx,
+        cancel_rx,
+        uploads: Arc::new(UploadActivity::default()),
     };
 
     {
-        let mut inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let mut inner = sessions
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         // Two concurrent prepares raced past the pre-check; only one may win.
-        if inner.sessions.values().any(|session| !session.status.is_terminal()) {
+        if inner
+            .sessions
+            .values()
+            .any(|session| !session.status.is_terminal())
+        {
             let _ = std::fs::remove_dir_all(&session.temp_dir);
             return PrepareOutcome::Immediate {
                 status: 409,
@@ -795,7 +1015,10 @@ pub fn prepare_upload(
     match decision_rx {
         None => {
             let tokens = {
-                let inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
+                let inner = sessions
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
                 inner
                     .sessions
                     .get(&session_id)
@@ -863,6 +1086,9 @@ impl ReceiveSessions {
         let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         let plan = {
             let session = inner.sessions.get_mut(session_id)?;
+            if *session.cancel_rx.borrow() || session.status.is_terminal() {
+                return None;
+            }
             if ok {
                 session.uploaded.insert(file_id.to_string());
             } else {
@@ -918,7 +1144,13 @@ impl ReceiveSessions {
             inner.sessions.remove(session_id);
             plan
         };
-        self.update_record(&mut inner, session_id, plan.status, Some(plan.destinations.clone()));
+        inner.progress.retain(|(id, _), _| id != session_id);
+        self.update_record(
+            &mut inner,
+            session_id,
+            plan.status,
+            Some(plan.destinations.clone()),
+        );
         Some(plan)
     }
 }
@@ -1035,7 +1267,17 @@ fn emit_progress(
         "percent": percent,
     });
     let flush = {
-        let mut inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let mut inner = sessions
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if inner
+            .sessions
+            .get(session_id)
+            .is_none_or(|session| *session.cancel_rx.borrow())
+        {
+            return;
+        }
         coalesce_progress(
             &mut inner.progress,
             session_id,
@@ -1070,8 +1312,22 @@ pub async fn upload_stream(
     }
 
     // Phase 1 — authorize and compute the target path (short lock, no awaits).
-    let (temp_path, temp_dir, expected_size) = {
-        let inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
+    let scope = sessions.scope();
+    // The per-session watch also covers ordinary UI /cancel. The service
+    // watch closes the generation even before the cancellation list is taken.
+    let mut service_cancel = scope.as_ref().map(|scope| scope.subscribe());
+    let (temp_path, temp_dir, expected_size, mut cancel, _lease) = {
+        let _admission = match &scope {
+            Some(scope) => match scope.admit() {
+                Ok(gate) => Some(gate),
+                Err(_) => return (503, json!({ "error": "LocalSend service is not running" })),
+            },
+            None => None,
+        };
+        let inner = sessions
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let Some(session) = inner.sessions.get(&session_id) else {
             return (403, json!({ "error": "Invalid token or IP address" }));
         };
@@ -1095,7 +1351,13 @@ pub async fn upload_stream(
         if session.uploaded.contains(&file_id) || session.failed.contains(&file_id) {
             return (409, json!({ "error": "File already transferred" }));
         }
-        (session.temp_dir.join(&file_id), session.temp_dir.clone(), entry.size)
+        (
+            session.temp_dir.join(&file_id),
+            session.temp_dir.clone(),
+            entry.size,
+            session.cancel_rx.clone(),
+            UploadLease::new(Arc::clone(&session.uploads), Arc::clone(&sessions.uploads)),
+        )
     };
 
     if let Err(error) = tokio::fs::create_dir_all(&temp_dir).await {
@@ -1114,10 +1376,21 @@ pub async fn upload_stream(
         Err(error) => return (500, json!({ "error": format!("open temp file: {error}") })),
     };
     let mut body = body;
+    let mut cancelled = false;
     loop {
-        let frame = match body.frame().await {
-            Some(frame) => frame,
-            None => break,
+        let frame = tokio::select! {
+            biased;
+            _ = wait_cancelled(&mut cancel) => { cancelled = true; break; }
+            _ = async {
+                match &mut service_cancel {
+                    Some(cancel) => wait_cancelled(cancel).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => { cancelled = true; break; }
+            frame = body.frame() => match frame {
+                Some(frame) => frame,
+                None => break,
+            },
         };
         match frame {
             Ok(frame) => {
@@ -1141,11 +1414,19 @@ pub async fn upload_stream(
         write_error = Some(format!("flush temp file: {error}"));
     }
     drop(file);
+    if cancelled || *cancel.borrow() || scope.as_ref().is_some_and(|scope| scope.is_cancelled()) {
+        // Flush above closes any Tokio blocking write before the cancellation
+        // cleanup can unlink the partial file/directory after our lease drops.
+        let _ = sessions.session_cancel(&session_id);
+        drop(body);
+        return (409, json!({ "error": "Blocked by another session" }));
+    }
 
     // Phase 3 — verify and finalize.
     if let Some(error) = write_error {
         let _ = tokio::fs::remove_file(&temp_path).await;
-        let plan = sessions.mark_file_terminal(&session_id, &file_id, false, download_dir.as_deref());
+        let plan =
+            sessions.mark_file_terminal(&session_id, &file_id, false, download_dir.as_deref());
         if let Some(plan) = plan {
             execute_terminal_plan(Arc::clone(&sessions), plan).await;
         }
@@ -1153,7 +1434,8 @@ pub async fn upload_stream(
     }
     if body_error {
         let _ = tokio::fs::remove_file(&temp_path).await;
-        let plan = sessions.mark_file_terminal(&session_id, &file_id, false, download_dir.as_deref());
+        let plan =
+            sessions.mark_file_terminal(&session_id, &file_id, false, download_dir.as_deref());
         if let Some(plan) = plan {
             execute_terminal_plan(Arc::clone(&sessions), plan).await;
         }
@@ -1169,7 +1451,10 @@ pub async fn upload_stream(
     // cases must be told apart before comparing.
     let session_gone;
     let expected_sha = {
-        let inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let inner = sessions
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         match inner.sessions.get(&session_id) {
             None => {
                 session_gone = true;
@@ -1177,7 +1462,10 @@ pub async fn upload_stream(
             }
             Some(session) => {
                 session_gone = false;
-                session.files.get(&file_id).and_then(|entry| entry.sha256.clone())
+                session
+                    .files
+                    .get(&file_id)
+                    .and_then(|entry| entry.sha256.clone())
             }
         }
     };
@@ -1229,6 +1517,82 @@ pub struct ServerShared {
     /// Discovery hook: on a successful (possibly fallback) bind the announce
     /// payload is reconciled through `DiscoveryShared::update_local_info`.
     pub discovery: Option<Arc<DiscoveryShared>>,
+    pub(crate) scope: Option<Arc<ServiceScope>>,
+}
+
+impl ServerShared {
+    pub(crate) fn in_service(
+        sessions: Arc<ReceiveSessions>,
+        settings: Arc<RwLock<Settings>>,
+        cert: CertMaterial,
+        discovery: Arc<DiscoveryShared>,
+        scope: Arc<ServiceScope>,
+    ) -> Self {
+        Self {
+            sessions,
+            settings,
+            broadcaster: Arc::clone(&discovery.event),
+            data_dir: PathBuf::new(),
+            cert,
+            server_port: AtomicU16::new(0),
+            bind_error: Mutex::new(None),
+            discovery: Some(discovery),
+            scope: Some(scope),
+        }
+    }
+}
+
+/// Wrap the TLS accept phase too: axum's Handle only observes cancellation
+/// after acceptor.accept completes, so a peer stalled in its handshake must
+/// not leave a detached connection task behind on stop/unload.
+#[derive(Clone)]
+struct CancellableAccept<A> {
+    inner: A,
+    cancel: watch::Receiver<bool>,
+}
+
+impl<A, I, S> axum_server::accept::Accept<I, S> for CancellableAccept<A>
+where
+    A: axum_server::accept::Accept<I, S>,
+    A::Future: Send + 'static,
+    A::Stream: Send + 'static,
+    A::Service: Send + 'static,
+{
+    type Stream = A::Stream;
+    type Service = A::Service;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>,
+    >;
+
+    fn accept(&self, stream: I, service: S) -> Self::Future {
+        let accept = self.inner.accept(stream, service);
+        let mut cancel = self.cancel.clone();
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                _ = wait_cancelled(&mut cancel) => Err(io::Error::new(io::ErrorKind::Interrupted, "LocalSend service stopped")),
+                result = accept => result,
+            }
+        })
+    }
+}
+
+pub(crate) async fn serve_bound(
+    state: Arc<ServerShared>,
+    listener: std::net::TcpListener,
+    config: axum_server::tls_rustls::RustlsConfig,
+    handle: axum_server::Handle,
+    cancel: watch::Receiver<bool>,
+) -> Result<(), String> {
+    axum_server::from_tcp_rustls(listener, config)
+        .map(|acceptor| CancellableAccept {
+            inner: acceptor,
+            cancel,
+        })
+        .handle(handle)
+        .serve(build_router(state).into_make_service_with_connect_info::<SocketAddr>())
+        .await
+        .map_err(|error| format!("HTTPS server: {error}"))
 }
 
 fn our_info(state: &ServerShared) -> DeviceInfo {
@@ -1248,7 +1612,10 @@ fn our_info(state: &ServerShared) -> DeviceInfo {
 pub fn build_router(state: Arc<ServerShared>) -> Router {
     Router::new()
         .route("/api/localsend/v2/register", post(register_handler))
-        .route("/api/localsend/v2/prepare-upload", post(prepare_upload_handler))
+        .route(
+            "/api/localsend/v2/prepare-upload",
+            post(prepare_upload_handler),
+        )
         .route("/api/localsend/v2/upload", post(upload_handler))
         .route("/api/localsend/v2/cancel", post(cancel_handler))
         .route("/api/localsend/v2/info", get(info_handler))
@@ -1265,7 +1632,6 @@ fn json_response(status: u16, value: Value) -> Response {
     }
     (code, Json(value)).into_response()
 }
-
 
 /// `POST /api/localsend/v2/register` — announce our own device info. No auth.
 async fn register_handler(State(state): State<Arc<ServerShared>>) -> Response {
@@ -1294,6 +1660,13 @@ async fn prepare_upload_handler(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<PrepareBody>,
 ) -> Response {
+    if state
+        .scope
+        .as_ref()
+        .is_some_and(|scope| scope.is_cancelled())
+    {
+        return json_response(503, json!({ "error": "LocalSend service is not running" }));
+    }
     let settings = state
         .settings
         .read()
@@ -1397,111 +1770,20 @@ async fn cancel_handler(
 /// Bind TCP on `0.0.0.0:port` with the discovery-style fallback window
 /// (`port..=port + PORT_FALLBACK_ATTEMPTS`). TCP and UDP discovery ports are
 /// independent; each may fall back separately.
-fn bind_https_listener(port: u16) -> io::Result<(std::net::TcpListener, u16)> {
+pub(crate) fn bind_https_listener(port: u16) -> io::Result<(std::net::TcpListener, u16)> {
     let mut last_error = None;
     for candidate in port..=port.saturating_add(discovery::PORT_FALLBACK_ATTEMPTS) {
         match std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, candidate)) {
-            Ok(listener) => return Ok((listener, candidate)),
+            Ok(listener) => {
+                let actual = listener.local_addr()?.port();
+                return Ok((listener, actual));
+            }
             Err(error) => last_error = Some(error),
         }
     }
     Err(last_error.unwrap_or_else(|| {
         io::Error::new(io::ErrorKind::AddrNotAvailable, "no HTTPS port candidate")
     }))
-}
-
-/// Serve the v2 HTTPS endpoints until the owning runtime is dropped.
-///
-/// Binds the configured port with fallback, records the actual port, feeds it
-/// back into the discovery announce payload (`update_local_info`) and emits
-/// `server-status {port, protocol: "https", fingerprint}` — or
-/// `server-status {error}` when no port could be bound (Review Focus #1: the
-/// UI must show the failure instead of "searching forever").
-pub async fn run_server(state: Arc<ServerShared>) {
-    // axum-server is built with `tls-rustls-no-provider`; install the ring
-    // provider once for the process (same baseline as otools-ai-switch).
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let config = match axum_server::tls_rustls::RustlsConfig::from_der(
-        vec![state.cert.cert_der.clone()],
-        state.cert.key_der.clone(),
-    )
-    .await
-    {
-        Ok(config) => config,
-        Err(error) => {
-            let message = format!("TLS setup failed: {error}");
-            *state
-                .bind_error
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = Some(message.clone());
-            state.broadcaster.send("server-status", json!({ "error": message }));
-            return;
-        }
-    };
-
-    let settings_port = state
-        .settings
-        .read()
-        .unwrap_or_else(|error| error.into_inner())
-        .port;
-    let mut last_error: Option<String> = None;
-    loop {
-        match bind_https_listener(settings_port) {
-            Ok((listener, port)) => {
-                state.server_port.store(port, Ordering::SeqCst);
-                *state
-                    .bind_error
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner()) = None;
-                last_error = None;
-                // Handoff from Task 6: the announce payload must carry the
-                // REAL bound port after a fallback.
-                if let Some(discovery) = &state.discovery {
-                    let mut info = discovery.snapshot_local_info();
-                    if info.port != port {
-                        info.port = port;
-                        discovery.update_local_info(info);
-                    }
-                }
-                state.broadcaster.send(
-                    "server-status",
-                    json!({
-                        "port": port,
-                        "protocol": "https",
-                        "fingerprint": state.cert.fingerprint,
-                    }),
-                );
-                let app = build_router(Arc::clone(&state));
-                if let Err(error) = axum_server::from_tcp_rustls(listener, config.clone())
-                    .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-                    .await
-                {
-                    eprintln!("otools-localsend server: serve: {error}");
-                }
-                // The listener died; report unbound and retry after a pause.
-                state.server_port.store(0, Ordering::SeqCst);
-                tokio::time::sleep(BIND_RETRY_PAUSE).await;
-            }
-            Err(error) => {
-                let message = format!(
-                    "HTTPS bind failed on ports {settings_port}..={} (already in use or blocked): {error}",
-                    settings_port.saturating_add(discovery::PORT_FALLBACK_ATTEMPTS)
-                );
-                // Only surface the first failure (or a changed message) so a
-                // permanently busy port does not flood the event queue.
-                if last_error.as_deref() != Some(message.as_str()) {
-                    state.broadcaster.send("server-status", json!({ "error": message }));
-                    last_error = Some(message.clone());
-                }
-                *state
-                    .bind_error
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner()) = Some(message);
-                tokio::time::sleep(BIND_RETRY_PAUSE).await;
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1641,14 +1923,14 @@ mod tests {
     }
 
     fn session_status(sessions: &ReceiveSessions, session_id: &str) -> Option<TransferStatus> {
-        let inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let inner = sessions
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         inner.sessions.get(session_id).map(|session| session.status)
     }
 
-    fn record_for<'a>(
-        records: &'a [TransferRecord],
-        session_id: &str,
-    ) -> &'a TransferRecord {
+    fn record_for<'a>(records: &'a [TransferRecord], session_id: &str) -> &'a TransferRecord {
         records
             .iter()
             .find(|record| record.session_id == session_id)
@@ -1690,11 +1972,82 @@ mod tests {
     }
 
     #[test]
-    fn prepare_upload_issues_tokens() {
+    fn server_status_events_are_complete_snapshots() {
         let temp = tempfile::tempdir().expect("temp dir");
         let events = Arc::new(WebEventBroadcaster::new());
         let sessions =
-            ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions");
+            Arc::new(ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions"));
+        Settings {
+            port: 0,
+            ..Default::default()
+        }
+        .save(temp.path())
+        .expect("settings");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .expect("runtime");
+        let controller = Arc::new(crate::service::ServiceController::new(
+            runtime.handle().clone(),
+            temp.path().to_path_buf(),
+            Arc::new(std::sync::RwLock::new(Settings::default())),
+            sessions,
+            Arc::clone(&events),
+        ));
+        controller.start().expect("start");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while controller.status().state != crate::service::ServiceState::Running {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "startup must reach running"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        runtime.block_on(controller.shutdown());
+        let snapshots: Vec<Value> = events
+            .drain()
+            .into_iter()
+            .filter(|event| event["event"] == "server-status")
+            .map(|event| event["data"].clone())
+            .collect();
+        assert!(snapshots.iter().any(|status| status["state"] == "running"));
+        assert_eq!(snapshots.last().expect("stopped event")["state"], "stopped");
+        for status in snapshots {
+            let mut keys: Vec<&str> = status
+                .as_object()
+                .expect("snapshot object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                vec![
+                    "activeTransfers",
+                    "error",
+                    "fingerprint",
+                    "port",
+                    "protocol",
+                    "revision",
+                    "state",
+                    "udpPort"
+                ]
+            );
+            assert_eq!(status["protocol"], "https");
+            assert!(status["revision"]
+                .as_u64()
+                .is_some_and(|revision| revision > 0));
+            assert_eq!(status["activeTransfers"], 0);
+            assert!(status["error"].is_null());
+        }
+    }
+
+    #[test]
+    fn prepare_upload_issues_tokens() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions = ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions");
         let config = settings(true, None);
 
         let entries = [file_entry("f1", 10, None), file_entry("f2", 20, None)];
@@ -1704,11 +2057,17 @@ mod tests {
         let session_id = body["sessionId"].as_str().expect("sessionId").to_string();
         let token1 = body["files"]["f1"].as_str().expect("f1 token").to_string();
         let token2 = body["files"]["f2"].as_str().expect("f2 token").to_string();
-        assert!(!token1.is_empty() && !token2.is_empty(), "tokens are issued");
+        assert!(
+            !token1.is_empty() && !token2.is_empty(),
+            "tokens are issued"
+        );
         assert_ne!(token1, token2, "tokens are unique per file");
 
         {
-            let inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
+            let inner = sessions
+                .inner
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             let session = inner.sessions.get(&session_id).expect("session stored");
             assert_eq!(session.status, TransferStatus::Transferring);
             assert_eq!(session.tokens["f1"], token1);
@@ -1741,8 +2100,7 @@ mod tests {
     fn prepare_upload_requires_pin_when_set() {
         let temp = tempfile::tempdir().expect("temp dir");
         let events = Arc::new(WebEventBroadcaster::new());
-        let sessions =
-            ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions");
+        let sessions = ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions");
         let config = settings(true, Some("123456"));
         let entries = [file_entry("f1", 10, None)];
 
@@ -1770,8 +2128,7 @@ mod tests {
     fn prepare_upload_rejects_second_session() {
         let temp = tempfile::tempdir().expect("temp dir");
         let events = Arc::new(WebEventBroadcaster::new());
-        let sessions =
-            ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions");
+        let sessions = ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions");
         let config = settings(true, None);
         let entries = [file_entry("f1", 10, None)];
 
@@ -1799,7 +2156,10 @@ mod tests {
         // incoming-request event still notifies the panel immediately.
         let (session_id, decision_rx) = prepare_manual(&sessions, &entries, SENDER_IP);
         {
-            let inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
+            let inner = sessions
+                .inner
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             let session = inner.sessions.get(&session_id).expect("session stored");
             assert_eq!(session.status, TransferStatus::Pending);
             assert!(session.tokens.is_empty(), "no tokens in pending state");
@@ -1824,7 +2184,10 @@ mod tests {
         assert!(!token1.is_empty() && !token2.is_empty());
         assert_ne!(token1, token2);
         {
-            let inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
+            let inner = sessions
+                .inner
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             let session = inner.sessions.get(&session_id).expect("session stored");
             assert_eq!(session.status, TransferStatus::Transferring);
             assert_eq!(session.tokens["f1"], token1, "tokens match the response");
@@ -1839,7 +2202,11 @@ mod tests {
         let (status, body) = waiter.await.expect("waiter task");
         assert_eq!(status, 403, "declined sender");
         assert_eq!(body["error"], "Rejected");
-        assert_eq!(session_status(&sessions, &session_id), None, "session removed");
+        assert_eq!(
+            session_status(&sessions, &session_id),
+            None,
+            "session removed"
+        );
         let record = record_snapshot(&sessions, &session_id);
         assert_eq!(record.status, TransferStatus::Cancelled);
 
@@ -1893,10 +2260,17 @@ mod tests {
             "the skipped file has no token in the response"
         );
         {
-            let inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
+            let inner = sessions
+                .inner
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             let session = inner.sessions.get(&session_id).expect("session stored");
             assert_eq!(session.status, TransferStatus::Transferring);
-            assert_eq!(session.tokens.len(), 1, "only the accepted file got a token");
+            assert_eq!(
+                session.tokens.len(),
+                1,
+                "only the accepted file got a token"
+            );
             assert!(session.tokens.contains_key("f1"));
         }
 
@@ -1911,7 +2285,10 @@ mod tests {
             empty_body(),
         )
         .await;
-        assert_eq!(status, 409, "file without a token is not accepted for upload");
+        assert_eq!(
+            status, 409,
+            "file without a token is not accepted for upload"
+        );
 
         // Accept-all on a fresh pending session: fileIds omitted means every
         // file of the session.
@@ -1922,11 +2299,17 @@ mod tests {
         assert_eq!(accepted, vec!["f1".to_string(), "f2".to_string()]);
         let (status, body) = waiter.await.expect("waiter task");
         assert_eq!(status, 200, "{body}");
-        let inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let inner = sessions
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let session = inner.sessions.get(&session_id).expect("session stored");
         assert_eq!(session.status, TransferStatus::Transferring);
         assert_eq!(session.tokens.len(), 2);
-        assert_eq!(session.tokens["f1"], body["files"]["f1"], "response tokens match");
+        assert_eq!(
+            session.tokens["f1"], body["files"]["f1"],
+            "response tokens match"
+        );
     }
 
     #[tokio::test]
@@ -1980,7 +2363,10 @@ mod tests {
         assert_eq!(status, 403, "unknown session cannot verify a token");
 
         {
-            let inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
+            let inner = sessions
+                .inner
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             let session = inner.sessions.get(&session_id).expect("session stored");
             assert_eq!(session.status, TransferStatus::Transferring);
             assert!(session.uploaded.is_empty(), "no file was marked done");
@@ -2022,11 +2408,17 @@ mod tests {
             body,
         ));
 
-        tx.send(Ok(Bytes::from_static(b"abc"))).await.expect("send chunk 1");
+        tx.send(Ok(Bytes::from_static(b"abc")))
+            .await
+            .expect("send chunk 1");
         wait_for_size(&temp_path, 3).await;
-        tx.send(Ok(Bytes::from_static(b"def"))).await.expect("send chunk 2");
+        tx.send(Ok(Bytes::from_static(b"def")))
+            .await
+            .expect("send chunk 2");
         wait_for_size(&temp_path, 6).await;
-        tx.send(Ok(Bytes::from_static(b"ghi"))).await.expect("send chunk 3");
+        tx.send(Ok(Bytes::from_static(b"ghi")))
+            .await
+            .expect("send chunk 3");
         wait_for_size(&temp_path, 9).await;
         drop(tx);
 
@@ -2089,7 +2481,10 @@ mod tests {
             )
             .await;
             assert_eq!(status, 422, "checksum mismatch on attempt {attempt}");
-            assert!(!bad_path.exists(), "corrupt temp file deleted (attempt {attempt})");
+            assert!(
+                !bad_path.exists(),
+                "corrupt temp file deleted (attempt {attempt})"
+            );
             if attempt < 3 {
                 assert_eq!(
                     session_status(&sessions, &bad_session),
@@ -2147,7 +2542,11 @@ mod tests {
             !sessions.tmp_root().join(&session_id).exists(),
             "session temp dir cleared"
         );
-        assert_eq!(session_status(&sessions, &session_id), None, "session removed");
+        assert_eq!(
+            session_status(&sessions, &session_id),
+            None,
+            "session removed"
+        );
 
         let (status, _) = upload_stream(
             Arc::clone(&sessions),
@@ -2181,7 +2580,11 @@ mod tests {
         let (session_id, _decision_rx) = prepare_manual(&sessions, &entries, SENDER_IP);
 
         session_decline(&sessions, &session_id).expect("decline");
-        assert_eq!(session_status(&sessions, &session_id), None, "session removed");
+        assert_eq!(
+            session_status(&sessions, &session_id),
+            None,
+            "session removed"
+        );
         let record = record_snapshot(&sessions, &session_id);
         assert_eq!(record.status, TransferStatus::Cancelled);
         let done = event_data(&events, "transfer-done");
@@ -2223,7 +2626,11 @@ mod tests {
         )
         .await;
         assert_eq!(status, 200);
-        assert_eq!(session_status(&sessions, &session_id), None, "evicted on Done");
+        assert_eq!(
+            session_status(&sessions, &session_id),
+            None,
+            "evicted on Done"
+        );
 
         let (status, _) = upload_stream(
             Arc::clone(&sessions),
@@ -2318,28 +2725,24 @@ mod tests {
     fn prepare_rejects_unsafe_file_ids() {
         let temp = tempfile::tempdir().expect("temp dir");
         let events = Arc::new(WebEventBroadcaster::new());
-        let sessions =
-            ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions");
+        let sessions = ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions");
         let config = settings(true, None);
 
         for evil in ["../evil", "sub\\dir", "..", ".", "con:stream", ""] {
             let mut files = files_map(&[file_entry("f1", 10, None)]);
             files.insert(evil.to_string(), file_entry("x", 10, None));
-            let (status, body) = match prepare_upload(
-                &sessions,
-                &config,
-                sender_info(),
-                files,
-                None,
-                SENDER_IP,
-            ) {
-                PrepareOutcome::Immediate { status, body } => (status, body),
-                PrepareOutcome::AwaitDecision { .. } => panic!("must be rejected outright"),
-            };
+            let (status, body) =
+                match prepare_upload(&sessions, &config, sender_info(), files, None, SENDER_IP) {
+                    PrepareOutcome::Immediate { status, body } => (status, body),
+                    PrepareOutcome::AwaitDecision { .. } => panic!("must be rejected outright"),
+                };
             assert_eq!(status, 400, "unsafe file id {evil:?} rejected: {body}");
         }
 
-        let inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let inner = sessions
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         assert!(
             inner.sessions.is_empty(),
             "no session is created from an invalid body"
@@ -2350,8 +2753,7 @@ mod tests {
     fn prepare_rejects_empty_files() {
         let temp = tempfile::tempdir().expect("temp dir");
         let events = Arc::new(WebEventBroadcaster::new());
-        let sessions =
-            ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions");
+        let sessions = ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions");
         let config = settings(true, None);
 
         let (status, body) = match prepare_upload(
@@ -2374,8 +2776,7 @@ mod tests {
     fn prepare_pin_attempts_rate_limited() {
         let temp = tempfile::tempdir().expect("temp dir");
         let events = Arc::new(WebEventBroadcaster::new());
-        let sessions =
-            ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions");
+        let sessions = ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions");
         let config = settings(true, Some("123456"));
         let entries = [file_entry("f1", 10, None)];
 
@@ -2388,7 +2789,10 @@ mod tests {
             assert_eq!(status, 401, "wrong pin attempt {attempt}: {body}");
         }
         let (status, body) = prepare_now(&sessions, &config, &entries, Some("123456"), SENDER_IP);
-        assert_eq!(status, 429, "budget exhausted, even the correct pin: {body}");
+        assert_eq!(
+            status, 429,
+            "budget exhausted, even the correct pin: {body}"
+        );
         assert_eq!(body["error"], "Too many requests", "official message");
 
         // A different source IP keeps its own budget.
@@ -2509,7 +2913,10 @@ mod tests {
         // Terminal: the session left the map (official drops the slot on
         // completion) while the history record stays in transfer_list.
         {
-            let inner = sessions.inner.lock().unwrap_or_else(|error| error.into_inner());
+            let inner = sessions
+                .inner
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             assert!(
                 inner.sessions.is_empty(),
                 "terminal sessions must be evicted: {:?}",
@@ -2527,12 +2934,239 @@ mod tests {
         assert_eq!(status, 200, "slot free after completion: {body}");
     }
 
+    /// Cancellation must wake a receiver whose sender has not closed the body.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_stalled_upload_before_body_eof() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions =
+            Arc::new(ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions"));
+        let (status, prepared) = prepare_now(
+            &sessions,
+            &settings(true, None),
+            &[file_entry("partial", 100, None)],
+            None,
+            SENDER_IP,
+        );
+        assert_eq!(status, 200);
+        let session_id = prepared["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        let token = prepared["files"]["partial"]
+            .as_str()
+            .expect("token")
+            .to_string();
+        let path = sessions.tmp_root().join(&session_id).join("partial");
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        let mut upload = tokio::spawn(upload_stream(
+            Arc::clone(&sessions),
+            None,
+            session_id.clone(),
+            "partial".into(),
+            token,
+            SENDER_IP,
+            Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+        ));
+        tx.send(Ok(Bytes::from_static(b"partial")))
+            .await
+            .expect("first chunk");
+        wait_for_size(&path, 7).await;
+
+        session_cancel(&sessions, &session_id).expect("cancel active writer");
+        let settled = tokio::time::timeout(Duration::from_millis(500), &mut upload).await;
+        if settled.is_err() {
+            upload.abort();
+            let _ = upload.await;
+        }
+        assert!(
+            settled.is_ok(),
+            "cancel must finish the upload without waiting for EOF"
+        );
+        assert!(tx.is_closed(), "the stalled body must be dropped on cancel");
+        sessions.drain().await.expect("closed-writer cleanup");
+        assert!(
+            !path.parent().expect("session dir").exists(),
+            "closed writer's partial dir removed"
+        );
+        assert_eq!(
+            record_snapshot(&sessions, &session_id).status,
+            TransferStatus::Cancelled
+        );
+        let inner = sessions
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(
+            inner.progress.is_empty(),
+            "cancel must not leave coalesced receive progress"
+        );
+        drop(inner);
+        let done = event_data(&events, "transfer-done");
+        assert_eq!(
+            done.len(),
+            1,
+            "one terminal event despite the upload settling after cancel"
+        );
+        assert_eq!(done[0]["status"], "cancelled");
+    }
+
+    /// Completed files in a partially cancelled session are still user data.
+    #[tokio::test]
+    async fn cancel_preserves_completed_files_in_partial_session() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions =
+            Arc::new(ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions"));
+        let (status, prepared) = prepare_now(
+            &sessions,
+            &settings(true, None),
+            &[
+                file_entry("finished", 4, None),
+                file_entry("pending", 100, None),
+            ],
+            None,
+            SENDER_IP,
+        );
+        assert_eq!(status, 200);
+        let session_id = prepared["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        let token = prepared["files"]["finished"]
+            .as_str()
+            .expect("token")
+            .to_string();
+        let (status, _) = upload_stream(
+            Arc::clone(&sessions),
+            None,
+            session_id.clone(),
+            "finished".into(),
+            token,
+            SENDER_IP,
+            Body::from("kept"),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let finished = sessions.tmp_root().join(&session_id).join("finished");
+        std::fs::write(
+            sessions.tmp_root().join(&session_id).join("pending"),
+            b"unfinished",
+        )
+        .expect("partial file");
+
+        session_cancel(&sessions, &session_id).expect("cancel remaining file");
+        assert_eq!(
+            std::fs::read(&finished).expect("completed file retained"),
+            b"kept"
+        );
+        assert!(!sessions
+            .tmp_root()
+            .join(&session_id)
+            .join("pending")
+            .exists());
+        let record = record_snapshot(&sessions, &session_id);
+        assert_eq!(record.status, TransferStatus::Cancelled);
+        assert_eq!(record.destinations["finished"], finished.to_string_lossy());
+        assert_eq!(event_data(&events, "transfer-done").len(), 1);
+    }
+
+    #[test]
+    fn stop_never_forces_axum_closed_while_receive_commit_is_active() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        Settings {
+            port: 0,
+            ..Default::default()
+        }
+        .save(temp.path())
+        .unwrap();
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions = Arc::new(ReceiveSessions::new(temp.path(), Arc::clone(&events)).unwrap());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let controller = Arc::new(crate::service::ServiceController::new(
+            runtime.handle().clone(),
+            temp.path().to_path_buf(),
+            Arc::new(std::sync::RwLock::new(Settings::default())),
+            Arc::clone(&sessions),
+            events,
+        ));
+        controller.start().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while controller.status().state != crate::service::ServiceState::Running {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let client = crate::sender::http_client();
+        let port = controller.status().port;
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        runtime
+            .block_on(tx.send(Ok(Bytes::from_static(b"{"))))
+            .unwrap();
+        let request = runtime.spawn(async move {
+            client
+                .post(format!(
+                    "https://127.0.0.1:{port}/api/localsend/v2/prepare-upload"
+                ))
+                .header("content-type", "application/json")
+                .body(reqwest::Body::wrap_stream(
+                    tokio_stream::wrappers::ReceiverStream::new(rx),
+                ))
+                .send()
+                .await
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        let lease = super::UploadLease::new(
+            Arc::new(super::UploadActivity::default()),
+            Arc::clone(&sessions.uploads),
+        );
+        controller.stop(true);
+        std::thread::sleep(Duration::from_millis(4300));
+        let closed_while_committing = request.is_finished();
+        assert_eq!(
+            controller.status().state,
+            crate::service::ServiceState::Stopping
+        );
+        drop(lease);
+        runtime.block_on(controller.shutdown());
+        let _ = runtime.block_on(request);
+        drop(tx);
+        assert!(
+            !closed_while_committing,
+            "force-close must wait for writer/commit lease instead of dropping filesystem futures"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_drain_keeps_cleanup_handles_owned() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions = Arc::new(ReceiveSessions::new(temp.path(), events).expect("sessions"));
+        let (tx, rx) = oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _ = rx.await;
+            Ok(())
+        });
+        sessions.cleanups.lock().unwrap().push(task);
+        let result = tokio::time::timeout(Duration::from_millis(20), sessions.drain()).await;
+        assert!(result.is_err(), "cleanup is still blocked");
+        let retained = sessions.cleanups.lock().unwrap().len();
+        tx.send(()).expect("release cleanup");
+        sessions.drain().await.expect("drain completed");
+        assert_eq!(
+            retained, 1,
+            "timed-out drain must not detach its cleanup task"
+        );
+    }
+
     #[test]
     fn bogus_session_actions_fail() {
         let temp = tempfile::tempdir().expect("temp dir");
         let events = Arc::new(WebEventBroadcaster::new());
-        let sessions =
-            ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions");
+        let sessions = ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions");
 
         assert!(session_accept(&sessions, "nope", None).is_err());
         assert!(session_decline(&sessions, "nope").is_err());

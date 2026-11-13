@@ -5,6 +5,7 @@ pub mod models;
 pub mod runtime;
 pub mod sender;
 pub mod server;
+mod service;
 pub mod settings;
 
 use serde_json::{json, Value};

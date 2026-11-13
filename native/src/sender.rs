@@ -45,12 +45,14 @@ use crate::discovery::{DiscoveryShared, PROTOCOL_VERSION};
 use crate::event_bridge::{coalesce_progress, WebEventBroadcaster};
 use crate::models::{DeviceInfo, Direction, FileEntry, Metadata, TransferRecord, TransferStatus};
 use crate::server::ReceiveSessions;
+use crate::service::ServiceScope;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
@@ -68,6 +70,8 @@ pub const MAX_UPLOAD_ATTEMPTS: u32 = 3;
 /// cancel notification). Deliberately NOT applied to prepare-upload/upload:
 /// prepare stays open until the receiver decides (Task 8 review handoff).
 pub const SHORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Cancel is best effort; it must not consume the whole service drain budget.
+const CANCEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 /// TCP connect timeout (the only timeout on transfer requests).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Disk read chunk for hashing and upload streaming.
@@ -114,6 +118,7 @@ pub struct SendJob {
     pub file_ids: Vec<String>,
     cancel_tx: watch::Sender<bool>,
     cancel_rx: watch::Receiver<bool>,
+    finalized: AtomicBool,
 }
 
 impl SendJob {
@@ -168,6 +173,7 @@ pub struct SendSessions {
     /// "https" in production; "http" in the unit tests, which drive the same
     /// code paths against plain axum servers.
     scheme: &'static str,
+    scope: Option<Arc<ServiceScope>>,
 }
 
 impl SendSessions {
@@ -177,6 +183,17 @@ impl SendSessions {
         discovery: Option<Arc<DiscoveryShared>>,
     ) -> Self {
         Self::build("https", receive, events, discovery)
+    }
+
+    pub(crate) fn in_service(
+        receive: Arc<ReceiveSessions>,
+        events: Arc<WebEventBroadcaster>,
+        discovery: Arc<DiscoveryShared>,
+        scope: Arc<ServiceScope>,
+    ) -> Self {
+        let mut sessions = Self::new(receive, events, Some(discovery));
+        sessions.scope = Some(scope);
+        sessions
     }
 
     #[cfg(test)]
@@ -202,6 +219,7 @@ impl SendSessions {
             discovery,
             client: http_client(),
             scheme,
+            scope: None,
         }
     }
 
@@ -253,6 +271,28 @@ impl SendSessions {
         }
     }
 
+    pub(crate) fn active_count(&self) -> usize {
+        self.jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .filter(|job| !job.finalized.load(Ordering::SeqCst))
+            .count()
+    }
+
+    pub(crate) fn cancel_all(&self) {
+        let jobs: Vec<Arc<SendJob>> = self
+            .jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for job in jobs {
+            job.cancel();
+        }
+    }
+
     /// Compute the coalesced `transfer-progress` payload for one tick.
     /// Returns the payload to emit (`None` when coalesced away).
     fn report_progress(&self, session_id: &str, file_id: &str, percent: u32) -> Option<Value> {
@@ -261,7 +301,10 @@ impl SendSessions {
             "fileId": file_id,
             "percent": percent,
         });
-        let mut pending = self.progress.lock().unwrap_or_else(|error| error.into_inner());
+        let mut pending = self
+            .progress
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         coalesce_progress(
             &mut pending,
             session_id,
@@ -307,9 +350,11 @@ impl SendSessions {
     /// history record to its final status, emit `transfer-done` and evict the
     /// job from the registry (official drops the slot on completion).
     fn finalize_job(&self, job: &SendJob, status: TransferStatus) {
+        if job.finalized.swap(true, Ordering::SeqCst) {
+            return;
+        }
         self.cleanup_progress(&job.session_id);
-        self.receive
-            .set_send_record(&job.session_id, status, None);
+        self.receive.set_send_record(&job.session_id, status, None);
         let status_name = match status {
             TransferStatus::Done => "done",
             TransferStatus::Cancelled => "cancelled",
@@ -323,6 +368,25 @@ impl SendSessions {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .remove(&job.session_id);
+    }
+}
+
+/// Dropping a tracked send future (the bounded-stop fallback) still owns its
+/// terminal transition. The atomic in finalize_job makes this and normal exit
+/// share exactly one history/event/progress cleanup.
+struct SendGuard {
+    state: Arc<SendSessions>,
+    job: Arc<SendJob>,
+}
+
+impl Drop for SendGuard {
+    fn drop(&mut self) {
+        let status = if self.job.is_cancelled() {
+            TransferStatus::Cancelled
+        } else {
+            TransferStatus::Failed
+        };
+        self.state.finalize_job(&self.job, status);
     }
 }
 
@@ -353,6 +417,11 @@ pub fn start_send(
         entries_sources.push(build_entry(item)?);
     }
 
+    let scope = state.scope.clone();
+    let _admission = match &scope {
+        Some(scope) => Some(scope.admit()?),
+        None => None,
+    };
     let session_id = uuid::Uuid::new_v4().to_string();
     let alias = state.peer_alias(&peer_ip, peer_port);
     let peer = SendPeer {
@@ -360,7 +429,10 @@ pub fn start_send(
         port: peer_port,
         alias,
     };
-    let file_ids: Vec<String> = entries_sources.iter().map(|(entry, _)| entry.id.clone()).collect();
+    let file_ids: Vec<String> = entries_sources
+        .iter()
+        .map(|(entry, _)| entry.id.clone())
+        .collect();
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let job = Arc::new(SendJob {
         session_id: session_id.clone(),
@@ -368,6 +440,7 @@ pub fn start_send(
         file_ids,
         cancel_tx,
         cancel_rx,
+        finalized: AtomicBool::new(false),
     });
 
     // Register before spawning so `session_cancel` finds the job even while
@@ -383,13 +456,23 @@ pub fn start_send(
         session_id: session_id.clone(),
         direction: Direction::Send,
         peer_alias: peer.alias,
-        files: entries_sources.iter().map(|(entry, _)| entry.clone()).collect(),
+        files: entries_sources
+            .iter()
+            .map(|(entry, _)| entry.clone())
+            .collect(),
         status: TransferStatus::Pending,
         created_at: now_ms(),
         destinations: HashMap::new(),
     });
 
-    let run = async move { run_send_job(state, job, entries_sources, pin).await };
+    let guard = SendGuard {
+        state: Arc::clone(&state),
+        job: Arc::clone(&job),
+    };
+    let run = async move {
+        let _guard = guard;
+        run_send_job(state, job, entries_sources, pin).await;
+    };
     Ok((session_id, run))
 }
 
@@ -435,8 +518,8 @@ fn build_entry(item: &SendItem) -> Result<(FileEntry, SendSource), String> {
             ))
         }
         SendItem::File(path) => {
-            let metadata = std::fs::metadata(path)
-                .map_err(|error| format!("{}: {error}", path.display()))?;
+            let metadata =
+                std::fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
             let file_name = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -465,25 +548,23 @@ fn mime_for(path: &Path) -> String {
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.to_ascii_lowercase())
         .as_deref()
-        .and_then(|ext| {
-            match ext {
-                "txt" | "md" | "log" => Some("text/plain"),
-                "html" | "htm" => Some("text/html"),
-                "csv" => Some("text/csv"),
-                "png" => Some("image/png"),
-                "jpg" | "jpeg" => Some("image/jpeg"),
-                "gif" => Some("image/gif"),
-                "svg" => Some("image/svg+xml"),
-                "webp" => Some("image/webp"),
-                "pdf" => Some("application/pdf"),
-                "zip" => Some("application/zip"),
-                "mp3" => Some("audio/mpeg"),
-                "wav" => Some("audio/wav"),
-                "mp4" => Some("video/mp4"),
-                "mov" => Some("video/quicktime"),
-                "json" => Some("application/json"),
-                _ => None,
-            }
+        .and_then(|ext| match ext {
+            "txt" | "md" | "log" => Some("text/plain"),
+            "html" | "htm" => Some("text/html"),
+            "csv" => Some("text/csv"),
+            "png" => Some("image/png"),
+            "jpg" | "jpeg" => Some("image/jpeg"),
+            "gif" => Some("image/gif"),
+            "svg" => Some("image/svg+xml"),
+            "webp" => Some("image/webp"),
+            "pdf" => Some("application/pdf"),
+            "zip" => Some("application/zip"),
+            "mp3" => Some("audio/mpeg"),
+            "wav" => Some("audio/wav"),
+            "mp4" => Some("video/mp4"),
+            "mov" => Some("video/quicktime"),
+            "json" => Some("application/json"),
+            _ => None,
         });
     mime.unwrap_or("application/octet-stream").to_string()
 }
@@ -499,10 +580,7 @@ fn file_metadata(metadata: &std::fs::Metadata) -> Option<Metadata> {
 }
 
 fn iso_timestamp(system: Option<SystemTime>) -> Option<String> {
-    let seconds = system?
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_secs() as i64;
+    let seconds = system?.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
     let stamp = time::OffsetDateTime::from_unix_timestamp(seconds).ok()?;
     stamp
         .format(&time::format_description::well_known::Rfc3339)
@@ -545,10 +623,7 @@ async fn run_send_job(
                         prepared.push((hashed, source));
                     }
                     Err(error) => {
-                        eprintln!(
-                            "otools-localsend sender: hash {}: {error}",
-                            path.display()
-                        );
+                        eprintln!("otools-localsend sender: hash {}: {error}", path.display());
                         results.insert(entry.id, FileOutcome::Failed);
                     }
                 }
@@ -624,9 +699,19 @@ async fn run_send_job(
         }
         Prepare::Response(response) => {
             let status = response.status().as_u16();
-            match status {
-                200 => match response.json::<Value>().await {
-                    Ok(payload) => {
+            if status == 200 {
+                let payload = tokio::select! {
+                    biased;
+                    _ = wait_cancelled(&mut cancel_rx) => None,
+                    result = response.json::<Value>() => Some(result),
+                };
+                match payload {
+                    None => {
+                        post_cancel(&state, &job.peer, None).await;
+                        state.finalize_job(&job, TransferStatus::Cancelled);
+                        return;
+                    }
+                    Some(Ok(payload)) => {
                         let remote_session = payload
                             .get("sessionId")
                             .and_then(Value::as_str)
@@ -634,7 +719,7 @@ async fn run_send_job(
                             .to_string();
                         (remote_session, parse_tokens(&payload))
                     }
-                    Err(error) => {
+                    Some(Err(error)) => {
                         eprintln!(
                             "otools-localsend sender: prepare body {}: {error}",
                             job.peer.ip
@@ -642,30 +727,15 @@ async fn run_send_job(
                         state.finalize_job(&job, TransferStatus::Failed);
                         return;
                     }
-                },
-                // Nothing accepted: terminal Done with zero uploaded files.
-                204 => {
-                    state.finalize_job(&job, TransferStatus::Done);
-                    return;
                 }
-                // Declined: the receiver said no.
-                403 => {
-                    state.finalize_job(&job, TransferStatus::Cancelled);
-                    return;
-                }
-                // Busy: another session blocks the receiver.
-                409 => {
-                    state.finalize_job(&job, TransferStatus::Failed);
-                    return;
-                }
-                other => {
-                    eprintln!(
-                        "otools-localsend sender: prepare answered {other} from {}:{}",
-                        job.peer.ip, job.peer.port
-                    );
-                    state.finalize_job(&job, TransferStatus::Failed);
-                    return;
-                }
+            } else {
+                let final_status = match status {
+                    204 => TransferStatus::Done,
+                    403 => TransferStatus::Cancelled,
+                    _ => TransferStatus::Failed,
+                };
+                state.finalize_job(&job, final_status);
+                return;
             }
         }
     };
@@ -702,7 +772,10 @@ async fn run_send_job(
     let final_status = if job.is_cancelled() {
         post_cancel(&state, &job.peer, Some(&remote_session)).await;
         TransferStatus::Cancelled
-    } else if results.values().any(|outcome| *outcome == FileOutcome::Failed) {
+    } else if results
+        .values()
+        .any(|outcome| *outcome == FileOutcome::Failed)
+    {
         TransferStatus::Failed
     } else {
         TransferStatus::Done
@@ -742,9 +815,7 @@ async fn upload_file(
             }
             Attempt::Cancelled => return (file_id, FileOutcome::Failed),
             Attempt::Error(error) => {
-                eprintln!(
-                    "otools-localsend sender: upload {file_id} attempt {attempt}: {error}"
-                );
+                eprintln!("otools-localsend sender: upload {file_id} attempt {attempt}: {error}");
                 return (file_id, FileOutcome::Failed);
             }
         }
@@ -811,27 +882,21 @@ async fn upload_attempt(
         },
     };
     let status = response.status().as_u16();
-    match status {
-        200 => Attempt::Ok,
-        // Checksum mismatch: retryable with the same token.
-        422 => {
-            // Drain the error body before dropping the response: a receiver
-            // that rejects BEFORE reading our body (early 403/422) closes the
-            // connection, and an undrained response would leave the half-open
-            // pooled connection to break the retry attempt.
-            let _body = response.text().await.unwrap_or_default();
-            Attempt::ChecksumMismatch
-        }
-        other => {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_default()
-                .chars()
-                .take(200)
-                .collect::<String>();
-            Attempt::Error(format!("peer answered {other}: {body}"))
-        }
+    if status == 200 {
+        return Attempt::Ok;
+    }
+    // Drain retry/error bodies for connection reuse, but never let a peer's
+    // incomplete body hold a cancelled session open.
+    let body = tokio::select! {
+        biased;
+        _ = wait_cancelled(&mut cancel_rx) => return Attempt::Cancelled,
+        result = response.text() => result.unwrap_or_default(),
+    };
+    if status == 422 {
+        Attempt::ChecksumMismatch
+    } else {
+        let body = body.chars().take(200).collect::<String>();
+        Attempt::Error(format!("peer answered {status}: {body}"))
     }
 }
 
@@ -878,7 +943,10 @@ async fn stream_sha256(path: &Path, cancel: watch::Receiver<bool>) -> Result<Str
         if *cancel.borrow() {
             return Err("cancelled".into());
         }
-        let read = file.read(&mut chunk).await.map_err(|error| error.to_string())?;
+        let read = file
+            .read(&mut chunk)
+            .await
+            .map_err(|error| error.to_string())?;
         if read == 0 {
             break;
         }
@@ -911,11 +979,11 @@ async fn wait_cancelled(rx: &mut watch::Receiver<bool>) {
 
 /// Best-effort cancel notification to the peer.
 async fn post_cancel(state: &SendSessions, peer: &SendPeer, remote_session: Option<&str>) {
-    let url = format!("{}://{}:{}{API_ROOT}/cancel", state.scheme, peer.ip, peer.port);
-    let mut builder = state
-        .client
-        .post(&url)
-        .timeout(SHORT_REQUEST_TIMEOUT);
+    let url = format!(
+        "{}://{}:{}{API_ROOT}/cancel",
+        state.scheme, peer.ip, peer.port
+    );
+    let mut builder = state.client.post(&url).timeout(CANCEL_REQUEST_TIMEOUT);
     if let Some(session) = remote_session {
         builder = builder.query(&[("sessionId", session)]);
     }
@@ -973,7 +1041,9 @@ mod tests {
 
     /// Bind a plain HTTP axum server on an ephemeral port; runs until dropped.
     async fn serve(app: Router) -> u16 {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let port = listener.local_addr().expect("addr").port();
         tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
         port
@@ -1039,9 +1109,17 @@ mod tests {
             "wire name must embed a uuid v4: {}",
             entry.file_name
         );
-        assert_eq!(entry.preview.as_deref(), Some(text), "text embedded into preview");
+        assert_eq!(
+            entry.preview.as_deref(),
+            Some(text),
+            "text embedded into preview"
+        );
         assert_eq!(entry.file_type, "text/plain");
-        assert_eq!(entry.size, text.len() as u64, "size is the utf8 byte length");
+        assert_eq!(
+            entry.size,
+            text.len() as u64,
+            "size is the utf8 byte length"
+        );
         assert_eq!(
             entry.sha256.as_deref(),
             Some(sha256_hex(text.as_bytes()).as_str()),
@@ -1063,7 +1141,10 @@ mod tests {
         assert_eq!(entry.file_name, "数据文件.bin", "non-ASCII name preserved");
         assert_eq!(entry.size, 7);
         assert_eq!(entry.file_type, "application/octet-stream");
-        assert!(entry.sha256.is_none(), "file checksums are hashed in the job");
+        assert!(
+            entry.sha256.is_none(),
+            "file checksums are hashed in the job"
+        );
         assert!(entry.metadata.is_some());
         match source {
             SendSource::File(resolved) => assert_eq!(resolved, path),
@@ -1092,12 +1173,18 @@ mod tests {
         assert_eq!(state.pending_progress(), 1, "one pending entry for the key");
 
         // A percent jump flushes immediately (monotonic percent rule).
-        let jumped = state.report_progress(session, file, 5).expect("jump flushes");
+        let jumped = state
+            .report_progress(session, file, 5)
+            .expect("jump flushes");
         assert_eq!(jumped["percent"], 5);
 
         // Session end: the pending map must be cleaned, never stranded.
         state.cleanup_progress(session);
-        assert_eq!(state.pending_progress(), 0, "pending map cleaned at session end");
+        assert_eq!(
+            state.pending_progress(),
+            0,
+            "pending map cleaned at session end"
+        );
     }
 
     #[tokio::test]
@@ -1122,10 +1209,17 @@ mod tests {
         .expect("job ran to a terminal state");
 
         let record = record_of(&state, &session_id);
-        assert_eq!(record.status, TransferStatus::Cancelled, "decline = cancelled");
+        assert_eq!(
+            record.status,
+            TransferStatus::Cancelled,
+            "decline = cancelled"
+        );
         assert_eq!(record.direction, Direction::Send);
         assert_eq!(record.files.len(), 1);
-        assert!(record.destinations.is_empty(), "send records have no destinations");
+        assert!(
+            record.destinations.is_empty(),
+            "send records have no destinations"
+        );
 
         let done = events_named(&state, "transfer-done");
         assert_eq!(done.len(), 1, "one transfer-done: {done:?}");
@@ -1135,7 +1229,11 @@ mod tests {
             events_named(&state, "transfer-progress").is_empty(),
             "no progress without an accepted upload"
         );
-        assert_eq!(state.pending_progress(), 0, "pending map cleaned at session end");
+        assert_eq!(
+            state.pending_progress(),
+            0,
+            "pending map cleaned at session end"
+        );
     }
 
     #[tokio::test]
@@ -1169,7 +1267,10 @@ mod tests {
             StatusCode::OK.into_response()
         };
         let app = Router::new()
-            .route(&format!("{API_ROOT}/prepare-upload"), axum::routing::post(prepare_ok))
+            .route(
+                &format!("{API_ROOT}/prepare-upload"),
+                axum::routing::post(prepare_ok),
+            )
             .route(&format!("{API_ROOT}/upload"), axum::routing::post(upload));
         let port = serve(app).await;
 
@@ -1223,10 +1324,21 @@ mod tests {
             .collect();
         assert!(!progress.is_empty(), "progress events must flow");
         for pair in progress.windows(2) {
-            assert!(pair[1] >= pair[0], "percent must be monotonic: {progress:?}");
+            assert!(
+                pair[1] >= pair[0],
+                "percent must be monotonic: {progress:?}"
+            );
         }
-        assert_eq!(*progress.last().expect("non-empty"), 100, "final 100% tick emitted");
-        assert!(progress.len() < 200, "ticks must be coalesced, got {}", progress.len());
+        assert_eq!(
+            *progress.last().expect("non-empty"),
+            100,
+            "final 100% tick emitted"
+        );
+        assert!(
+            progress.len() < 200,
+            "ticks must be coalesced, got {}",
+            progress.len()
+        );
 
         let done: Vec<&Value> = events
             .iter()
@@ -1236,7 +1348,215 @@ mod tests {
         assert_eq!(done.len(), 1, "one transfer-done: {events:?}");
         assert_eq!(done[0]["sessionId"], session_id.as_str());
         assert_eq!(done[0]["status"], "done");
-        assert_eq!(state.pending_progress(), 0, "pending map cleaned at session end");
+        assert_eq!(
+            state.pending_progress(),
+            0,
+            "pending map cleaned at session end"
+        );
+    }
+
+    /// The peer sends response headers and one chunk but never ends the body.
+    /// Cancelling must drop those reads rather than wait for the peer's EOF.
+    async fn assert_stalled_response_cancelled(prepare_body: bool, status: StatusCode) {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (body_tx, body_rx) =
+            tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(1);
+        body_tx
+            .send(Ok(axum::body::Bytes::from_static(b"{")))
+            .await
+            .expect("response prefix");
+        let body_rx = Arc::new(std::sync::Mutex::new(Some(body_rx)));
+        let response = {
+            let started = Arc::clone(&started);
+            move || {
+                let started = Arc::clone(&started);
+                let rx = body_rx
+                    .lock()
+                    .expect("body receiver")
+                    .take()
+                    .expect("one request");
+                async move {
+                    let body = axum::body::Body::from_stream(
+                        tokio_stream::wrappers::ReceiverStream::new(rx),
+                    );
+                    let mut response = Response::new(body);
+                    *response.status_mut() = status;
+                    started.notify_one();
+                    response
+                }
+            }
+        };
+        let app = if prepare_body {
+            Router::new().route(
+                &format!("{API_ROOT}/prepare-upload"),
+                axum::routing::post(response),
+            )
+        } else {
+            Router::new()
+                .route(
+                    &format!("{API_ROOT}/prepare-upload"),
+                    axum::routing::post(prepare_ok),
+                )
+                .route(&format!("{API_ROOT}/upload"), axum::routing::post(response))
+        }
+        .route(
+            &format!("{API_ROOT}/cancel"),
+            axum::routing::post(|| async { StatusCode::OK }),
+        );
+        let port = serve(app).await;
+        let (state, _dir) = test_state();
+        let (session_id, run) = super::start_send(
+            Arc::clone(&state),
+            "127.0.0.1".into(),
+            port,
+            vec![SendItem::Text("cancel while reading a response".into())],
+            None,
+        )
+        .expect("start send");
+        let mut job = tokio::spawn(run);
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+            .await
+            .expect("peer returned headers");
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(state.cancel_session(&session_id), "job still registered");
+        let settled = tokio::time::timeout(std::time::Duration::from_millis(500), &mut job).await;
+        if settled.is_err() {
+            job.abort();
+            let _ = job.await;
+        }
+        assert!(
+            settled.is_ok(),
+            "cancel must interrupt the stalled response body read"
+        );
+        assert_eq!(
+            record_of(&state, &session_id).status,
+            TransferStatus::Cancelled
+        );
+        assert!(
+            state.jobs.lock().expect("jobs").is_empty(),
+            "cancel evicts the outbound job"
+        );
+        assert_eq!(state.pending_progress(), 0);
+        let done = events_named(&state, "transfer-done");
+        assert_eq!(done.len(), 1, "one cancelled terminal event");
+        assert_eq!(done[0]["status"], "cancelled");
+        drop(body_tx);
+    }
+
+    #[tokio::test]
+    async fn cancel_stalled_prepare_json_body() {
+        assert_stalled_response_cancelled(true, StatusCode::OK).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_stalled_upload_error_body() {
+        assert_stalled_response_cancelled(false, StatusCode::BAD_REQUEST).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_stalled_checksum_error_body() {
+        assert_stalled_response_cancelled(false, StatusCode::UNPROCESSABLE_ENTITY).await;
+    }
+
+    #[tokio::test]
+    async fn abort_cancelled_send_finalizes_once() {
+        let prepared = Arc::new(tokio::sync::Notify::new());
+        let app = Router::new().route(
+            &format!("{API_ROOT}/prepare-upload"),
+            axum::routing::post({
+                let prepared = Arc::clone(&prepared);
+                move || {
+                    let prepared = Arc::clone(&prepared);
+                    async move {
+                        prepared.notify_one();
+                        std::future::pending::<StatusCode>().await
+                    }
+                }
+            }),
+        );
+        let port = serve(app).await;
+        let (state, _dir) = test_state();
+        let (session_id, run) = super::start_send(
+            Arc::clone(&state),
+            "127.0.0.1".into(),
+            port,
+            vec![SendItem::Text("abort fallback".into())],
+            None,
+        )
+        .expect("job");
+        let task = tokio::spawn(run);
+        tokio::time::timeout(std::time::Duration::from_secs(2), prepared.notified())
+            .await
+            .expect("prepare started");
+        state.report_progress(&session_id, "file", 1);
+        assert!(state.cancel_session(&session_id));
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            record_of(&state, &session_id).status,
+            TransferStatus::Cancelled
+        );
+        assert!(state.jobs.lock().expect("jobs").is_empty());
+        assert_eq!(state.pending_progress(), 0);
+        let done = events_named(&state, "transfer-done");
+        assert_eq!(
+            done.len(),
+            1,
+            "abort fallback must have exactly one terminal event"
+        );
+        assert_eq!(done[0]["status"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn cancelled_send_does_not_wait_ten_seconds_for_peer_cancel() {
+        let prepared = Arc::new(tokio::sync::Notify::new());
+        let app = Router::new()
+            .route(
+                &format!("{API_ROOT}/prepare-upload"),
+                axum::routing::post({
+                    let prepared = Arc::clone(&prepared);
+                    move || {
+                        let prepared = Arc::clone(&prepared);
+                        async move {
+                            prepared.notify_one();
+                            std::future::pending::<StatusCode>().await
+                        }
+                    }
+                }),
+            )
+            .route(
+                &format!("{API_ROOT}/cancel"),
+                axum::routing::post(|| async { std::future::pending::<StatusCode>().await }),
+            );
+        let port = serve(app).await;
+        let (state, _dir) = test_state();
+        let (session_id, run) = super::start_send(
+            Arc::clone(&state),
+            "127.0.0.1".into(),
+            port,
+            vec![SendItem::Text("bounded cancel".into())],
+            None,
+        )
+        .expect("job");
+        let mut task = tokio::spawn(run);
+        tokio::time::timeout(std::time::Duration::from_secs(2), prepared.notified())
+            .await
+            .expect("prepare started");
+        assert!(state.cancel_session(&session_id));
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(3), &mut task).await;
+        if settled.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
+        assert!(
+            settled.is_ok(),
+            "best-effort peer cancel must fit within service-stop's budget"
+        );
+        assert_eq!(
+            record_of(&state, &session_id).status,
+            TransferStatus::Cancelled
+        );
+        assert_eq!(events_named(&state, "transfer-done").len(), 1);
     }
 
     #[tokio::test]
@@ -1246,9 +1566,9 @@ mod tests {
         // (official _maxUploadAttempts) and finish Done.
         let upload_calls = Arc::new(AtomicU32::new(0));
         let tokens_seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let (calls_in_handler, tokens_in_handler) = (Arc::clone(&upload_calls), Arc::clone(&tokens_seen));
-        let upload = move |Query(query): Query<HashMap<String, String>>,
-                           body: axum::body::Body| async move {
+        let (calls_in_handler, tokens_in_handler) =
+            (Arc::clone(&upload_calls), Arc::clone(&tokens_seen));
+        let upload = move |Query(query): Query<HashMap<String, String>>, body: axum::body::Body| async move {
             tokens_in_handler
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -1271,7 +1591,10 @@ mod tests {
             }
         };
         let app = Router::new()
-            .route(&format!("{API_ROOT}/prepare-upload"), axum::routing::post(prepare_ok))
+            .route(
+                &format!("{API_ROOT}/prepare-upload"),
+                axum::routing::post(prepare_ok),
+            )
             .route(&format!("{API_ROOT}/upload"), axum::routing::post(upload));
         let port = serve(app).await;
 
@@ -1291,14 +1614,20 @@ mod tests {
         .expect("send completed after the retry");
 
         let record = record_of(&state, &session_id);
-        assert_eq!(record.status, TransferStatus::Done, "422 retry must end Done");
+        assert_eq!(
+            record.status,
+            TransferStatus::Done,
+            "422 retry must end Done"
+        );
         assert_eq!(record.direction, Direction::Send);
         assert_eq!(
             upload_calls.load(Ordering::SeqCst),
             2,
             "exactly one retry after the 422"
         );
-        let seen = tokens_seen.lock().unwrap_or_else(|error| error.into_inner());
+        let seen = tokens_seen
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         assert_eq!(seen.len(), 2, "two upload attempts");
         assert_eq!(seen[0], seen[1], "the retry must reuse the SAME token");
         assert!(!seen[0].is_empty(), "token comes from the prepare response");

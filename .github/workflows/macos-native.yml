@@ -51,8 +51,11 @@ jobs:
           lipo -archs lib/macOS.dylib
           otool -L lib/macOS.dylib
           xcrun vtool -show-build lib/macOS.dylib
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
       - name: Load and smoke-test macOS library
-        run: python3 -I scripts/smoke-native.py --library lib/macOS.dylib
+        run: python -I scripts/smoke-native.py --library lib/macOS.dylib
       - uses: actions/upload-artifact@v4
         with:
           name: plugin-lib-macos

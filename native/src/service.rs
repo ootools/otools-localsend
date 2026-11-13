@@ -686,6 +686,10 @@ impl ServiceController {
                 let _ = worker.await;
             }
         }
+        // Ordinary stop is bounded; unload must still join independently owned
+        // receive/commit workers after a timeout before dropping connection or
+        // runtime ownership. Their filesystem work cannot be safely aborted.
+        let _ = self.receive.drain().await;
         let generation = self.lock().generation.clone();
         if let Some(generation) = generation {
             generation.scope.cancel();

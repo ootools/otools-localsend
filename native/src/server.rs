@@ -1316,7 +1316,7 @@ pub async fn upload_stream(
     // The per-session watch also covers ordinary UI /cancel. The service
     // watch closes the generation even before the cancellation list is taken.
     let mut service_cancel = scope.as_ref().map(|scope| scope.subscribe());
-    let (temp_path, temp_dir, expected_size, mut cancel, _lease) = {
+    let (temp_path, temp_dir, expected_size, mut cancel, lease) = {
         let _admission = match &scope {
             Some(scope) => match scope.admit() {
                 Ok(gate) => Some(gate),
@@ -1360,143 +1360,198 @@ pub async fn upload_stream(
         )
     };
 
-    if let Err(error) = tokio::fs::create_dir_all(&temp_dir).await {
-        return (500, json!({ "error": format!("create temp dir: {error}") }));
-    }
-
-    // Phase 2 — stream the body to disk. No lock is held: chunks are written
-    // as they arrive and the sha256 is computed incrementally, so memory use
-    // stays flat regardless of file size (Review Focus #2).
-    let mut hasher = Sha256::new();
-    let mut received: u64 = 0;
-    let mut write_error: Option<String> = None;
-    let mut body_error = false;
-    let mut file = match tokio::fs::File::create(&temp_path).await {
-        Ok(file) => file,
-        Err(error) => return (500, json!({ "error": format!("open temp file: {error}") })),
-    };
-    let mut body = body;
-    let mut cancelled = false;
-    loop {
-        let frame = tokio::select! {
-            biased;
-            _ = wait_cancelled(&mut cancel) => { cancelled = true; break; }
-            _ = async {
-                match &mut service_cancel {
-                    Some(cancel) => wait_cancelled(cancel).await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => { cancelled = true; break; }
-            frame = body.frame() => match frame {
-                Some(frame) => frame,
-                None => break,
-            },
-        };
-        match frame {
-            Ok(frame) => {
-                if let Some(data) = frame.data_ref() {
-                    hasher.update(data);
-                    if let Err(error) = file.write_all(data).await {
-                        write_error = Some(format!("write temp file: {error}"));
-                        break;
-                    }
-                    received += data.len() as u64;
-                    emit_progress(&sessions, &session_id, &file_id, received, expected_size);
-                }
-            }
-            Err(_) => {
-                body_error = true;
-                break;
-            }
-        }
-    }
-    if let Err(error) = file.flush().await {
-        write_error = Some(format!("flush temp file: {error}"));
-    }
-    drop(file);
-    if cancelled || *cancel.borrow() || scope.as_ref().is_some_and(|scope| scope.is_cancelled()) {
-        // Flush above closes any Tokio blocking write before the cancellation
-        // cleanup can unlink the partial file/directory after our lease drops.
-        let _ = sessions.session_cancel(&session_id);
-        drop(body);
-        return (409, json!({ "error": "Blocked by another session" }));
-    }
-
-    // Phase 3 — verify and finalize.
-    if let Some(error) = write_error {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        let plan =
-            sessions.mark_file_terminal(&session_id, &file_id, false, download_dir.as_deref());
-        if let Some(plan) = plan {
-            execute_terminal_plan(Arc::clone(&sessions), plan).await;
-        }
-        return (500, json!({ "error": error }));
-    }
-    if body_error {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        let plan =
-            sessions.mark_file_terminal(&session_id, &file_id, false, download_dir.as_deref());
-        if let Some(plan) = plan {
-            execute_terminal_plan(Arc::clone(&sessions), plan).await;
-        }
-        return (400, json!({ "error": "Upload aborted by the sender" }));
-    }
-    let digest: String = hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    // None can mean "no checksum promised for this file" (verify is skipped)
-    // OR "the session vanished mid-stream" (cancelled by UI/sender) — the two
-    // cases must be told apart before comparing.
-    let session_gone;
-    let expected_sha = {
-        let inner = sessions
-            .inner
+    let (mut result_tx, result_rx) = oneshot::channel();
+    let owner = Arc::clone(&sessions);
+    // Hyper may drop this caller on RST_STREAM. Only the retained worker owns
+    // the body/lease and filesystem futures; closing the response receiver
+    // signals cooperative cancellation, never aborts a pending disk owner.
+    {
+        let mut workers = owner
+            .cleanups
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        match inner.sessions.get(&session_id) {
-            None => {
-                session_gone = true;
-                None
-            }
-            Some(session) => {
-                session_gone = false;
-                session
-                    .files
-                    .get(&file_id)
-                    .and_then(|entry| entry.sha256.clone())
-            }
-        }
-    };
-    if session_gone {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return (409, json!({ "error": "Blocked by another session" }));
+        workers.push(tokio::spawn(async move {
+            let _lease = lease;
+            let run = async {
+                if let Err(error) = tokio::fs::create_dir_all(&temp_dir).await {
+                    return (500, json!({ "error": format!("create temp dir: {error}") }));
+                }
+
+                // Phase 2 — stream the body to disk. No lock is held: chunks are written
+                // as they arrive and the sha256 is computed incrementally, so memory use
+                // stays flat regardless of file size (Review Focus #2).
+                let mut hasher = Sha256::new();
+                let mut received: u64 = 0;
+                let mut write_error: Option<String> = None;
+                let mut body_error = false;
+                let mut file = match tokio::fs::File::create(&temp_path).await {
+                    Ok(file) => file,
+                    Err(error) => {
+                        return (500, json!({ "error": format!("open temp file: {error}") }))
+                    }
+                };
+                let mut body = body;
+                let mut cancelled = false;
+                loop {
+                    let frame = tokio::select! {
+                        biased;
+                        _ = wait_cancelled(&mut cancel) => { cancelled = true; break; }
+                        _ = result_tx.closed() => { cancelled = true; break; }
+                        _ = async {
+                            match &mut service_cancel {
+                                Some(cancel) => wait_cancelled(cancel).await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        } => { cancelled = true; break; }
+                        frame = body.frame() => match frame {
+                            Some(frame) => frame,
+                            None => break,
+                        },
+                    };
+                    match frame {
+                        Ok(frame) => {
+                            if let Some(data) = frame.data_ref() {
+                                hasher.update(data);
+                                if let Err(error) = file.write_all(data).await {
+                                    write_error = Some(format!("write temp file: {error}"));
+                                    break;
+                                }
+                                received += data.len() as u64;
+                                emit_progress(
+                                    &sessions,
+                                    &session_id,
+                                    &file_id,
+                                    received,
+                                    expected_size,
+                                );
+                            }
+                        }
+                        Err(_) => {
+                            body_error = true;
+                            break;
+                        }
+                    }
+                }
+                if let Err(error) = file.flush().await {
+                    write_error = Some(format!("flush temp file: {error}"));
+                }
+                drop(file);
+                if cancelled
+                    || *cancel.borrow()
+                    || result_tx.is_closed()
+                    || scope.as_ref().is_some_and(|scope| scope.is_cancelled())
+                {
+                    // Flush above closes any Tokio blocking write before the cancellation
+                    // cleanup can unlink the partial file/directory after our lease drops.
+                    let _ = sessions.session_cancel(&session_id);
+                    drop(body);
+                    return (409, json!({ "error": "Blocked by another session" }));
+                }
+
+                // Phase 3 — verify and finalize.
+                if let Some(error) = write_error {
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    let plan = sessions.mark_file_terminal(
+                        &session_id,
+                        &file_id,
+                        false,
+                        download_dir.as_deref(),
+                    );
+                    if let Some(plan) = plan {
+                        execute_terminal_plan(Arc::clone(&sessions), plan).await;
+                    }
+                    return (500, json!({ "error": error }));
+                }
+                if body_error {
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    let plan = sessions.mark_file_terminal(
+                        &session_id,
+                        &file_id,
+                        false,
+                        download_dir.as_deref(),
+                    );
+                    if let Some(plan) = plan {
+                        execute_terminal_plan(Arc::clone(&sessions), plan).await;
+                    }
+                    return (400, json!({ "error": "Upload aborted by the sender" }));
+                }
+                let digest: String = hasher
+                    .finalize()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                // None can mean "no checksum promised for this file" (verify is skipped)
+                // OR "the session vanished mid-stream" (cancelled by UI/sender) — the two
+                // cases must be told apart before comparing.
+                let session_gone;
+                let expected_sha = {
+                    let inner = sessions
+                        .inner
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    match inner.sessions.get(&session_id) {
+                        None => {
+                            session_gone = true;
+                            None
+                        }
+                        Some(session) => {
+                            session_gone = false;
+                            session
+                                .files
+                                .get(&file_id)
+                                .and_then(|entry| entry.sha256.clone())
+                        }
+                    }
+                };
+                if session_gone {
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    return (409, json!({ "error": "Blocked by another session" }));
+                }
+                let checksum_ok = match &expected_sha {
+                    Some(expected) => expected.eq_ignore_ascii_case(&digest),
+                    None => true, // no checksum promised for this file
+                };
+                if !checksum_ok {
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    // Official semantics: the mismatched file is NOT terminal while its
+                    // retry budget lasts — the sender re-uploads it with the same token
+                    // (attempt 3 = the last one, official MAX_UPLOAD_ATTEMPTS).
+                    let exhausted = sessions.register_mismatch(&session_id, &file_id);
+                    if exhausted {
+                        let plan = sessions.mark_file_terminal(
+                            &session_id,
+                            &file_id,
+                            false,
+                            download_dir.as_deref(),
+                        );
+                        if let Some(plan) = plan {
+                            execute_terminal_plan(Arc::clone(&sessions), plan).await;
+                        }
+                    }
+                    return (422, json!({ "error": "Checksum mismatch" }));
+                }
+                let plan = sessions.mark_file_terminal(
+                    &session_id,
+                    &file_id,
+                    true,
+                    download_dir.as_deref(),
+                );
+                if let Some(plan) = plan {
+                    execute_terminal_plan(Arc::clone(&sessions), plan).await;
+                }
+                (200, Value::Null)
+            };
+            let result = run.await;
+            let _ = result_tx.send(result);
+            Ok(())
+        }));
     }
-    let checksum_ok = match &expected_sha {
-        Some(expected) => expected.eq_ignore_ascii_case(&digest),
-        None => true, // no checksum promised for this file
-    };
-    if !checksum_ok {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        // Official semantics: the mismatched file is NOT terminal while its
-        // retry budget lasts — the sender re-uploads it with the same token
-        // (attempt 3 = the last one, official MAX_UPLOAD_ATTEMPTS).
-        let exhausted = sessions.register_mismatch(&session_id, &file_id);
-        if exhausted {
-            let plan =
-                sessions.mark_file_terminal(&session_id, &file_id, false, download_dir.as_deref());
-            if let Some(plan) = plan {
-                execute_terminal_plan(Arc::clone(&sessions), plan).await;
-            }
-        }
-        return (422, json!({ "error": "Checksum mismatch" }));
-    }
-    let plan = sessions.mark_file_terminal(&session_id, &file_id, true, download_dir.as_deref());
-    if let Some(plan) = plan {
-        execute_terminal_plan(Arc::clone(&sessions), plan).await;
-    }
-    (200, Value::Null)
+    result_rx.await.unwrap_or_else(|_| {
+        (
+            500,
+            json!({ "error": "Receive worker stopped unexpectedly" }),
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3160,6 +3215,334 @@ mod tests {
             retained, 1,
             "timed-out drain must not detach its cleanup task"
         );
+    }
+
+    /// A real service with one filesystem thread lets a barrier queue Tokio's
+    /// non-abortable IO while the production upload future is dropped.
+    struct ReceiveWorkerFixture {
+        runtime: tokio::runtime::Runtime,
+        controller: Arc<crate::service::ServiceController>,
+        sessions: Arc<ReceiveSessions>,
+        events: Arc<WebEventBroadcaster>,
+        dir: tempfile::TempDir,
+    }
+
+    impl ReceiveWorkerFixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("data dir");
+            Settings {
+                port: 0,
+                ..Default::default()
+            }
+            .save(dir.path())
+            .expect("settings");
+            let events = Arc::new(WebEventBroadcaster::new());
+            let sessions =
+                Arc::new(ReceiveSessions::new(dir.path(), Arc::clone(&events)).expect("sessions"));
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(2)
+                .max_blocking_threads(1)
+                .build()
+                .expect("limited runtime");
+            let controller = Arc::new(crate::service::ServiceController::new(
+                runtime.handle().clone(),
+                dir.path().to_path_buf(),
+                Arc::new(std::sync::RwLock::new(Settings::default())),
+                Arc::clone(&sessions),
+                Arc::clone(&events),
+            ));
+            controller.start().expect("start service");
+            let fixture = Self {
+                runtime,
+                controller,
+                sessions,
+                events,
+                dir,
+            };
+            fixture.wait_for(
+                || fixture.controller.status().state == crate::service::ServiceState::Running,
+                "service running",
+            );
+            fixture
+        }
+
+        fn wait_for(&self, mut ready: impl FnMut() -> bool, message: &str) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while !ready() {
+                assert!(std::time::Instant::now() < deadline, "{message}");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        fn block_filesystem(&self) -> BlockingFsGate {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let task = self.runtime.spawn_blocking(move || {
+                entered_tx.send(()).expect("blocking gate entered");
+                let _ = release_rx.recv();
+            });
+            entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("only filesystem thread occupied");
+            BlockingFsGate {
+                release: Some(release_tx),
+                task,
+            }
+        }
+
+        fn state_after_stop_while_blocked(&self) -> crate::service::ServiceStatus {
+            self.controller.stop(true);
+            let deadline = std::time::Instant::now() + Duration::from_millis(150);
+            loop {
+                let status = self.controller.status();
+                if status.state != crate::service::ServiceState::Stopping
+                    || std::time::Instant::now() >= deadline
+                {
+                    return status;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        fn settle_stop(&self) {
+            self.wait_for(
+                || self.controller.status().state == crate::service::ServiceState::Stopped,
+                "stop waits for receive worker's IO to settle",
+            );
+            self.runtime.block_on(self.controller.shutdown());
+        }
+    }
+
+    struct BlockingFsGate {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl BlockingFsGate {
+        fn open(mut self, runtime: &tokio::runtime::Runtime) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            runtime
+                .block_on(&mut self.task)
+                .expect("blocking gate task");
+        }
+    }
+
+    impl Drop for BlockingFsGate {
+        fn drop(&mut self) {
+            // A failed assertion must not strand Runtime::drop at the barrier.
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    #[test]
+    fn dropped_upload_caller_keeps_queued_filesystem_owner_until_stop_drains() {
+        let fixture = ReceiveWorkerFixture::new();
+        let (status, prepared) = prepare_now(
+            &fixture.sessions,
+            &settings(true, None),
+            &[file_entry("partial", 100, None)],
+            None,
+            SENDER_IP,
+        );
+        assert_eq!(status, 200);
+        let id = prepared["sessionId"].as_str().unwrap().to_string();
+        let token = prepared["files"]["partial"].as_str().unwrap().to_string();
+        let gate = fixture.block_filesystem();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        let caller = fixture.runtime.spawn(upload_stream(
+            Arc::clone(&fixture.sessions),
+            None,
+            id.clone(),
+            "partial".into(),
+            token,
+            SENDER_IP,
+            Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+        ));
+        fixture.wait_for(
+            || !fixture.sessions.writers_idle(),
+            "upload acquired lease before queued filesystem IO",
+        );
+        caller.abort();
+        assert!(
+            fixture.runtime.block_on(caller).unwrap_err().is_cancelled(),
+            "HTTP response caller dropped"
+        );
+        let while_blocked = fixture.state_after_stop_while_blocked();
+        gate.open(&fixture.runtime);
+        // The single blocking queue must really settle before checking that a
+        // dropped create_dir task cannot resurrect a cancelled directory.
+        fixture
+            .runtime
+            .block_on(fixture.runtime.spawn_blocking(|| {}))
+            .expect("IO queue drained");
+        fixture.settle_stop();
+        assert_eq!(
+            while_blocked.state,
+            crate::service::ServiceState::Stopping,
+            "HTTP caller drop must not release ownership of queued filesystem work"
+        );
+        assert!(tx.is_closed());
+        assert!(
+            !fixture.sessions.tmp_root().join(&id).exists(),
+            "no cancelled directory recreated after stopped"
+        );
+        assert_eq!(
+            record_snapshot(&fixture.sessions, &id).status,
+            TransferStatus::Cancelled
+        );
+        let done = event_data(&fixture.events, "transfer-done");
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0]["status"], "cancelled");
+    }
+
+    #[test]
+    fn dropped_upload_caller_during_commit_finishes_unique_destination_and_event() {
+        let fixture = ReceiveWorkerFixture::new();
+        let downloads = fixture.dir.path().join("downloads");
+        std::fs::create_dir_all(&downloads).expect("downloads");
+        std::fs::write(downloads.join("finished.bin"), b"existing user file")
+            .expect("existing destination");
+        let (status, prepared) = prepare_now(
+            &fixture.sessions,
+            &settings(true, None),
+            &[file_entry("finished", 7, None)],
+            None,
+            SENDER_IP,
+        );
+        assert_eq!(status, 200);
+        let id = prepared["sessionId"].as_str().unwrap().to_string();
+        let token = prepared["files"]["finished"].as_str().unwrap().to_string();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        let caller = fixture.runtime.spawn(upload_stream(
+            Arc::clone(&fixture.sessions),
+            Some(downloads.clone()),
+            id.clone(),
+            "finished".into(),
+            token,
+            SENDER_IP,
+            Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+        ));
+        fixture
+            .runtime
+            .block_on(tx.send(Ok(Bytes::from_static(b"payload"))))
+            .expect("upload chunk");
+        let source = fixture.sessions.tmp_root().join(&id).join("finished");
+        fixture.wait_for(
+            || std::fs::metadata(&source).is_ok_and(|metadata| metadata.len() == 7),
+            "payload reached real filesystem",
+        );
+        fixture
+            .runtime
+            .block_on(fixture.runtime.spawn_blocking(|| {}))
+            .expect("last write completed");
+        let gate = fixture.block_filesystem();
+        drop(tx);
+        // EOF and flush can finish without more blocking jobs. Done is marked
+        // before pick_unique_path queues its real filesystem query at the gate.
+        fixture.wait_for(
+            || record_snapshot(&fixture.sessions, &id).status == TransferStatus::Done,
+            "upload entered terminal commit",
+        );
+        caller.abort();
+        assert!(fixture.runtime.block_on(caller).unwrap_err().is_cancelled());
+        let while_blocked = fixture.state_after_stop_while_blocked();
+        gate.open(&fixture.runtime);
+        fixture.settle_stop();
+        assert_eq!(
+            while_blocked.state,
+            crate::service::ServiceState::Stopping,
+            "a dropped HTTP response cannot discard an already-Done commit owner"
+        );
+        let unique = downloads.join("finished (1).bin");
+        assert_eq!(
+            std::fs::read(&unique).expect("unique committed file"),
+            b"payload"
+        );
+        assert_eq!(
+            std::fs::read(downloads.join("finished.bin")).expect("existing file retained"),
+            b"existing user file"
+        );
+        let record = record_snapshot(&fixture.sessions, &id);
+        assert_eq!(record.status, TransferStatus::Done);
+        assert_eq!(record.destinations["finished"], unique.to_string_lossy());
+        assert!(
+            !source.parent().unwrap().exists(),
+            "committed temp directory removed"
+        );
+        let done = event_data(&fixture.events, "transfer-done");
+        assert_eq!(
+            done.len(),
+            1,
+            "terminal event survives response reset during commit"
+        );
+        assert_eq!(done[0]["status"], "done");
+    }
+
+    #[test]
+    fn unload_waits_for_dropped_upload_workers_after_stop_timeout() {
+        let fixture = ReceiveWorkerFixture::new();
+        let (status, prepared) = prepare_now(
+            &fixture.sessions,
+            &settings(true, None),
+            &[file_entry("partial", 100, None)],
+            None,
+            SENDER_IP,
+        );
+        assert_eq!(status, 200);
+        let id = prepared["sessionId"].as_str().unwrap().to_string();
+        let token = prepared["files"]["partial"].as_str().unwrap().to_string();
+        let gate = fixture.block_filesystem();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+        let caller = fixture.runtime.spawn(upload_stream(
+            Arc::clone(&fixture.sessions),
+            None,
+            id.clone(),
+            "partial".into(),
+            token,
+            SENDER_IP,
+            Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+        ));
+        fixture.wait_for(|| !fixture.sessions.writers_idle(), "upload queued real IO");
+        caller.abort();
+        assert!(fixture.runtime.block_on(caller).unwrap_err().is_cancelled());
+        let controller = Arc::clone(&fixture.controller);
+        let unload = fixture.runtime.spawn(async move {
+            controller.shutdown().await;
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(13);
+        while fixture.controller.status().state != crate::service::ServiceState::Failed {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bounded stop must surface a diagnostic, not stopped"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let returned_with_io_blocked = unload.is_finished();
+        gate.open(&fixture.runtime);
+        fixture.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), unload)
+                .await
+                .expect("unload drain")
+                .expect("unload task");
+            fixture
+                .sessions
+                .drain()
+                .await
+                .expect("all receive work joined");
+        });
+        assert!(!returned_with_io_blocked, "unload must await independently retained receive owners even after ordinary stop times out");
+        assert!(tx.is_closed());
+        assert!(!fixture.sessions.tmp_root().join(&id).exists());
+        assert_eq!(
+            record_snapshot(&fixture.sessions, &id).status,
+            TransferStatus::Cancelled
+        );
+        assert_eq!(event_data(&fixture.events, "transfer-done").len(), 1);
     }
 
     #[test]

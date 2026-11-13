@@ -55,7 +55,9 @@ jobs:
         with:
           python-version: "3.x"
       - name: Load and smoke-test macOS library
-        run: python -I scripts/smoke-native.py --library lib/macOS.dylib
+        run: |
+          python -I scripts/service-ports.test.py
+          python -I scripts/smoke-native.py --library lib/macOS.dylib
       - uses: actions/upload-artifact@v4
         with:
           name: plugin-lib-macos

@@ -328,19 +328,7 @@ def wait_service_state(expected, timeout=15.0):
 
 
 def unused_service_port():
-    for _ in range(20):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
-            tcp.bind(("0.0.0.0", 0))
-            port = tcp.getsockname()[1]
-            if port > 65525:
-                continue
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
-                try:
-                    udp.bind(("0.0.0.0", port))
-                except OSError:
-                    continue
-                return port
-    raise RuntimeError("no private TCP/UDP test port available")
+    return smoke_native.find_service_test_port()
 
 
 def assert_idle_ports_released(tcp_port, udp_port):

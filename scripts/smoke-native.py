@@ -49,6 +49,26 @@ def drain_events():
     return result["data"]["events"]
 
 
+def find_service_test_port(candidates=None):
+    """Select a real TCP/UDP endpoint below the dynamic/excluded port range."""
+    if candidates is None:
+        start = 20000 + int.from_bytes(os.urandom(2), "big") % 25000
+        candidates = (20000 + (start - 20000 + offset) % 25000 for offset in range(1024))
+    failures = []
+    for candidate in candidates:
+        if not isinstance(candidate, int) or candidate < 1024 or candidate > 65525:
+            continue
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
+                tcp.bind(("0.0.0.0", candidate))
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+                    udp.bind(("0.0.0.0", candidate))
+                    return candidate
+        except OSError as error:
+            failures.append(f"{candidate}: {error}")
+    raise RuntimeError(f"no idle TCP/UDP service-test endpoint; bind errors: {'; '.join(failures[-8:])}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--library", type=Path, default=Path(__file__).resolve().parents[1] / "lib" / "Windows.dll")
@@ -176,21 +196,7 @@ def main():
 
         # A private endpoint avoids mistaking another same-host LocalSend
         # socket for our own when asserting actual port release.
-        private_port = None
-        for _ in range(20):
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_probe:
-                tcp_probe.bind(("0.0.0.0", 0))
-                candidate = tcp_probe.getsockname()[1]
-                if candidate > 65525:
-                    continue
-                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_probe:
-                    try:
-                        udp_probe.bind(("0.0.0.0", candidate))
-                    except OSError:
-                        continue
-                    private_port = candidate
-                    break
-        assert private_port is not None, "no idle TCP/UDP endpoint for restart smoke"
+        private_port = find_service_test_port()
         changed = invoke("settings_get")["data"]
         changed["port"] = private_port
         assert invoke("settings_set", {"settings": changed})["ok"] is True

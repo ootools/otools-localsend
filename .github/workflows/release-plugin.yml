@@ -64,7 +64,9 @@ jobs:
         with:
           python-version: "3.x"
       - name: 原生启停与端口释放冒烟
-        run: python -I scripts/smoke-native.py --library lib/${{ matrix.library }}
+        run: |
+          python -I scripts/service-ports.test.py
+          python -I scripts/smoke-native.py --library lib/${{ matrix.library }}
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}

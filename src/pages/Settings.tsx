@@ -5,7 +5,8 @@
 
 import { useEffect, useState } from "react";
 import { pickDirectory } from "otools-plugin-sdk/dialog";
-import { setSettings, type Settings } from "../api";
+import { isPreviewMode, setSettings, type Settings } from "../api";
+import { ServiceControls } from "../components/ServiceControls";
 import { formatError } from "../format";
 import type { PluginStore } from "../hooks/usePollEvents";
 
@@ -40,7 +41,7 @@ const DEVICE_TYPES: Array<{ value: string; label: string }> = [
 ];
 
 export function SettingsPage({ store }: { store: PluginStore }) {
-  const [draft, setDraft] = useState<Draft | null>(null);
+  const [draft, setDraft] = useState<Draft | null>(() => store.settings ? draftFrom(store.settings) : null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
@@ -53,7 +54,7 @@ export function SettingsPage({ store }: { store: PluginStore }) {
 
   const pickDownloadDir = async () => {
     try {
-      const dir = await pickDirectory({ title: "选择下载目录" });
+      const dir = isPreviewMode() ? "D:\\Downloads" : await pickDirectory({ title: "选择下载目录" });
       if (dir && draft) {
         setDraft({ ...draft, downloadDir: dir });
       }
@@ -97,30 +98,48 @@ export function SettingsPage({ store }: { store: PluginStore }) {
     }
   };
 
+  const server = store.server;
+  const fingerprint = server?.fingerprint ?? null;
+  const fingerprintShort = fingerprint
+    ? `${fingerprint.slice(0, 16)}…${fingerprint.slice(-8)}`
+    : "—";
+
+  const serviceCard = (
+    <section className="card set-card">
+      <h3>服务状态（生效中）</h3>
+      <ServiceControls store={store} />
+      <dl className="kv service-kv">
+        <dt>服务端口</dt>
+        <dd>{server ? (server.port > 0 ? server.port : "未绑定") : "—"}</dd>
+        <dt>协议</dt>
+        <dd>{server?.protocol ?? "—"}</dd>
+        <dt>证书指纹</dt>
+        <dd title={fingerprint ?? undefined}>{fingerprintShort}</dd>
+        <dt>UDP 发现端口</dt>
+        <dd>{server ? (server.udpPort > 0 ? server.udpPort : "未监听") : "—"}</dd>
+      </dl>
+    </section>
+  );
+
   if (store.hostError) {
     return (
-      <div className="banner banner-warn" role="alert">
-        <span aria-hidden>🔌</span>
-        <span>
-          <b>宿主未注入</b> — 未检测到 OTools 宿主桥接，仅作本地预览占位：{store.hostError}
-        </span>
+      <div className="settings">
+        <div className="banner banner-warn" role="alert">
+          <span><b>宿主未注入</b> — 未检测到 OTools 宿主桥接，仅作本地预览占位：{store.hostError}</span>
+        </div>
+        {serviceCard}
       </div>
     );
   }
 
   if (!draft) {
     return (
-      <p className="xfer-meta" role="status">
-        {store.ready ? "设置不可用" : "正在读取设置…"}
-      </p>
+      <div className="settings">
+        <p className="xfer-meta" role="status">{store.ready ? "设置不可用" : "正在读取设置…"}</p>
+        {serviceCard}
+      </div>
     );
   }
-
-  const server = store.server;
-  const fingerprint = server?.fingerprint ?? null;
-  const fingerprintShort = fingerprint
-    ? `${fingerprint.slice(0, 16)}…${fingerprint.slice(-8)}`
-    : "—";
 
   return (
     <div className="settings">
@@ -163,7 +182,7 @@ export function SettingsPage({ store }: { store: PluginStore }) {
             </label>
           </div>
           <label className="field-label">
-            端口（重启宿主后生效）
+            端口（保存后重新启动服务生效）
             <input
               type="number"
               min={1024}
@@ -244,22 +263,7 @@ export function SettingsPage({ store }: { store: PluginStore }) {
         </div>
       </section>
 
-      <section className="card set-card">
-        <h3>服务状态（生效中）</h3>
-        <dl className="kv">
-          <dt>服务端口</dt>
-          <dd>
-            {server ? (server.port > 0 ? server.port : "未绑定") : "—"}
-            {server?.error ? <span className="bad">（异常）</span> : null}
-          </dd>
-          <dt>协议</dt>
-          <dd>{server?.protocol ?? "—"}</dd>
-          <dt>证书指纹</dt>
-          <dd title={fingerprint ?? undefined}>{fingerprintShort}</dd>
-          <dt>UDP 发现端口</dt>
-          <dd>{store.udpPort > 0 ? store.udpPort : "未监听"}</dd>
-        </dl>
-      </section>
+      {serviceCard}
     </div>
   );
 }

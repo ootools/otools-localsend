@@ -121,11 +121,20 @@ input, select, textarea { accent-color: var(--accent); }
   overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
 }
 .net-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; margin-top: 4px; }
+.net-idle { background: var(--dim); }
 .net-ok { background: #2bb673; box-shadow: 0 0 0 3px rgba(43, 182, 115, .18); }
 .net-off { background: #d4544a; box-shadow: 0 0 0 3px rgba(212, 84, 74, .18); }
 .net-wait { background: #e0a23c; box-shadow: 0 0 0 3px rgba(224, 162, 60, .18); animation: pulse 1.2s infinite; }
 @keyframes pulse { 50% { opacity: .45; } }
 .side-version { font-size: 10.5px; color: var(--dim); padding-left: 4px; }
+.service-controls { display: grid; gap: 8px; justify-items: start; }
+.service-compact { justify-items: stretch; }
+.service-action { justify-content: center; }
+.service-error { font-size: 12px; line-height: 1.5; color: #e0857c; overflow-wrap: anywhere; }
+.service-compact .service-error { font-size: 11px; }
+html.light .service-error { color: #a3362d; }
+.preview-label { font-size: 11px; color: var(--text2); }
+.service-kv { margin-top: 14px; }
 
 /* ---------- 主区 ---------- */
 
@@ -299,6 +308,10 @@ html.light .chip-failed { color: #a3362d; }
   display: grid; place-items: center; z-index: 150;
   backdrop-filter: blur(2px);
 }
+.modal-back[hidden] { display: none; }
+.service-confirm-back { z-index: 160; }
+.service-confirm-copy { margin-top: 12px; line-height: 1.75; }
+.incoming-service-action { margin-top: 14px; }
 .modal {
   background: var(--panel); border: 1px solid var(--line);
   border-radius: var(--radius); padding: 20px 22px;

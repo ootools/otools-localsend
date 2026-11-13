@@ -1,12 +1,13 @@
 /**
  * 应用壳：汇澜式侧栏布局（品牌 + 导航 + 服务状态徽标）+ 主区（标题栏 +
- * 滚动视图）+ 传入请求弹窗队列。服务状态由 server-status 事件驱动
- * （Review Focus #1 —— 失败必须显式报错，绝不静默）。
+ * 滚动视图）+ 传入请求弹窗队列。服务快照、手动控制与单个停服确认均由
+ * usePollEvents 提供共享状态；查询与挂载绝不自动启动服务。
  */
 
 import { useState } from "react";
-import { acceptSession, declineSession } from "./api";
+import { acceptSession, declineSession, isPreviewMode } from "./api";
 import { IncomingDialog } from "./components/IncomingDialog";
+import { ServiceControls, StopServiceDialog } from "./components/ServiceControls";
 import { usePollEvents } from "./hooks/usePollEvents";
 import { DevicesPage } from "./pages/Devices";
 import { DownloadPage } from "./pages/Download";
@@ -23,51 +24,6 @@ const TABS: Array<{ id: TabId; label: string; icon: string; title: string; subti
   { id: "settings", label: "设置", icon: "⚙️", title: "设置", subtitle: "本机身份、接收偏好与服务状态" },
 ];
 
-/**
- * 服务状态徽标（侧栏底部）。五态显式：读取中 / 宿主未注入 / 服务异常 /
- * 运行中（实际端口）/ 启动中——任何失败态都不静默。
- */
-function ServerStatusBadge({
-  ready,
-  hostError,
-  error,
-  port,
-}: {
-  ready: boolean;
-  hostError: string | null;
-  error: string | null;
-  port: number;
-}) {
-  let dot = "net-wait";
-  let main = "正在获取服务状态…";
-  let sub: string | null = null;
-  if (!ready) {
-    // 保持默认 wait 态文案
-  } else if (hostError) {
-    dot = "net-off";
-    main = "宿主桥未注入";
-    sub = "请在 OTools 宿主中打开本插件";
-  } else if (error) {
-    dot = "net-off";
-    main = "服务异常";
-    sub = `${error} — 检查端口占用或防火墙放行 UDP/TCP 53317`;
-  } else if (port > 0) {
-    dot = "net-ok";
-    main = `服务运行中 · 端口 ${port}`;
-  } else {
-    main = "服务启动中…（等待宿主 autostart）";
-  }
-  return (
-    <div className="net-badge" title={error ?? hostError ?? undefined}>
-      <span className={`net-dot ${dot}`} aria-hidden />
-      <span className="net-lines">
-        <span className="net-main">{main}</span>
-        {sub && <span className="net-sub">{sub}</span>}
-      </span>
-    </div>
-  );
-}
-
 export function App() {
   const store = usePollEvents();
   const [tab, setTab] = useState<TabId>("devices");
@@ -78,7 +34,7 @@ export function App() {
   const current = TABS.find((entry) => entry.id === tab) ?? TABS[0];
 
   const respondAndClose = async (respond: () => Promise<void>) => {
-    if (dialogBusy || !activeRequest) return;
+    if (dialogBusy || store.serviceBusy || store.stopConfirmation || store.server?.state !== "running" || !activeRequest) return;
     setDialogBusy(true);
     setDialogError(null);
     try {
@@ -156,12 +112,7 @@ export function App() {
         </nav>
 
         <div className="sidebar-foot">
-          <ServerStatusBadge
-            ready={store.ready}
-            hostError={store.hostError}
-            error={store.server?.error ?? null}
-            port={store.server?.port ?? 0}
-          />
+          <ServiceControls store={store} compact />
           <div className="side-version">协议 v2 兼容 · GPL-3.0</div>
         </div>
       </aside>
@@ -174,6 +125,9 @@ export function App() {
           </div>
         </header>
         <div className="view">
+          {isPreviewMode() && (
+            <div className="banner banner-warn" role="status">预览模拟 · 启停与传输仅在页面内仿真，不控制真实原生服务。</div>
+          )}
           {serverBanner}
           {tab === "devices" && (
             <DevicesPage store={store} onGoToTransfers={() => setTab("transfers")} />
@@ -188,11 +142,24 @@ export function App() {
         <IncomingDialog
           key={activeRequest.sessionId}
           request={activeRequest}
-          busy={dialogBusy}
-          error={dialogError}
+          busy={dialogBusy || store.serviceBusy || store.server?.state !== "running"}
+          error={dialogError ?? store.serviceError}
           onAcceptAll={acceptAll}
           onAcceptSelected={acceptSelected}
           onDecline={decline}
+          onStopService={() => void store.stopService()}
+          serviceBusy={store.serviceBusy || store.server?.state !== "running"}
+          hidden={store.stopConfirmation !== null}
+        />
+      )}
+      {store.stopConfirmation && (
+        <StopServiceDialog
+          activeTransfers={store.stopConfirmation.activeTransfers}
+          busy={store.serviceBusy}
+          error={store.serviceError}
+          preview={isPreviewMode()}
+          onCancel={store.cancelStopService}
+          onConfirm={() => void store.confirmStopService()}
         />
       )}
     </div>

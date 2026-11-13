@@ -98,12 +98,30 @@ export interface Settings {
   notifyOnIncoming: boolean;
 }
 
-/** `server_status` invoke 返回（未启动时 port=0）。 */
+/** 服务生命周期（与 native 的状态及事件使用同一小写枚举）。 */
+export type ServiceState = "stopped" | "starting" | "running" | "stopping" | "failed";
+
+/** 完整服务快照；revision 在同一插件进程的普通重启之间不会归零。 */
 export interface ServerStatus {
+  state: ServiceState;
   port: number;
-  protocol: string;
+  udpPort: number;
+  protocol: "https";
   fingerprint: string | null;
   error: string | null;
+  activeTransfers: number;
+  revision: number;
+}
+
+export interface StartServiceResult {
+  started: true;
+  status: ServerStatus;
+}
+
+export interface StopServiceResult {
+  confirmationRequired: boolean;
+  activeTransfers: number;
+  status: ServerStatus;
 }
 
 // ---------------------------------------------------------------------------
@@ -152,17 +170,8 @@ export interface TransferDoneEvent {
   status: "done" | "cancelled" | "failed";
 }
 
-/**
- * server-status 负载，两种互斥形状：
- *  - 绑定成功：{ port, protocol, fingerprint }
- *  - 绑定失败（端口被占/防火墙/TLS）：{ error }
- */
-export interface ServerStatusEvent {
-  port?: number;
-  protocol?: string;
-  fingerprint?: string;
-  error?: string;
-}
+/** server-status 事件始终与 server_status 查询返回同一完整快照。 */
+export type ServerStatusEvent = ServerStatus;
 
 /** poll_events 返回的排队事件（native→前端事件队列逐条 drain）。 */
 export interface QueuedEvent {
@@ -177,6 +186,13 @@ export async function onEvent<T>(
   event: EventName,
   handler: (payload: T) => void,
 ): Promise<UnlistenFn> {
+  if (PREVIEW_MODE) {
+    const listener = (payload: unknown) => handler(payload as T);
+    const listeners = previewListeners.get(event) ?? new Set<(payload: unknown) => void>();
+    listeners.add(listener);
+    previewListeners.set(event, listeners);
+    return () => { listeners.delete(listener); };
+  }
   const unlisten = await listen<T>(event, (message) => {
     handler(message.payload);
   });
@@ -243,66 +259,176 @@ const previewIncoming: IncomingRequestEvent = {
   ],
 };
 
-let previewEventsPending = true;
-
-const PREVIEW_DATA: Record<string, unknown> = {
-  settings_get: {
-    alias: "My-PC", deviceModel: "Windows 11 Pro", deviceType: "desktop",
-    port: 53317, downloadDir: "D:\\Downloads", pin: null,
-    autoSave: false, notifyOnIncoming: true,
-  },
-  device_list: {
-    devices: [
-      previewDevice("iPhone 15 Pro", "iOS 18", "mobile", "192.168.31.20", 3_000),
-      previewDevice("MacBook Pro", "macOS 15", "desktop", "192.168.31.33", 41_000),
-      previewDevice("客厅 N100", "Debian", "headless", "192.168.31.7", 5_400_000),
-    ],
-    udpPort: 53318,
-  },
-  server_status: { port: 53318, protocol: "https", fingerprint: previewFingerprint, error: null },
-  transfer_list: {
-    transfers: [
-      {
-        sessionId: "t1", direction: "Receive", peerAlias: "iPhone 15 Pro",
-        status: "Transferring", createdAt: Date.now() - 30_000,
-        files: [
-          { id: "f1", fileName: " vacation.zip", size: 1_284_337_664, fileType: "application/zip", sha256: null, preview: null, metadata: null },
-          { id: "f2", fileName: "IMG_0042.HEIC", size: 4_800_512, fileType: "image/heic", sha256: null, preview: null, metadata: null },
-        ],
-      },
-      {
-        sessionId: "t2", direction: "Send", peerAlias: "MacBook Pro",
-        status: "Done", createdAt: Date.now() - 3_600_000,
-        files: [
-          { id: "f3", fileName: "季度报表.xlsx", size: 238_912, fileType: "application/vnd.ms-excel", sha256: null, preview: null, metadata: null },
-        ],
-      },
-      {
-        sessionId: "t3", direction: "Receive", peerAlias: "小米 14",
-        status: "Done", createdAt: Date.now() - 86_400_000,
-        files: [
-          { id: "f4", fileName: "message.txt", size: 24, fileType: "text/plain", sha256: null, preview: "晚上一起吃饭？", metadata: null },
-        ],
-        destinations: { f4: "D:\\Downloads\\message.txt" },
-      },
-    ],
-  },
-  discover_now: { ok: true },
+/** 可变预览存储只存在于当前页面；绝不打开真实网络服务或写宿主设置。 */
+const previewListeners = new Map<string, Set<(payload: unknown) => void>>();
+let previewSettings: Settings = {
+  alias: "My-PC", deviceModel: "Windows 11 Pro", deviceType: "desktop",
+  port: 53317, downloadDir: "D:\\Downloads", pin: null,
+  autoSave: false, notifyOnIncoming: true,
 };
+const previewKnownDevices = [
+  previewDevice("iPhone 15 Pro", "iOS 18", "mobile", "192.168.31.20", 3_000),
+  previewDevice("MacBook Pro", "macOS 15", "desktop", "192.168.31.33", 41_000),
+  previewDevice("客厅 N100", "Debian", "headless", "192.168.31.7", 5_400_000),
+];
+let previewDevices = [...previewKnownDevices];
+let previewTransfers: TransferRecord[] = [
+  {
+    sessionId: previewIncoming.sessionId, direction: "Receive", peerAlias: previewIncoming.sender.alias,
+    status: "Pending", createdAt: Date.now(), files: previewIncoming.files,
+  },
+  {
+    sessionId: "t1", direction: "Receive", peerAlias: "iPhone 15 Pro",
+    status: "Transferring", createdAt: Date.now() - 30_000,
+    files: [
+      { id: "f1", fileName: " vacation.zip", size: 1_284_337_664, fileType: "application/zip", sha256: null, preview: null, metadata: null },
+      { id: "f2", fileName: "IMG_0042.HEIC", size: 4_800_512, fileType: "image/heic", sha256: null, preview: null, metadata: null },
+    ],
+  },
+  {
+    sessionId: "t2", direction: "Send", peerAlias: "MacBook Pro",
+    status: "Done", createdAt: Date.now() - 3_600_000,
+    files: [
+      { id: "f3", fileName: "季度报表.xlsx", size: 238_912, fileType: "application/vnd.ms-excel", sha256: null, preview: null, metadata: null },
+    ],
+  },
+  {
+    sessionId: "t3", direction: "Receive", peerAlias: "小米 14",
+    status: "Done", createdAt: Date.now() - 86_400_000,
+    files: [
+      { id: "f4", fileName: "message.txt", size: 24, fileType: "text/plain", sha256: null, preview: "晚上一起吃饭？", metadata: null },
+    ],
+    destinations: { f4: "D:\\Downloads\\message.txt" },
+  },
+];
+let previewServer: ServerStatus = {
+  state: "running", port: 53318, udpPort: 53318, protocol: "https",
+  fingerprint: previewFingerprint, error: null, activeTransfers: 2, revision: 1,
+};
+let previewEvents: QueuedEvent[] = [{ event: EVENTS.incomingRequest, data: previewIncoming }];
+let previewSequence = 0;
 
-function previewInvoke(method: string): unknown {  if (method === "poll_events") {
-    if (previewEventsPending) {
-      previewEventsPending = false;
-      return { events: [{ event: EVENTS.incomingRequest, data: previewIncoming }] };
+function previewActiveCount(): number {
+  return previewTransfers.filter((record) => record.status === "Pending" || record.status === "Transferring").length;
+}
+
+function previewStatusSnapshot(): ServerStatus {
+  return { ...previewServer, activeTransfers: previewActiveCount() };
+}
+
+function emitPreview(event: string, data: unknown): void {
+  previewEvents.push({ event, data });
+  for (const handler of previewListeners.get(event) ?? []) {
+    try { handler(data); } catch { /* 一条仿真事件不阻止其余订阅者。 */ }
+  }
+}
+
+function changePreviewStatus(patch: Partial<ServerStatus>): ServerStatus {
+  previewServer = { ...previewServer, ...patch, revision: previewServer.revision + 1 };
+  const status = previewStatusSnapshot();
+  emitPreview(EVENTS.serverStatus, status);
+  return status;
+}
+
+function cancelPreviewSession(sessionId: string): void {
+  const record = previewTransfers.find((item) => item.sessionId === sessionId);
+  if (!record || (record.status !== "Pending" && record.status !== "Transferring")) return;
+  record.status = "Cancelled";
+  previewEvents = previewEvents.filter((queued) => (
+    queued.event !== EVENTS.incomingRequest && queued.event !== EVENTS.transferProgress
+  ) || (queued.data as { sessionId?: string }).sessionId !== sessionId);
+  emitPreview(EVENTS.transferDone, { sessionId, status: "cancelled" });
+}
+
+function requirePreviewRunning(): void {
+  if (previewServer.state !== "running") throw new Error("预览模拟：服务未运行");
+}
+
+function previewInvoke(method: string, payload: Record<string, unknown> = {}): unknown {
+  switch (method) {
+    case "settings_get": return { ...previewSettings };
+    case "settings_set": {
+      previewSettings = { ...(payload.settings as Settings) };
+      return { ...previewSettings };
     }
-    return { events: [] };
+    case "server_status": return previewStatusSnapshot();
+    case "device_list": return { devices: structuredClone(previewDevices), udpPort: previewServer.udpPort };
+    case "transfer_list": return { transfers: structuredClone(previewTransfers) };
+    case "poll_events": {
+      const events = previewEvents;
+      previewEvents = [];
+      return { events };
+    }
+    case "start_localsend": {
+      if (previewServer.state === "stopping") throw new Error("预览模拟：服务停止中 (stopping)");
+      if (previewServer.state === "running" || previewServer.state === "starting") {
+        return { started: true, status: previewStatusSnapshot() };
+      }
+      const savedPort = previewSettings.port;
+      const status = changePreviewStatus({ state: "starting", port: 0, udpPort: 0, error: null });
+      setTimeout(() => {
+        if (previewServer.state !== "starting" || previewServer.revision !== status.revision) return;
+        previewDevices = [...previewKnownDevices];
+        changePreviewStatus({ state: "running", port: savedPort, udpPort: savedPort, error: null });
+        for (const device of previewDevices) emitPreview(EVENTS.deviceFound, structuredClone(device));
+      }, 300);
+      return { started: true, status };
+    }
+    case "stop_localsend": {
+      const activeTransfers = previewActiveCount();
+      if (previewServer.state === "stopped" || previewServer.state === "stopping") {
+        return { confirmationRequired: false, activeTransfers, status: previewStatusSnapshot() };
+      }
+      if (activeTransfers > 0 && payload.force !== true) {
+        return { confirmationRequired: true, activeTransfers, status: previewStatusSnapshot() };
+      }
+      const status = changePreviewStatus({ state: "stopping" });
+      setTimeout(() => {
+        if (previewServer.state !== "stopping" || previewServer.revision !== status.revision) return;
+        for (const record of previewTransfers) cancelPreviewSession(record.sessionId);
+        previewDevices = [];
+        changePreviewStatus({ state: "stopped", port: 0, udpPort: 0, error: null });
+      }, 300);
+      return { confirmationRequired: false, activeTransfers, status };
+    }
+    case "discover_now": {
+      if (previewServer.state === "running") {
+        for (const device of previewDevices) emitPreview(EVENTS.deviceFound, structuredClone(device));
+      }
+      return { ok: true };
+    }
+    case "session_accept": {
+      requirePreviewRunning();
+      const sessionId = String(payload.sessionId);
+      const record = previewTransfers.find((item) => item.sessionId === sessionId && item.status === "Pending");
+      if (!record) throw new Error("预览模拟：会话已不存在");
+      record.status = "Transferring";
+      return { accepted: record.files.map((file) => file.id) };
+    }
+    case "session_decline":
+    case "session_cancel": {
+      cancelPreviewSession(String(payload.sessionId));
+      return {};
+    }
+    case "send_files":
+    case "send_text": {
+      requirePreviewRunning();
+      const sessionId = `preview-send-${++previewSequence}`;
+      const files: FileEntry[] = method === "send_text" ? [{
+        id: "text", fileName: "message.txt", size: new TextEncoder().encode(String(payload.text)).length,
+        fileType: "text/plain", sha256: null, preview: String(payload.text), metadata: null,
+      }] : (payload.files as Array<{ path: string }>).map(({ path }, index) => ({
+        id: `file-${index}`, fileName: path.split(/[\\/]/).pop() || path, size: 238_912,
+        fileType: "application/octet-stream", sha256: null, preview: null, metadata: null,
+      }));
+      previewTransfers = [{
+        sessionId, direction: "Send", peerAlias: previewDevices.find((device) => device.ip === payload.ip)?.info.alias ?? "预览设备",
+        files, status: "Transferring", createdAt: Date.now(),
+      }, ...previewTransfers];
+      return { sessionId };
+    }
+    default: throw new Error(`预览模式未仿真该 method: ${method}`);
   }
-  if (method in PREVIEW_DATA) return PREVIEW_DATA[method];
-  if (["send_files", "send_text"].includes(method)) return { sessionId: `preview-${method}` };
-  if (["session_accept", "session_decline", "session_cancel", "settings_set"].includes(method)) {
-    return {};
-  }
-  throw new Error(`预览模式未仿真该 method: ${method}`);
 }
 
 /**
@@ -313,7 +439,7 @@ async function callNative<T>(
   method: string,
   payload?: Record<string, unknown>,
 ): Promise<T> {
-  if (PREVIEW_MODE) return previewInvoke(method) as T;
+  if (PREVIEW_MODE) return previewInvoke(method, payload) as T;
   const result = await invoke<T>(method, payload ?? {});
   if (result && typeof result === "object" && "ok" in result) {
     const envelope = result as { ok: boolean; data?: T; error?: unknown };
@@ -421,6 +547,16 @@ export async function listTransfers(): Promise<TransferRecord[]> {
 
 export async function serverStatus(): Promise<ServerStatus> {
   return callNative<ServerStatus>("server_status");
+}
+
+/** 使用已保存设置启动；立即返回 starting/running 快照，不保存任何表单草稿。 */
+export async function startService(): Promise<StartServiceResult> {
+  return callNative<StartServiceResult>("start_localsend", {});
+}
+
+/** 默认只检查活动传输；用户确认后 force=true 才取消未完成传输并停止。 */
+export async function stopService(force = false): Promise<StopServiceResult> {
+  return callNative<StopServiceResult>("stop_localsend", { force });
 }
 
 /** 取走事件队列里所有待处理事件（队列有界，满丢最旧）。 */

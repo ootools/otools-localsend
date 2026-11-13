@@ -12,14 +12,16 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   EVENTS,
   getSettings,
+  isPreviewMode,
   listDevices,
   listTransfers,
   onEvent,
   pollEvents,
   serverStatus,
+  startService as nativeStartService,
+  stopService as nativeStopService,
   type DeviceEntry,
   type IncomingRequestEvent,
-  type ServerStatus,
   type Settings,
   type TransferRecord,
   type UnlistenFn,
@@ -27,6 +29,13 @@ import {
 import { normalizeTransferStatus } from "../format";
 import { pendingIncomingFromTransfers } from "./incomingRebuild";
 import { devicesFromWire, upsertDeviceFromWire } from "./deviceState";
+import {
+  createServiceController,
+  liveServiceStateForStatus,
+  normalizeServerStatus,
+  serviceAllowsLiveTraffic,
+  type ServiceControlState,
+} from "./serviceState";
 import {
   isPermissionGranted,
   requestPermission,
@@ -44,6 +53,7 @@ export type ProgressMap = Record<string, Record<string, number>>;
 let notificationPermissionRequested = false;
 
 async function notifyIncomingRequest(senderAlias: string): Promise<void> {
+  if (isPreviewMode()) return;
   try {
     let granted = false;
     try {
@@ -84,18 +94,59 @@ export function usePollEvents() {
   const [ready, setReady] = useState(false);
   const [hostError, setHostError] = useState<string | null>(null);
   const [settings, setSettings] = useState<Settings | null>(null);
-  const [server, setServer] = useState<ServerStatus | null>(null);
-  const [udpPort, setUdpPort] = useState(0);
-  const [devices, setDevices] = useState<DeviceEntry[]>([]);
+  const [service, setService] = useState<ServiceControlState>({
+    server: null, serviceBusy: false, serviceError: null, stopConfirmation: null,
+  });
+  const [live, setLive] = useState<{
+    udpPort: number;
+    devices: DeviceEntry[];
+    incoming: IncomingRequestEvent[];
+    progress: ProgressMap;
+  }>({ udpPort: 0, devices: [], incoming: [], progress: {} });
   const [transfers, setTransfers] = useState<TransferRecord[]>([]);
-  const [progress, setProgress] = useState<ProgressMap>({});
-  const [incoming, setIncoming] = useState<IncomingRequestEvent[]>([]);
 
   const settingsRef = useRef<Settings | null>(null);
   const aliveRef = useRef(false);
   const seenIncomingRef = useRef(new Set<string>());
   const unlistenersRef = useRef<UnlistenFn[]>([]);
   const timersRef = useRef<number[]>([]);
+  const lastLifecycleRef = useRef<string | null>(null);
+  const controllerRef = useRef<ReturnType<typeof createServiceController> | null>(null);
+  if (!controllerRef.current) {
+    controllerRef.current = createServiceController({
+      startService: nativeStartService,
+      stopService: nativeStopService,
+      serverStatus,
+      onChange: (next) => { if (aliveRef.current) setService(next); },
+      onStatus: (status) => {
+        if (!aliveRef.current) return;
+        setLive((current) => liveServiceStateForStatus(current, status));
+        // 结果/重查询也走这里；不能只在 server-status 事件中刷新关联数据。
+        if (lastLifecycleRef.current !== status.state) {
+          lastLifecycleRef.current = status.state;
+          if (status.state === "running") void refreshDevices();
+          if (status.state === "stopped") void refreshTransfers();
+        }
+      },
+    });
+  }
+  const controller = controllerRef.current;
+
+  const startService = useCallback(() => controllerRef.current!.start(), []);
+  const stopService = useCallback((force = false) => controllerRef.current!.stop(force), []);
+  const confirmStopService = useCallback(() => controllerRef.current!.confirmStop(), []);
+  const cancelStopService = useCallback(() => controllerRef.current!.cancelStop(), []);
+  const refreshServer = useCallback(() => controllerRef.current!.refreshStatus(), []);
+
+  const setDevices = useCallback((update: (list: DeviceEntry[]) => DeviceEntry[]) => {
+    setLive((current) => ({ ...current, devices: update(current.devices) }));
+  }, []);
+  const setProgress = useCallback((update: (map: ProgressMap) => ProgressMap) => {
+    setLive((current) => ({ ...current, progress: update(current.progress) }));
+  }, []);
+  const setIncoming = useCallback((update: (queue: IncomingRequestEvent[]) => IncomingRequestEvent[]) => {
+    setLive((current) => ({ ...current, incoming: update(current.incoming) }));
+  }, []);
 
   // --- 刷新动作 -----------------------------------------------------------
 
@@ -110,11 +161,17 @@ export function usePollEvents() {
   }, []);
 
   const refreshDevices = useCallback(async () => {
+    const before = controllerRef.current!.getState().server;
+    if (!serviceAllowsLiveTraffic(before)) return;
     try {
-      const { devices: list, udpPort: port } = await listDevices();
+      const { devices: list } = await listDevices();
       if (!aliveRef.current) return;
-      setUdpPort(port ?? 0);
-      setDevices(devicesFromWire(list, Date.now()));
+      const current = controllerRef.current!.getState().server;
+      // 停服/重启之间返回的旧设备快照不得复活上一代的设备和 UDP 端口。
+      if (!serviceAllowsLiveTraffic(current) || before?.revision !== current?.revision) return;
+      setLive((liveState) => ({
+        ...liveState, udpPort: current!.udpPort, devices: devicesFromWire(list, Date.now()),
+      }));
     } catch {
       // 降级：保留现有列表。
     }
@@ -135,30 +192,32 @@ export function usePollEvents() {
     // seen 集合保持粘性（不 delete）：同一 sessionId 永远不会合法地二次请求，
     // 双通道重复投递不得在用户处理后重开幽灵对话框。
     setIncoming((queue) => queue.filter((item) => item.sessionId !== sessionId));
-  }, []);
+  }, [setIncoming]);
 
   // --- 幂等事件应用 --------------------------------------------------------
 
   const upsertDevice = useCallback((entry: DeviceEntry) => {
+    if (!serviceAllowsLiveTraffic(controllerRef.current!.getState().server)) return;
     if (!entry || typeof entry.ip !== "string" || !entry.info?.fingerprint) return;
     setDevices((list) => upsertDeviceFromWire(list, entry, Date.now()));
-  }, []);
+  }, [setDevices]);
 
   const removeDevice = useCallback((fingerprint: string) => {
     if (!fingerprint) return;
     setDevices((list) =>
       list.filter((item) => item.info.fingerprint !== fingerprint),
     );
-  }, []);
+  }, [setDevices]);
 
   const applyProgress = useCallback((sessionId: string, fileId: string, percent: number) => {
+    if (!serviceAllowsLiveTraffic(controllerRef.current!.getState().server)) return;
     if (!sessionId || !fileId || typeof percent !== "number") return;
     setProgress((map) => {
       const fileMap = map[sessionId] ?? {};
       if (fileMap[fileId] === percent) return map;
       return { ...map, [sessionId]: { ...fileMap, [fileId]: percent } };
     });
-  }, []);
+  }, [setProgress]);
 
   const applyTransferDone = useCallback((sessionId: string, status: string) => {
     const normalized = normalizeTransferStatus(status);
@@ -180,9 +239,10 @@ export function usePollEvents() {
       // seen 集合保持粘性，防止双通道残留投递重开幽灵对话框。
       setIncoming((queue) => queue.filter((item) => item.sessionId !== sessionId));
     }
-  }, []);
+  }, [setIncoming, setProgress]);
 
   const applyIncomingRequest = useCallback((request: IncomingRequestEvent) => {
+    if (!serviceAllowsLiveTraffic(controllerRef.current!.getState().server)) return;
     if (!request?.sessionId || !Array.isArray(request.files)) return;
     if (seenIncomingRef.current.has(request.sessionId)) return;
     seenIncomingRef.current.add(request.sessionId);
@@ -196,32 +256,10 @@ export function usePollEvents() {
     if (hidden && settingsRef.current?.notifyOnIncoming) {
       void notifyIncomingRequest(request.sender?.alias ?? "未知设备");
     }
-  }, []);
+  }, [setIncoming]);
 
   const applyServerStatus = useCallback((data: unknown) => {
-    const payload = (data ?? {}) as {
-      port?: unknown;
-      protocol?: unknown;
-      fingerprint?: unknown;
-      error?: unknown;
-    };
-    if (typeof payload.error === "string" && payload.error) {
-      setServer({
-        port: 0,
-        protocol: "https",
-        fingerprint: null,
-        error: payload.error,
-      });
-      return;
-    }
-    if (typeof payload.port === "number" && payload.port > 0) {
-      setServer({
-        port: payload.port,
-        protocol: typeof payload.protocol === "string" ? payload.protocol : "https",
-        fingerprint: typeof payload.fingerprint === "string" ? payload.fingerprint : null,
-        error: null,
-      });
-    }
+    controllerRef.current!.applyStatus(data);
   }, []);
 
   const handleEvent = useCallback(
@@ -289,6 +327,7 @@ export function usePollEvents() {
   useEffect(() => {
     aliveRef.current = true;
     let cancelled = false;
+    controller.setAvailability(false, null);
 
     const startLive = () => {
       if (cancelled || !aliveRef.current) return;
@@ -300,6 +339,11 @@ export function usePollEvents() {
           if (!aliveRef.current) return;
           for (const queued of events) {
             handleEvent(queued.event, queued.data);
+          }
+          // 异步 starting/stopping 和未知态即使漏事件也能收敛；这里只查询，绝不启动。
+          const current = controller.getState();
+          if (!current.serviceBusy && (!current.server || ["starting", "stopping"].includes(current.server.state))) {
+            await controller.refreshStatus();
           }
         } catch {
           // 无宿主（浏览器直跑）或桥失效：静默，重建阶段的降级态已覆盖。
@@ -345,8 +389,10 @@ export function usePollEvents() {
       if (cancelled || !aliveRef.current) return;
 
       if (devicesResult.status === "fulfilled") {
-        setUdpPort(devicesResult.value.udpPort ?? 0);
-        setDevices(devicesFromWire(devicesResult.value.devices, Date.now()));
+        setLive((current) => ({
+          ...current, udpPort: devicesResult.value.udpPort ?? 0,
+          devices: devicesFromWire(devicesResult.value.devices, Date.now()),
+        }));
       }
       if (transfersResult.status === "fulfilled") {
         const records = sortByNewestTransfers(transfersResult.value);
@@ -362,7 +408,11 @@ export function usePollEvents() {
         if (pending.length) setIncoming((queue) => [...queue, ...pending]);
       }
       if (statusResult.status === "fulfilled") {
-        setServer(statusResult.value);
+        applyServerStatus(statusResult.value);
+        if (!normalizeServerStatus(statusResult.value)) void controller.refreshStatus();
+      } else {
+        // 其它面可用但状态读取失败：server 仍是 null，显示未知并可被轮询恢复。
+        void controller.refreshStatus();
       }
       if (settingsResult.status === "fulfilled") {
         settingsRef.current = settingsResult.value;
@@ -370,13 +420,11 @@ export function usePollEvents() {
       }
 
       // 三个核心面全部失败 = 宿主桥未注入（浏览器直跑）→ 显式降级态。
-      if (
-        devicesResult.status === "rejected" &&
-        transfersResult.status === "rejected" &&
-        statusResult.status === "rejected"
-      ) {
-        setHostError(asErrorText(devicesResult.reason) || "宿主桥不可用");
-      }
+      const missingHost = devicesResult.status === "rejected" &&
+        transfersResult.status === "rejected" && statusResult.status === "rejected"
+        ? asErrorText(devicesResult.reason) || "宿主桥不可用" : null;
+      setHostError(missingHost);
+      controller.setAvailability(true, missingHost);
       setReady(true);
       // 重建完成之后才允许实时事件进入（Review Focus #3）。
       startLive();
@@ -385,23 +433,26 @@ export function usePollEvents() {
     return () => {
       cancelled = true;
       aliveRef.current = false;
+      controller.setAvailability(false, null);
       for (const timer of timersRef.current) window.clearInterval(timer);
       timersRef.current = [];
       for (const unlisten of unlistenersRef.current) void unlisten();
       unlistenersRef.current = [];
     };
-  }, [handleEvent, refreshDevices]);
+  }, [applyServerStatus, controller, handleEvent, refreshDevices, setIncoming]);
 
   return {
     ready,
     hostError,
     settings,
-    server,
-    udpPort,
-    devices,
+    ...service,
+    ...live,
     transfers,
-    progress,
-    incoming,
+    startService,
+    stopService,
+    confirmStopService,
+    cancelStopService,
+    refreshServer,
     refreshDevices,
     refreshTransfers,
     refreshSettings,

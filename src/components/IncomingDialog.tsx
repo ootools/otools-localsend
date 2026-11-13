@@ -19,6 +19,9 @@ interface IncomingDialogProps {
   onAcceptAll: () => void;
   onAcceptSelected: (fileIds: string[]) => void;
   onDecline: () => void;
+  onStopService?: () => void;
+  serviceBusy?: boolean;
+  hidden?: boolean;
 }
 
 function isTextMessage(request: IncomingRequestEvent): boolean {
@@ -37,6 +40,9 @@ export function IncomingDialog({
   onAcceptAll,
   onAcceptSelected,
   onDecline,
+  onStopService,
+  serviceBusy = false,
+  hidden = false,
 }: IncomingDialogProps) {
   const textMode = isTextMessage(request);
   const [selected, setSelected] = useState<Set<string>>(
@@ -69,6 +75,7 @@ export function IncomingDialog({
       role="dialog"
       aria-modal="true"
       aria-label="传输请求"
+      hidden={hidden}
     >
       <div className="modal">
         <h3>{sender?.alias || "未知设备"} 请求传输</h3>
@@ -129,6 +136,13 @@ export function IncomingDialog({
           </div>
         )}
 
+        {onStopService && (
+          <div className="incoming-service-action">
+            <button type="button" onClick={onStopService} disabled={serviceBusy} className="btn btn-sm btn-danger">
+              {serviceBusy ? "处理中…" : "停止服务"}
+            </button>
+          </div>
+        )}
         <div className="modal-actions">
           <button type="button" onClick={onDecline} disabled={busy} className="btn btn-sm btn-danger">
             拒绝

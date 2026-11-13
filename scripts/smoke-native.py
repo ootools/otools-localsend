@@ -9,6 +9,7 @@ import argparse
 import ctypes
 import json
 import os
+import socket
 import tempfile
 import time
 from pathlib import Path
@@ -84,8 +85,14 @@ def main():
         assert pre_now["ok"] is True and pre_now["data"]["ok"] is True, f"discover_now before start: {pre_now}"
         print("PASS: device_list empty (udpPort 0) and discover_now ok before start_background")
 
+        pre_status = invoke("server_status")
+        assert pre_status["ok"] is True and pre_status["data"].get("state") == "stopped", pre_status
+        assert pre_status["data"]["port"] == 0 and pre_status["data"]["udpPort"] == 0, pre_status
+        assert isinstance(pre_status["data"]["revision"], int), pre_status
+        print("PASS: service state before autostart is explicitly stopped, not indefinitely starting")
         started = invoke("start_localsend")
         assert started["ok"] is True, f"start_localsend: {started.get('error')}"
+        assert started["data"]["status"]["state"] in ("starting", "running"), started
 
         # The discovery task binds asynchronously; poll for the actual port.
         # Settings above switched the port to 53318, so discovery binds there
@@ -116,6 +123,10 @@ def main():
             status = invoke("server_status")
         https_port = status["data"]["port"]
         assert 53318 <= https_port <= 53328, f"https port outside the fallback range: {https_port}"
+        assert status["data"]["state"] == "running", status
+        assert status["data"]["udpPort"] == udp_port, status
+        assert status["data"]["activeTransfers"] == 0, status
+        assert isinstance(status["data"]["revision"], int), status
         fingerprint = status["data"]["fingerprint"]
         assert isinstance(fingerprint, str) and len(fingerprint) == 64, f"fingerprint: {fingerprint}"
         assert status["data"]["error"] is None, f"unexpected bind error: {status['data']}"
@@ -128,7 +139,9 @@ def main():
         assert latest["port"] == https_port, f"event port mismatch: {latest}"
         assert latest["protocol"] == "https", f"event protocol: {latest}"
         assert latest["fingerprint"] == fingerprint, f"event fingerprint mismatch: {latest}"
-        print("PASS: server-status event carries the actual https port, protocol and fingerprint")
+        assert latest["state"] == "running" and latest["udpPort"] == udp_port, latest
+        assert isinstance(latest["revision"], int) and latest["activeTransfers"] == 0, latest
+        print("PASS: server-status event carries the actual ports, lifecycle, revision and fingerprint")
 
         transfers = invoke("transfer_list")
         assert transfers["ok"] is True, f"transfer_list: {transfers.get('error')}"
@@ -138,6 +151,72 @@ def main():
             assert bogus["ok"] is False, f"{method} with a bogus id must fail: {bogus}"
             assert "session not found" in bogus.get("error", ""), f"unexpected error: {bogus}"
         print("PASS: transfer_list ok and bogus session ids rejected on all session endpoints")
+
+        # Ordinary stop is restartable and never retires the plugin library.
+        cert_bytes = (Path(directory) / "cert.pem").read_bytes()
+        key_bytes = (Path(directory) / "key.pem").read_bytes()
+        stop = invoke("stop_localsend")
+        assert stop["ok"] is True, f"manual stop unavailable: {stop}"
+        assert stop["data"]["confirmationRequired"] is False, stop
+        deadline = time.monotonic() + 15
+        stopped = invoke("server_status")
+        while stopped["data"].get("state") != "stopped" and time.monotonic() < deadline:
+            time.sleep(0.05)
+            stopped = invoke("server_status")
+        assert stopped["data"]["state"] == "stopped", f"stop never completed: {stopped}"
+        assert stopped["data"]["port"] == 0 and stopped["data"]["udpPort"] == 0, stopped
+        assert invoke("settings_get")["data"]["alias"] == "Smoke设备"
+        assert (Path(directory) / "cert.pem").read_bytes() == cert_bytes
+        assert (Path(directory) / "key.pem").read_bytes() == key_bytes
+        repeated_stop = invoke("stop_localsend")
+        assert repeated_stop["ok"] is True and repeated_stop["data"]["status"]["state"] == "stopped", repeated_stop
+        devices_after_stop = invoke("device_list")
+        assert devices_after_stop["data"] == {"devices": [], "udpPort": 0}, devices_after_stop
+        print("PASS: ordinary stop is idempotent, releases live state and preserves settings/certificate")
+
+        # A private endpoint avoids mistaking another same-host LocalSend
+        # socket for our own when asserting actual port release.
+        private_port = None
+        for _ in range(20):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_probe:
+                tcp_probe.bind(("0.0.0.0", 0))
+                candidate = tcp_probe.getsockname()[1]
+                if candidate > 65525:
+                    continue
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_probe:
+                    try:
+                        udp_probe.bind(("0.0.0.0", candidate))
+                    except OSError:
+                        continue
+                    private_port = candidate
+                    break
+        assert private_port is not None, "no idle TCP/UDP endpoint for restart smoke"
+        changed = invoke("settings_get")["data"]
+        changed["port"] = private_port
+        assert invoke("settings_set", {"settings": changed})["ok"] is True
+        restarted = invoke("start_localsend")
+        assert restarted["ok"] is True and restarted["data"]["started"] is True, restarted
+        deadline = time.monotonic() + 5
+        running = invoke("server_status")
+        while running["data"].get("state") != "running" and time.monotonic() < deadline:
+            time.sleep(0.05)
+            running = invoke("server_status")
+        assert running["data"]["state"] == "running", f"restart failed: {running}"
+        assert running["data"]["port"] == private_port, f"saved port not applied: {running}"
+        assert running["data"]["fingerprint"] == fingerprint
+        assert running["data"]["revision"] > stopped["data"]["revision"], "restart reset status revision"
+        assert invoke("stop_localsend")["ok"] is True
+        deadline = time.monotonic() + 15
+        final_stop = invoke("server_status")
+        while final_stop["data"].get("state") != "stopped" and time.monotonic() < deadline:
+            time.sleep(0.05)
+            final_stop = invoke("server_status")
+        assert final_stop["data"]["state"] == "stopped", final_stop
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_probe:
+            tcp_probe.bind(("0.0.0.0", private_port))
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_probe:
+            udp_probe.bind(("0.0.0.0", private_port))
+        print("PASS: same-library restart applies saved port, retains fingerprint and releases TCP/UDP sockets")
 
         assert invoke("__otools_shutdown__")["ok"] is True
         retired = invoke("settings_get")

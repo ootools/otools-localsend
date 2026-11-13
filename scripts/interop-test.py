@@ -8,12 +8,14 @@ directory for every run, every child process is killed on exit (atexit +
 finally), and each scenario prints a PASS/FAIL/SKIP line with details.
 """
 
+import argparse
 import atexit
 import hashlib
 import importlib.util
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -232,6 +234,10 @@ def scenario(fn):
             for proc in _children[children_before:]:
                 if proc.poll() is None:
                     proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
 
     wrapper.__name__ = fn.__name__
     return wrapper
@@ -267,7 +273,7 @@ def make_text_file(directory: Path, name: str, text: str) -> Path:
 # ---------------------------------------------------------------------------
 
 def start_dll():
-    """Load the DLL, point OTOOLS_DATA_DIR at a fresh dir, start the shell."""
+    """Load the library once; subsequent service restarts reuse its state."""
     data_dir = Path(tempfile.mkdtemp(prefix="otools-localsend-interop-"))
     os.environ["OTOOLS_DATA_DIR"] = str(data_dir)
     atexit.register(shutil.rmtree, data_dir, ignore_errors=True)
@@ -275,23 +281,126 @@ def start_dll():
     smoke_native.load_dll(LIBRARY)
     settings = ok_data("settings_get")
     assert settings["port"] == 53317, f"unexpected default port: {settings}"
-    assert ok_data("start_localsend") == {"started": True}
-
-    deadline = time.monotonic() + 30
-    status = server_status()
-    while status["port"] == 0 and time.monotonic() < deadline:
-        time.sleep(0.1)
-        status = server_status()
-    assert status["port"] != 0, f"HTTPS server never bound: {status}"
-    devices = device_list()
-    while devices["udpPort"] == 0 and time.monotonic() < deadline:
-        time.sleep(0.1)
-        devices = device_list()
-    assert devices["udpPort"] != 0, f"discovery never bound: {devices}"
+    started = ok_data("start_localsend")
+    assert started.get("started") is True, f"start result: {started}"
+    status, devices = wait_service_running()
     return data_dir, status["port"], devices["udpPort"]
 
 
+def wait_service_running(timeout=30.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = server_status()
+        devices = device_list()
+        if status["port"] > 0 and devices["udpPort"] > 0:
+            assert status.get("state", "running") == "running", status
+            return status, devices
+        if status.get("state") == "failed":
+            raise AssertionError(f"service failed to start: {status}")
+        time.sleep(0.05)
+    raise TimeoutError(f"service never became running: {server_status()}")
+
+
+def restart_service():
+    started = ok_data("start_localsend")
+    assert started.get("started") is True, started
+    status, devices = wait_service_running()
+    CTX["tcp_port"] = status["port"]
+    CTX["udp_port"] = devices["udpPort"]
+    assert status["fingerprint"] == CTX["fingerprint"], "ordinary restart replaced the certificate"
+    return status
+
+
+def wait_service_state(expected, timeout=15.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = server_status()
+        if status.get("state") == expected:
+            for field in ("revision", "activeTransfers", "udpPort"):
+                assert isinstance(status.get(field), int), f"missing lifecycle field {field}: {status}"
+            return status
+        if status.get("state") == "failed" and expected != "failed":
+            raise AssertionError(f"service entered failed instead of {expected}: {status}")
+        time.sleep(0.05)
+    raise TimeoutError(f"service never entered {expected}: {server_status()}")
+
+
+def unused_service_port():
+    for _ in range(20):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
+            tcp.bind(("0.0.0.0", 0))
+            port = tcp.getsockname()[1]
+            if port > 65525:
+                continue
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+                try:
+                    udp.bind(("0.0.0.0", port))
+                except OSError:
+                    continue
+                return port
+    raise RuntimeError("no private TCP/UDP test port available")
+
+
+def assert_idle_ports_released(tcp_port, udp_port):
+    # No reuse flags: successfully binding the exact old endpoints is evidence
+    # that the service actually closed them, not merely changed its status.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
+        tcp.bind(("0.0.0.0", tcp_port))
+        tcp.listen(1)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+        udp.bind(("0.0.0.0", udp_port))
+
+
+def force_stop_and_collect(session_id):
+    started = time.monotonic()
+    requested = ok_data("stop_localsend", {"force": True})
+    assert time.monotonic() - started < 2, "stop invoke blocked on cleanup instead of returning asynchronously"
+    assert requested["confirmationRequired"] is False, requested
+    assert requested["status"]["state"] in ("stopping", "stopped"), requested
+    deadline = time.monotonic() + 15
+    collected = []
+    stopped = server_status()
+    while stopped.get("state") != "stopped" and time.monotonic() < deadline:
+        assert stopped.get("state") != "failed", f"service cleanup failed: {stopped}"
+        polled_at = time.monotonic()
+        collected.extend(drain_events())
+        assert time.monotonic() - polled_at < 1, "poll_events blocked behind service cleanup"
+        time.sleep(0.05)
+        stopped = server_status()
+    assert stopped.get("state") == "stopped", f"forced stop did not complete: {stopped}"
+    assert time.monotonic() - started < 15, "stop waited for the sender to finish the whole file"
+    assert stopped["port"] == 0 and stopped["udpPort"] == 0, stopped
+    assert device_list() == {"devices": [], "udpPort": 0}, "discovery survived stop"
+    events = collected + drain_events()
+    revisions = [
+        e["data"]["revision"] for e in events if e["event"] == "server-status"
+    ]
+    assert revisions == sorted(revisions), f"service status events regressed revisions: {revisions}"
+    assert revisions and revisions[-1] == stopped["revision"], "stopped status was not published"
+    # A cancelled generation must not emit a late running state after stop.
+    after = drain_events()
+    assert not [e for e in after if e["event"] == "server-status" and e["data"].get("state") == "running"], after
+    cancelled = [
+        e for e in events if e["event"] == "transfer-done"
+        and e["data"].get("sessionId") == session_id
+    ]
+    assert len(cancelled) == 1 and cancelled[0]["data"]["status"] == "cancelled", cancelled
+    assert find_record(session_id)["status"] == "Cancelled", find_record(session_id)
+    return stopped
+
+
 def main():
+    global LIBRARY
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--library", type=Path, default=LIBRARY)
+    parser.add_argument("--scenario", action="append", default=[])
+    args = parser.parse_args()
+    LIBRARY = args.library.resolve(strict=True)
+    selected = [test for test in SCENARIOS if not args.scenario or test.__name__ in args.scenario]
+    unknown = set(args.scenario) - {test.__name__ for test in SCENARIOS}
+    if unknown:
+        parser.error(f"unknown scenario(s): {', '.join(sorted(unknown))}")
+
     data_dir, tcp_port, udp_port = start_dll()
     work = Path(tempfile.mkdtemp(prefix="otools-localsend-interop-work-"))
     atexit.register(shutil.rmtree, work, ignore_errors=True)
@@ -315,7 +424,7 @@ def main():
         flush=True,
     )
     try:
-        for test in SCENARIOS:
+        for test in selected:
             test()
     finally:
         kill_children()
@@ -325,9 +434,11 @@ def main():
             pass
 
     failed = [name for name, status, _ in RESULTS if status == "FAIL"]
+    passed = sum(status == "PASS" for _, status, _ in RESULTS)
+    skipped = sum(status == "SKIP" for _, status, _ in RESULTS)
     print(
-        f"--- interop summary: {len(RESULTS) - len(failed)}/{len(RESULTS)} passed,"
-        f" total {time.monotonic() - started:.1f}s ---",
+        f"--- interop summary: {passed}/{len(RESULTS)} passed,"
+        f" {skipped} skipped, total {time.monotonic() - started:.1f}s ---",
         flush=True,
     )
     for name, status, detail in RESULTS:
@@ -1042,6 +1153,232 @@ def receive_auto_save():
     assert ok_data("settings_get")["autoSave"] is False, "autoSave not restored"
     drain_events()
     return "auto-save: immediate 200, zero incoming-request, Done + byte-identical files"
+
+
+@register_scenario
+@scenario
+def service_restart():
+    """One loaded library: idle stop releases ports; restart keeps all data."""
+    drain_events()
+    previous_settings = ok_data("settings_get")
+    previous_records = transfer_list()
+    cert_before = (CTX["data_dir"] / "cert.pem").read_bytes()
+    key_before = (CTX["data_dir"] / "key.pem").read_bytes()
+    completed_bytes = {}
+    for record in previous_records:
+        assert record["status"] not in ("Pending", "Transferring"), record
+        if record["status"] == "Done":
+            for destination in (record.get("destinations") or {}).values():
+                if Path(destination).is_file():
+                    completed_bytes[destination] = sha256_file(destination)
+
+    stopped = ok_data("stop_localsend")
+    assert stopped["confirmationRequired"] is False, stopped
+    stopped_status = wait_service_state("stopped")
+    assert stopped_status["port"] == 0 and stopped_status["udpPort"] == 0, stopped_status
+    assert transfer_list() == previous_records, "idle stop rewrote completed history"
+    assert ok_data("settings_get") == previous_settings, "idle stop lost settings"
+    assert (CTX["data_dir"] / "cert.pem").read_bytes() == cert_before
+    assert (CTX["data_dir"] / "key.pem").read_bytes() == key_before
+    repeated = ok_data("stop_localsend")
+    assert repeated["confirmationRequired"] is False and repeated["status"]["state"] == "stopped", repeated
+    assert repeated["status"]["revision"] >= stopped_status["revision"]
+
+    private_port = unused_service_port()
+    set_settings(lambda s: s.update(port=private_port))
+    running = restart_service()
+    assert running["port"] == private_port, "restart did not apply saved port"
+    assert CTX["udp_port"] == private_port, "UDP restart did not apply saved port"
+    revision = running["revision"]
+    again = ok_data("start_localsend")
+    assert again["started"] is True and again["status"]["state"] == "running", again
+    assert server_status()["port"] == private_port, "idempotent start spawned another listener"
+
+    drain_events()
+    stopped2 = ok_data("stop_localsend")
+    assert stopped2["confirmationRequired"] is False
+    stopped2_status = wait_service_state("stopped")
+    assert stopped2_status["revision"] > revision, "stop revision was reset"
+    assert_idle_ports_released(private_port, private_port)
+    # Reading state never implicitly starts the service.
+    assert server_status()["state"] == "stopped"
+    assert device_list() == {"devices": [], "udpPort": 0}
+    running2 = restart_service()
+    assert running2["revision"] > stopped2_status["revision"]
+    assert running2["port"] == private_port
+    assert transfer_list() == previous_records, "restart lost completed history"
+    assert (CTX["data_dir"] / "cert.pem").read_bytes() == cert_before
+    for destination, expected_sha in completed_bytes.items():
+        assert sha256_file(destination) == expected_sha, f"completed file changed during restart: {destination}"
+    return "same-library stop/restart, TCP+UDP released, saved port applied, certificate/settings/history preserved"
+
+
+@register_scenario
+@scenario
+def service_stop_pending():
+    """Unconfirmed stop has no effects; forced stop declines a pending peer."""
+    drain_events()
+    set_settings(lambda s: s.update(autoSave=False))
+    payload = make_text_file(CTX["src"], "service-pending.txt", "pending receive before stop")
+    mock = MockPeer(["send", "--to", f"127.0.0.1:{CTX['tcp_port']}", "--file", str(payload)])
+    incoming = wait_dll_event("incoming-request", timeout=30)
+    session_id = incoming["sessionId"]
+    before = server_status()
+    refused = ok_data("stop_localsend")
+    assert refused["confirmationRequired"] is True and refused["activeTransfers"] >= 1, refused
+    assert refused["status"]["state"] == "running", refused
+    assert server_status()["port"] == before["port"], "unconfirmed stop closed the listener"
+    assert find_record(session_id)["status"] == "Pending", "unconfirmed stop cancelled the request"
+    force_stop_and_collect(session_id)
+    result = mock.wait_event("done", timeout=15)
+    assert result and result["status"] == "declined", f"pending sender must receive 403: {mock.diagnostics()}"
+    assert not (CTX["data_dir"] / "tmp" / session_id).exists(), "cancelled Pending directory survived stop"
+    restart_service()
+    return "pending request protected until confirmation; forced stop returns 403 and keeps a Cancelled record"
+
+
+@register_scenario
+@scenario
+def service_stop_receive():
+    """Stopping an active receive aborts streaming before EOF, then can restart."""
+    drain_events()
+    set_settings(lambda s: s.update(autoSave=False, downloadDir=str(CTX["downloads"])))
+    payload = make_random_file(CTX["src"], "service-stalled-receive.bin", 8 * MB)
+    mock = MockPeer([
+        "send", "--to", f"127.0.0.1:{CTX['tcp_port']}", "--file", str(payload), "--slow-ms", "200",
+    ])
+    incoming = wait_dll_event("incoming-request", timeout=30)
+    session_id = incoming["sessionId"]
+    ok_data("session_accept", {"sessionId": session_id})
+    wait_dll_event("transfer-progress", lambda d: d.get("sessionId") == session_id and 0 < d["percent"] < 100, timeout=30)
+    refused = ok_data("stop_localsend")
+    assert refused["confirmationRequired"] is True and refused["activeTransfers"] >= 1, refused
+    assert find_record(session_id)["status"] == "Transferring"
+    force_stop_and_collect(session_id)
+    result = mock.wait_event("done", timeout=15)
+    assert result and result["status"] == "failed", f"stream should abort before EOF: {mock.diagnostics()}"
+    assert not (CTX["data_dir"] / "tmp" / session_id).exists(), "cancelled upload files survived stopped status"
+    assert not (CTX["downloads"] / payload.name).exists(), "cancelled payload was moved into downloads"
+    restart_service()
+
+    # A new transfer after restart must be accepted, not blocked by the cancelled slot.
+    fresh = make_text_file(CTX["src"], "service-after-restart.txt", "new receiver generation works")
+    next_peer = MockPeer(["send", "--to", f"127.0.0.1:{CTX['tcp_port']}", "--file", str(fresh)])
+    next_incoming = wait_dll_event("incoming-request", timeout=30)
+    ok_data("session_accept", {"sessionId": next_incoming["sessionId"]})
+    done = next_peer.wait_event("done", timeout=30)
+    assert done and done["status"] == "done", next_peer.diagnostics()
+    assert find_record(next_incoming["sessionId"])["status"] == "Done"
+    drain_events()
+    return "confirmed stop aborts slow receive before EOF; temporary files removed; fresh receive works after restart"
+
+
+@register_scenario
+@scenario
+def service_stop_send():
+    """Stopping an outgoing transfer notifies the peer and retains history."""
+    drain_events()
+    mock = MockPeer([
+        "serve", "--alias", "ServiceStopTarget", "--dir", str(CTX["work"] / "service-stop-send"), "--slow-ms", "200",
+    ])
+    listening = mock.wait_event("listening", timeout=15)
+    assert listening, mock.diagnostics()
+    payload = make_random_file(CTX["src"], "service-slow-send.bin", 8 * MB)
+    result = ok_data("send_files", {
+        "ip": "127.0.0.1", "port": listening["port"], "files": [{"path": str(payload)}],
+    })
+    session_id = result["sessionId"]
+    prepared = mock.wait_event("prepare", lambda e: e.get("status") == 200, timeout=30)
+    assert prepared, mock.diagnostics()
+    wait_dll_event("transfer-progress", lambda d: d.get("sessionId") == session_id, timeout=30)
+    refused = ok_data("stop_localsend")
+    assert refused["confirmationRequired"] is True and refused["activeTransfers"] >= 1, refused
+    force_stop_and_collect(session_id)
+    assert mock.wait_event("cancel", timeout=15), f"peer was not told about cancelled send: {mock.diagnostics()}"
+    restart_service()
+    return "outgoing stop requires confirmation, notifies peer /cancel, emits one Cancelled result and permits restart"
+
+
+@register_scenario
+@scenario
+def service_keep_completed_files():
+    """Files deliberately left in tmp without downloadDir survive a stop."""
+    drain_events()
+    previous_settings = ok_data("settings_get")
+    set_settings(lambda s: s.update(autoSave=True, downloadDir=None))
+    payload = make_text_file(CTX["src"], "service-kept-without-download-dir.txt", "keep this completed file through service restart")
+    expected = sha256_file(payload)
+    mock = MockPeer(["send", "--to", f"127.0.0.1:{CTX['tcp_port']}", "--file", str(payload)])
+    done = mock.wait_event("done", lambda e: e.get("status") == "done", timeout=30)
+    assert done, mock.diagnostics()
+    record = record_by_file_name(payload.name)
+    assert record["status"] == "Done", record
+    destinations = record.get("destinations") or {}
+    assert len(destinations) == 1, record
+    stored = Path(next(iter(destinations.values())))
+    assert stored.is_relative_to(CTX["data_dir"] / "tmp"), stored
+    assert sha256_file(stored) == expected
+    mock.kill()
+    drain_events()
+    assert ok_data("stop_localsend")["confirmationRequired"] is False
+    wait_service_state("stopped")
+    assert sha256_file(stored) == expected, "ordinary stop deleted completed tmp data"
+    restart_service()
+    assert sha256_file(stored) == expected, "restart deleted completed tmp data"
+    assert find_record(record["sessionId"])["status"] == "Done"
+    ok_data("settings_set", {"settings": previous_settings})
+    drain_events()
+    return "completed file under plugin tmp survives stop/restart with unchanged bytes and history"
+
+
+@register_scenario
+@scenario
+def service_failure_retry():
+    """A failed bind reports failed and supports manual retry after release."""
+    drain_events()
+    assert ok_data("stop_localsend")["confirmationRequired"] is False
+    wait_service_state("stopped")
+    previous_settings = ok_data("settings_get")
+    blockers = []
+    blocked_port = None
+    for _ in range(20):
+        candidate = unused_service_port()
+        try:
+            for port in range(candidate, candidate + 11):
+                tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                blockers.append(tcp)
+                tcp.bind(("0.0.0.0", port))
+                tcp.listen(1)
+                udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                blockers.append(udp)
+                udp.bind(("0.0.0.0", port))
+            blocked_port = candidate
+            break
+        except OSError:
+            for sock in blockers:
+                sock.close()
+            blockers = []
+    assert blocked_port is not None, "could not reserve the entire service fallback window"
+    try:
+        set_settings(lambda s: s.update(port=blocked_port))
+        requested = ok_data("start_localsend")
+        assert requested["started"] is True, requested
+        failed = wait_service_state("failed", timeout=10)
+        assert failed["error"], f"failed service omitted diagnostic: {failed}"
+        assert failed["port"] == 0, f"failed service falsely reported a bound port: {failed}"
+    finally:
+        for sock in blockers:
+            sock.close()
+    recovered = restart_service()
+    assert recovered["port"] == blocked_port, recovered
+    assert recovered["revision"] > failed["revision"], "retry reused the failed revision"
+    assert recovered["error"] is None, recovered
+    assert ok_data("stop_localsend")["confirmationRequired"] is False
+    wait_service_state("stopped")
+    ok_data("settings_set", {"settings": previous_settings})
+    restart_service()
+    drain_events()
+    return "all fallback ports blocked -> explicit failed; manual retry binds after release with no stale error"
 
 
 if __name__ == "__main__":

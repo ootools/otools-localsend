@@ -7,6 +7,8 @@ pub mod sender;
 pub mod server;
 mod service;
 pub mod settings;
+#[cfg(test)]
+mod test_peer;
 
 use serde_json::{json, Value};
 use std::panic::{catch_unwind, AssertUnwindSafe};

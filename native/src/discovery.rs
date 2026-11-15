@@ -9,7 +9,7 @@
 //!   `POST /api/localsend/v2/register` (origin IP from the UDP datagram, port
 //!   from the announce payload). That HTTP call belongs to Task 9's sender
 //!   http client, so [`DiscoveryShared`] only queues
-//!   `(ip, port, our-info)` register replies for that wiring to consume —
+//!   `(ip, port, peer-protocol, our-info)` register replies for that wiring —
 //!   no HTTP stack lives in this module.
 //! - The fingerprint is the SHA-256 hex digest of the TLS certificate DER
 //!   (Task 4 [`crate::crypto`]) and doubles as the device table key.
@@ -193,7 +193,7 @@ pub fn parse_frame(bytes: &[u8]) -> Option<(DeviceInfo, bool)> {
 /// answered over HTTP by POSTing our own info to `<ip>:<port>
 /// /api/localsend/v2/register`; Task 6 only queues, Task 9's sender wiring
 /// drains this queue with its http client.
-pub type RegisterReply = (String, u16, DeviceInfo);
+pub type RegisterReply = (String, u16, &'static str, DeviceInfo);
 
 /// State shared between the discovery loop and the runtime dispatch methods.
 pub struct DiscoveryShared {
@@ -259,8 +259,14 @@ impl DiscoveryShared {
 
     /// Queue a register reply for Task 9's http client. Sending never fails:
     /// the receiver lives in `self` and is only dropped together with it.
-    pub fn queue_register_reply(&self, ip: String, port: u16, info: DeviceInfo) {
-        let _ = self.register_tx.send((ip, port, info));
+    pub fn queue_register_reply(
+        &self,
+        ip: String,
+        port: u16,
+        protocol: &'static str,
+        info: DeviceInfo,
+    ) {
+        let _ = self.register_tx.send((ip, port, protocol, info));
     }
 
     /// Drain all queued register replies. Task 9's wiring consumes these and
@@ -279,10 +285,9 @@ impl DiscoveryShared {
 }
 
 /// Build our own announcement payload from settings and the certificate
-/// fingerprint. `download` mirrors `auto_save` (the v2 flag marks a device
-/// that auto-accepts downloads); the announced `port` is the HTTPS server
-/// port, reconciled with Task 7's actual bind via
-/// [`DiscoveryShared::update_local_info`].
+/// fingerprint. `download` is false because the reverse-download endpoints
+/// are not implemented; it is independent of auto-save. The announced port
+/// is reconciled with the actual HTTPS bind.
 pub fn local_info_from_settings(settings: &Settings, fingerprint: &str) -> DeviceInfo {
     DeviceInfo {
         alias: settings.alias.clone(),
@@ -292,7 +297,7 @@ pub fn local_info_from_settings(settings: &Settings, fingerprint: &str) -> Devic
         fingerprint: fingerprint.to_string(),
         port: settings.port,
         protocol: "https".to_string(),
-        download: settings.auto_save,
+        download: false,
     }
 }
 
@@ -437,7 +442,9 @@ async fn handle_frame(state: &DiscoveryShared, bytes: &[u8], source: SocketAddr)
         // The register HTTP POST belongs to Task 9's sender http client;
         // queue the reply for that wiring.
         let our_info = state.snapshot_local_info();
-        state.queue_register_reply(source.ip().to_string(), info.port, our_info);
+        if let Ok(protocol) = crate::sender::validate_protocol(&info.protocol) {
+            state.queue_register_reply(source.ip().to_string(), info.port, protocol, our_info);
+        }
     }
 }
 
@@ -635,6 +642,62 @@ mod tests {
                 false,
             )),
         );
+    }
+
+    #[tokio::test]
+    async fn announced_http_peer_receives_register_over_its_protocol() {
+        use crate::event_bridge::WebEventBroadcaster;
+        use crate::test_peer::{observed, Peer, Response};
+        use std::sync::Arc;
+        let seen = observed();
+        let requests = Arc::clone(&seen);
+        let peer = Peer::http(move |request| {
+            requests.lock().unwrap().push(request);
+            Response::json(
+                200,
+                r#"{"alias":"HTTP fixture","version":"2.2","fingerprint":"http-peer"}"#,
+            )
+        });
+        let local = sample_info("local", "Local fixture");
+        let shared = Arc::new(super::DiscoveryShared::new(
+            local,
+            Arc::new(WebEventBroadcaster::new()),
+        ));
+        let frame = format!(
+            r#"{{"alias":"HTTP fixture","version":"2.2","fingerprint":"http-peer","port":{},"protocol":"http","announce":true}}"#,
+            peer.port
+        );
+        super::handle_frame(
+            &shared,
+            frame.as_bytes(),
+            "127.0.0.1:53317".parse().unwrap(),
+        )
+        .await;
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let run = tokio::spawn(crate::runtime::register_loop(
+            Arc::clone(&shared),
+            crate::sender::http_client(None).unwrap(),
+            cancel_rx,
+        ));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        while seen.lock().unwrap().is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        cancel_tx.send(true).unwrap();
+        run.await.unwrap();
+        let requests = seen.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "HTTP announcement must not trigger a TLS register request"
+        );
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/api/localsend/v2/register");
+        let devices = shared.devices.list();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].info.protocol, "http");
+        assert_eq!(devices[0].info.port, peer.port);
+        assert!(!devices[0].info.download);
     }
 
     #[test]

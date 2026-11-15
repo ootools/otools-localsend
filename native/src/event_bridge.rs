@@ -56,7 +56,7 @@ impl WebEventBroadcaster {
     }
 
     /// Approximate serialized cost of one entry: payload length plus the event
-    /// name (the `{"event":…, "data":…}` wrapper adds only constant overhead).
+    /// name (the `{"topic":…, "payload":…}` wrapper adds only constant overhead).
     fn entry_size(event: &str, data: &Value) -> usize {
         serde_json::to_vec(data)
             .map(|bytes| bytes.len())
@@ -91,15 +91,15 @@ impl WebEventBroadcaster {
         }
     }
 
-    /// Take all queued events in FIFO order as `{"event": <name>, "data":
-    /// <data>}` values and clear the queue.
+    /// Take queued events in the host's canonical `{"topic": <name>,
+    /// "payload": <data>}` envelope and clear the queue in FIFO order.
     pub fn drain(&self) -> Vec<Value> {
         let mut queue = self.queue.lock().unwrap_or_else(|error| error.into_inner());
         let entries = std::mem::take(&mut queue.entries);
         queue.bytes = 0;
         entries
             .into_iter()
-            .map(|entry| json!({"event": entry.event, "data": entry.data}))
+            .map(|entry| json!({"topic": entry.event, "payload": entry.data}))
             .collect()
     }
 
@@ -162,6 +162,86 @@ mod tests {
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
+    /// Characterization of the verified host parser: it aliases the name but
+    /// only reads payload, never the legacy data field.
+    fn host_parse(item: &serde_json::Value) -> (String, serde_json::Value) {
+        let object = item.as_object().expect("host event object");
+        let topic = object
+            .get("topic")
+            .or_else(|| object.get("event"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|topic| !topic.is_empty())
+            .expect("host topic");
+        (
+            topic.to_string(),
+            object
+                .get("payload")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    #[test]
+    fn actual_incoming_and_done_payloads_survive_host_parser() {
+        use crate::models::{DeviceInfo, FileEntry};
+        use crate::server::{prepare_upload, PrepareOutcome, ReceiveSessions};
+        use crate::settings::Settings;
+        use std::sync::Arc;
+
+        let legacy = json!({"event": "incoming-request", "data": {"sessionId": "legacy"}});
+        assert_eq!(
+            host_parse(&legacy),
+            ("incoming-request".into(), serde_json::Value::Null)
+        );
+
+        let directory = tempfile::tempdir().expect("isolated history");
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions =
+            ReceiveSessions::new(directory.path(), Arc::clone(&events)).expect("sessions");
+        let sender: DeviceInfo = serde_json::from_value(json!({
+            "alias": "Official fixture", "version": "2.2", "fingerprint": "fixture",
+            "port": 53317, "protocol": "https", "download": false
+        }))
+        .expect("sender fixture");
+        let file: FileEntry = serde_json::from_value(json!({
+            "id": "f", "fileName": "fixture.txt", "size": 12, "fileType": "text/plain"
+        }))
+        .expect("file fixture");
+        let outcome = prepare_upload(
+            &sessions,
+            &Settings::default(),
+            sender,
+            HashMap::from([("f".into(), file)]),
+            None,
+            "127.0.0.1".parse().unwrap(),
+        );
+        let (session_id, _decision) = match outcome {
+            PrepareOutcome::AwaitDecision {
+                session_id,
+                decision_rx,
+            } => (session_id, decision_rx),
+            PrepareOutcome::Immediate { .. } => panic!("manual receive must wait"),
+        };
+        sessions
+            .session_decline(&session_id)
+            .expect("decline fixture");
+        let drained = events.drain();
+        assert_eq!(drained.len(), 2, "actual incoming and terminal events");
+        let (topic, payload) = host_parse(&drained[0]);
+        assert_eq!(topic, "incoming-request");
+        assert_eq!(payload["sessionId"], session_id);
+        assert_eq!(payload["sender"]["alias"], "Official fixture");
+        assert_eq!(payload["files"][0]["fileName"], "fixture.txt");
+        let (topic, payload) = host_parse(&drained[1]);
+        assert_eq!(topic, "transfer-done");
+        assert_eq!(payload["sessionId"], session_id);
+        assert_eq!(payload["status"], "cancelled");
+        assert!(drained
+            .iter()
+            .all(|item| item.get("event").is_none() && item.get("data").is_none()));
+    }
+
     #[test]
     fn drain_returns_sent_events_in_order() {
         let broadcaster = WebEventBroadcaster::new();
@@ -173,11 +253,11 @@ mod tests {
         assert_eq!(drained.len(), 2);
         assert_eq!(
             drained[0],
-            json!({"event": "device-found", "data": {"alias": "测试机"}})
+            json!({"topic": "device-found", "payload": {"alias": "测试机"}})
         );
         assert_eq!(
             drained[1],
-            json!({"event": "transfer-done", "data": {"sessionId": "s1"}})
+            json!({"topic": "transfer-done", "payload": {"sessionId": "s1"}})
         );
         assert!(broadcaster.drain().is_empty(), "drain must clear the queue");
     }
@@ -192,8 +272,11 @@ mod tests {
 
         let drained = broadcaster.drain();
         assert_eq!(drained.len(), 2048);
-        assert_eq!(drained[0], json!({"event": "tick", "data": {"i": 53}}));
-        assert_eq!(drained[2047], json!({"event": "tick", "data": {"i": 2100}}));
+        assert_eq!(drained[0], json!({"topic": "tick", "payload": {"i": 53}}));
+        assert_eq!(
+            drained[2047],
+            json!({"topic": "tick", "payload": {"i": 2100}})
+        );
     }
 
     #[test]
@@ -219,12 +302,12 @@ mod tests {
             drained.len()
         );
         assert_eq!(
-            drained.last().expect("non-empty")["data"]["i"].as_u64(),
+            drained.last().expect("non-empty")["payload"]["i"].as_u64(),
             Some(6),
             "newest event must survive"
         );
         assert!(
-            drained[0]["data"]["i"].as_u64().expect("index") > 1,
+            drained[0]["payload"]["i"].as_u64().expect("index") > 1,
             "oldest events must be dropped first"
         );
         assert!(broadcaster.dropped() >= 1, "evictions must be counted");
@@ -282,6 +365,10 @@ mod tests {
             start + Duration::from_millis(450),
         );
         assert_eq!(later, Some(json!({"p": 1})));
-        assert_eq!(pending.len(), 2, "one pending entry per (sessionId, fileId)");
+        assert_eq!(
+            pending.len(),
+            2,
+            "one pending entry per (sessionId, fileId)"
+        );
     }
 }

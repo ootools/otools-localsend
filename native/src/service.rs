@@ -342,6 +342,7 @@ impl ServiceController {
         &self,
         ip: String,
         port: u16,
+        protocol: Option<String>,
         items: Vec<SendItem>,
         pin: Option<String>,
     ) -> Result<String, String> {
@@ -354,7 +355,7 @@ impl ServiceController {
             .as_ref()
             .ok_or("LocalSend service is not running")?;
         let sender = generation.sender().ok_or("LocalSend sender is not ready")?;
-        let (id, run) = sender::start_send(sender, ip, port, items, pin)?;
+        let (id, run) = sender::start_send_with_protocol(sender, ip, port, protocol, items, pin)?;
         let mut outbound = generation
             .outbound
             .lock()
@@ -422,6 +423,7 @@ impl ServiceController {
             })?;
         let socket = tokio::net::UdpSocket::from_std(socket)
             .map_err(|error| format!("UDP socket: {error}"))?;
+        let client = sender::http_client(Some(&cert))?;
         {
             let mut inner = self.lock();
             if inner
@@ -449,6 +451,7 @@ impl ServiceController {
                 Arc::clone(&self.events),
                 Arc::clone(&discovery),
                 Arc::clone(&generation.scope),
+                client.clone(),
             ));
             *generation
                 .discovery
@@ -476,7 +479,7 @@ impl ServiceController {
             )));
             tasks.push(self.runtime.spawn(crate::runtime::register_loop(
                 Arc::clone(&discovery),
-                sender::http_client(),
+                client,
                 generation.scope.subscribe(),
             )));
             let controller = Arc::clone(self);

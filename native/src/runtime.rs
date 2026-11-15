@@ -1,6 +1,6 @@
 use crate::discovery::{DeviceEntry, DiscoveryShared};
 use crate::event_bridge::WebEventBroadcaster;
-use crate::models::DeviceInfo;
+use crate::models::RegisterResponse;
 use crate::sender::{self, SendItem};
 use crate::server::{self, ReceiveSessions};
 use crate::service::{wait_cancelled, ServiceController};
@@ -221,6 +221,7 @@ fn invoke_plugin(
             Ok(json!({}))
         }
         "send_files" => {
+            let protocol = optional_protocol(&payload)?;
             let ip = require_ip(&payload)?;
             let port = require_port(&payload)?;
             let files = payload
@@ -243,10 +244,11 @@ fn invoke_plugin(
                 .map(str::to_string);
             // Spawn and answer immediately: the session id is generated
             // locally and the job registered synchronously by `start_send`.
-            let session_id = plugin.service.send(ip, port, items, pin)?;
+            let session_id = plugin.service.send(ip, port, protocol, items, pin)?;
             Ok(json!({ "sessionId": session_id }))
         }
         "send_text" => {
+            let protocol = optional_protocol(&payload)?;
             let ip = require_ip(&payload)?;
             let port = require_port(&payload)?;
             let text = payload
@@ -259,9 +261,10 @@ fn invoke_plugin(
                 .get("pin")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let session_id = plugin
-                .service
-                .send(ip, port, vec![SendItem::Text(text)], pin)?;
+            let session_id =
+                plugin
+                    .service
+                    .send(ip, port, protocol, vec![SendItem::Text(text)], pin)?;
             Ok(json!({ "sessionId": session_id }))
         }
         "transfer_list" => Ok(json!({
@@ -269,6 +272,16 @@ fn invoke_plugin(
         })),
         "server_status" => Ok(json!(plugin.service.status())),
         _ => Err(format!("unknown method: {method}")),
+    }
+}
+
+fn optional_protocol(payload: &Value) -> Result<Option<String>, String> {
+    match payload.get("protocol") {
+        None => Ok(None),
+        Some(Value::String(protocol)) => {
+            sender::validate_protocol(protocol).map(|protocol| Some(protocol.into()))
+        }
+        Some(_) => Err("payload.protocol must be http or https".into()),
     }
 }
 
@@ -339,13 +352,13 @@ pub(crate) async fn register_loop(
 ) {
     let run = async {
         loop {
-            for (ip, port, our_info) in shared.take_register_replies() {
+            for (ip, port, protocol, our_info) in shared.take_register_replies() {
                 if port == 0 {
                     // A peer announcing port 0 has no HTTPS listener (send-only
                     // announce); there is nothing to register against.
                     continue;
                 }
-                let url = format!("https://{ip}:{port}{}/register", sender::API_ROOT);
+                let url = format!("{protocol}://{ip}:{port}{}/register", sender::API_ROOT);
                 let result = client
                     .post(&url)
                     .json(&our_info)
@@ -354,9 +367,11 @@ pub(crate) async fn register_loop(
                     .await;
                 match result {
                     Ok(response) if response.status().as_u16() == 200 => {
-                        match response.json::<DeviceInfo>().await {
-                            Ok(info) => match ip.parse::<IpAddr>() {
+                        match response.json::<RegisterResponse>().await {
+                            Ok(response_info) => match ip.parse::<IpAddr>() {
                                 Ok(source_ip) => {
+                                    let info =
+                                        response_info.into_device_info(port, protocol.into());
                                     let is_new = shared.devices.upsert(info.clone(), source_ip);
                                     if is_new {
                                         let entry = serde_json::to_value(DeviceEntry {
@@ -430,6 +445,8 @@ mod tests {
     use std::net::{Ipv4Addr, TcpListener, UdpSocket};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    static FIXED_PORT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn local_plugin() -> (PluginRuntime, tempfile::TempDir) {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -506,6 +523,391 @@ mod tests {
         assert_ne!(udp, 0);
         let _tcp = TcpListener::bind((Ipv4Addr::UNSPECIFIED, tcp)).expect("old TCP port released");
         let _udp = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, udp)).expect("old UDP port released");
+    }
+
+    #[test]
+    fn official_prepare_without_download_reaches_real_handler() {
+        let (mut plugin, _temp) = local_plugin();
+        call(&mut plugin, "start_localsend", json!({}));
+        let running = wait_state(&mut plugin, "running");
+        let port = running["port"].as_u64().unwrap();
+        let client = crate::sender::http_client(None).expect("test HTTP client");
+        // Literal protocol fixture, not serialized from our own DTO.
+        let request = plugin.runtime.spawn(async move {
+            client
+                .post(format!("https://127.0.0.1:{port}/api/localsend/v2/prepare-upload"))
+                .json(&json!({
+                    "info": {"alias": "Official fixture", "version": "2.2", "fingerprint": "fixture",
+                        "port": 53317, "protocol": "https"},
+                    "files": {"f": {"id": "f", "fileName": "fixture.txt", "size": 12,
+                        "fileType": "text/plain"}}
+                }))
+                .send().await.expect("prepare response").status().as_u16()
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while plugin.receive.active_count() == 0
+            && !request.is_finished()
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let records = plugin.receive.transfer_records();
+        if let Some(record) = records.first() {
+            call(
+                &mut plugin,
+                "session_accept",
+                json!({"sessionId": record.session_id, "fileIds": []}),
+            );
+        }
+        call(&mut plugin, "stop_localsend", json!({"force": true}));
+        wait_state(&mut plugin, "stopped");
+        let status = plugin.runtime.block_on(request).expect("request task");
+        plugin.shutdown();
+        assert_eq!(
+            status, 204,
+            "valid omitted download must reach manual acceptance, not JSON rejection"
+        );
+        assert_eq!(records.len(), 1, "actual handler stored a session");
+        assert_eq!(records[0].status, crate::models::TransferStatus::Pending);
+    }
+
+    #[test]
+    fn register_and_info_respond_with_official_minimal_fields() {
+        let (mut plugin, _temp) = local_plugin();
+        call(&mut plugin, "start_localsend", json!({}));
+        let running = wait_state(&mut plugin, "running");
+        let port = running["port"].as_u64().unwrap();
+        let client = crate::sender::http_client(None).expect("test HTTP client");
+        let responses = plugin.runtime.block_on(async {
+            let register = client.post(format!("https://127.0.0.1:{port}/api/localsend/v2/register"))
+                .json(&json!({"alias":"Official peer", "version":"2.1", "fingerprint":"peer", "port":53317,
+                    "protocol":"https", "download":false})).send().await.expect("register")
+                .json::<Value>().await.expect("register JSON");
+            let info = client.get(format!("https://127.0.0.1:{port}/api/localsend/v2/info"))
+                .send().await.expect("info").json::<Value>().await.expect("info JSON");
+            [register, info]
+        });
+        plugin.shutdown();
+        for response in responses {
+            assert!(response["alias"].is_string());
+            assert_eq!(response["version"], "2.2");
+            assert!(response["fingerprint"].is_string());
+            assert_eq!(response["download"], false);
+            assert!(
+                response.get("port").is_none(),
+                "official response uses the known target port"
+            );
+            assert!(
+                response.get("protocol").is_none(),
+                "official response uses the known target protocol"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn official_register_response_merges_contacted_port_and_protocol() {
+        use crate::discovery::DiscoveryShared;
+        use crate::event_bridge::WebEventBroadcaster;
+        use crate::test_peer::{Peer, Response};
+        let peer = Peer::https(None, |request| {
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.path, "/api/localsend/v2/register");
+            Response::json(
+                200,
+                r#"{"alias":"Official 1.17 fixture","version":"2.1","fingerprint":"official","download":false}"#,
+            )
+        });
+        let our_info = crate::discovery::local_info_from_settings(&Settings::default(), "local");
+        let shared = Arc::new(DiscoveryShared::new(
+            our_info.clone(),
+            Arc::new(WebEventBroadcaster::new()),
+        ));
+        shared.queue_register_reply("127.0.0.1".into(), peer.port, "https", our_info);
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let run = tokio::spawn(super::register_loop(
+            Arc::clone(&shared),
+            crate::sender::http_client(None).expect("test HTTP client"),
+            cancel_rx,
+        ));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while shared.devices.list().is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        cancel_tx.send(true).unwrap();
+        run.await.expect("register loop stopped");
+        let devices = shared.devices.list();
+        assert_eq!(
+            devices.len(),
+            1,
+            "official minimal response must decode without port/protocol"
+        );
+        assert_eq!(devices[0].info.alias, "Official 1.17 fixture");
+        assert_eq!(
+            devices[0].info.port, peer.port,
+            "retain contacted fallback port, not 53317/0"
+        );
+        assert_eq!(devices[0].info.protocol, "https");
+        assert!(!devices[0].info.download);
+    }
+
+    #[test]
+    fn production_sender_presents_its_announced_certificate_to_modern_tls_peer() {
+        use crate::test_peer::{observed, Peer, Response};
+        let (mut plugin, _temp) = local_plugin();
+        call(&mut plugin, "start_localsend", json!({}));
+        let running = wait_state(&mut plugin, "running");
+        let fingerprint = running["fingerprint"].as_str().unwrap().to_string();
+        let requests = observed();
+        let observed_requests = Arc::clone(&requests);
+        let peer = Peer::https(Some(fingerprint.clone()), move |request| {
+            let response = if request.path == "/api/localsend/v2/prepare-upload" {
+                Response::json(204, "")
+            } else {
+                Response::json(404, "")
+            };
+            observed_requests.lock().unwrap().push(request);
+            response
+        });
+        let sent = call(
+            &mut plugin,
+            "send_text",
+            json!({
+                "ip":"127.0.0.1", "port":peer.port, "text":"hello world!"
+            }),
+        );
+        let id = sent["sessionId"].as_str().unwrap();
+        let record = wait_terminal_record(&plugin, id);
+        plugin.shutdown();
+        assert_eq!(
+            record.status,
+            crate::models::TransferStatus::Done,
+            "mandatory client-certificate TLS must reach prepare, not fail before HTTP"
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "message acknowledgement requires no upload"
+        );
+        assert_eq!(
+            requests[0].client_fingerprint.as_deref(),
+            Some(fingerprint.as_str()),
+            "outgoing identity is the same certificate advertised by the service"
+        );
+        let body: Value = serde_json::from_slice(&requests[0].body).expect("prepare JSON");
+        assert_eq!(body["info"]["fingerprint"], fingerprint);
+        let file = body["files"].as_object().unwrap().values().next().unwrap();
+        assert_eq!(file["fileType"], "text/plain");
+        assert_eq!(file["preview"], "hello world!");
+    }
+
+    fn wait_terminal_record(plugin: &PluginRuntime, id: &str) -> crate::models::TransferRecord {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let record = plugin
+                .receive
+                .transfer_records()
+                .into_iter()
+                .find(|record| record.session_id == id)
+                .expect("registered send");
+            if record.status.is_terminal() || Instant::now() >= deadline {
+                return record;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn public_send_protocol_honors_http_prepare_and_upload() {
+        use crate::test_peer::{observed, Peer, Response};
+        let (mut plugin, directory) = local_plugin();
+        call(&mut plugin, "start_localsend", json!({}));
+        wait_state(&mut plugin, "running");
+        let requests = observed();
+        let observed_requests = Arc::clone(&requests);
+        let peer = Peer::http(move |request| {
+            let response = if request.path == "/api/localsend/v2/prepare-upload" {
+                let body: Value = serde_json::from_slice(&request.body).expect("prepare JSON");
+                let files: serde_json::Map<String, Value> = body["files"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(|id| (id.clone(), json!("fixture-token")))
+                    .collect();
+                Response::json(
+                    200,
+                    &json!({"sessionId":"remote-http", "files":files}).to_string(),
+                )
+            } else if request.path.starts_with("/api/localsend/v2/upload?") {
+                Response::json(200, "")
+            } else {
+                Response::json(404, "")
+            };
+            observed_requests.lock().unwrap().push(request);
+            response
+        });
+        let file = directory.path().join("send.txt");
+        std::fs::write(&file, b"hello world!").unwrap();
+        for (method, extra) in [
+            ("send_text", json!({"text":"hello world!"})),
+            ("send_files", json!({"files":[{"path":file}]})),
+        ] {
+            let mut payload = json!({"ip":"127.0.0.1", "port":peer.port, "protocol":"http"});
+            payload
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let sent = call(&mut plugin, method, payload);
+            let record = wait_terminal_record(&plugin, sent["sessionId"].as_str().unwrap());
+            assert_eq!(
+                record.status,
+                crate::models::TransferStatus::Done,
+                "public {method} must use the selected HTTP peer rather than TLS"
+            );
+        }
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.path == "/api/localsend/v2/prepare-upload")
+                .count(),
+            2
+        );
+        let uploads: Vec<_> = requests
+            .iter()
+            .filter(|request| request.path.starts_with("/api/localsend/v2/upload?"))
+            .collect();
+        assert_eq!(uploads.len(), 2);
+        assert!(uploads
+            .iter()
+            .all(|request| request.body == b"hello world!"));
+        drop(requests);
+        plugin.shutdown();
+    }
+
+    #[test]
+    fn missing_send_protocol_uses_exact_discovered_endpoint() {
+        use crate::test_peer::{Peer, Response};
+        let (mut plugin, _temp) = local_plugin();
+        call(&mut plugin, "start_localsend", json!({}));
+        wait_state(&mut plugin, "running");
+        let peer = Peer::http(|request| {
+            assert_eq!(request.path, "/api/localsend/v2/prepare-upload");
+            Response::json(204, "")
+        });
+        let shared = plugin.service.discovery().expect("running discovery");
+        let mut info = shared.snapshot_local_info();
+        info.fingerprint = "discovered-http".into();
+        info.alias = "Discovered HTTP peer".into();
+        info.port = peer.port;
+        info.protocol = "http".into();
+        shared.devices.upsert(info, Ipv4Addr::LOCALHOST.into());
+        let sent = call(
+            &mut plugin,
+            "send_text",
+            json!({"ip":"127.0.0.1", "port":peer.port, "text":"hello world!"}),
+        );
+        let record = wait_terminal_record(&plugin, sent["sessionId"].as_str().unwrap());
+        plugin.shutdown();
+        assert_eq!(
+            record.status,
+            crate::models::TransferStatus::Done,
+            "missing protocol must retain known peer scheme"
+        );
+        assert_eq!(record.peer_alias, "Discovered HTTP peer");
+    }
+
+    #[test]
+    fn invalid_public_protocol_is_rejected_before_registering_send() {
+        let (mut plugin, _temp) = local_plugin();
+        call(&mut plugin, "start_localsend", json!({}));
+        wait_state(&mut plugin, "running");
+        let mut rejected = Vec::new();
+        for protocol in [
+            json!("ftp"),
+            json!("https://user:password@127.0.0.1"),
+            json!("HTTPS"),
+            json!(null),
+            json!(7),
+        ] {
+            for method in ["send_text", "send_files"] {
+                rejected.push(invoke_plugin(
+                    &mut plugin,
+                    method,
+                    json!({
+                        "ip":"127.0.0.1", "port":53317, "protocol":protocol,
+                        "text":"hello world!", "files":[{"path":"not-a-file"}]
+                    }),
+                ));
+            }
+        }
+        let records = plugin.receive.transfer_records();
+        plugin.shutdown();
+        for result in rejected {
+            let error = result.expect_err("invalid protocol must fail before job registration");
+            assert!(
+                error.contains("protocol"),
+                "safe protocol validation, not file/network error: {error}"
+            );
+            assert!(!error.contains("password"));
+        }
+        assert!(
+            records.is_empty(),
+            "rejected protocols must not create transfer records"
+        );
+    }
+
+    #[test]
+    fn auto_save_does_not_advertise_an_unimplemented_download_api() {
+        let (mut plugin, _temp) = local_plugin();
+        let mut settings = call(&mut plugin, "settings_get", json!({}));
+        settings["autoSave"] = json!(true);
+        call(&mut plugin, "settings_set", json!({"settings":settings}));
+        call(&mut plugin, "start_localsend", json!({}));
+        let running = wait_state(&mut plugin, "running");
+        let announced = plugin.service.discovery().unwrap().snapshot_local_info();
+        let port = running["port"].as_u64().unwrap();
+        let info = plugin.runtime.block_on(async {
+            crate::sender::http_client(None)
+                .unwrap()
+                .get(format!("https://127.0.0.1:{port}/api/localsend/v2/info"))
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        });
+        plugin.shutdown();
+        assert!(
+            !announced.download,
+            "download means reverse-download routes, not auto-save"
+        );
+        assert_eq!(info["download"], false);
+    }
+
+    #[test]
+    fn production_identity_stays_compatible_with_legacy_https_receiver() {
+        use crate::test_peer::{Peer, Response};
+        let (mut plugin, _temp) = local_plugin();
+        call(&mut plugin, "start_localsend", json!({}));
+        wait_state(&mut plugin, "running");
+        let peer = Peer::https(None, |request| {
+            assert_eq!(request.path, "/api/localsend/v2/prepare-upload");
+            Response::json(204, "")
+        });
+        let sent = call(
+            &mut plugin,
+            "send_text",
+            json!({"ip":"127.0.0.1", "port":peer.port, "text":"hello world!"}),
+        );
+        let record = wait_terminal_record(&plugin, sent["sessionId"].as_str().unwrap());
+        plugin.shutdown();
+        assert_eq!(
+            record.status,
+            crate::models::TransferStatus::Done,
+            "1.17-style server without client-auth request remains compatible"
+        );
     }
 
     #[test]
@@ -605,8 +1007,8 @@ mod tests {
             .broadcaster
             .drain()
             .into_iter()
-            .filter(|event| event["event"] == "server-status")
-            .map(|event| event["data"].clone())
+            .filter(|event| event["topic"] == "server-status")
+            .map(|event| event["payload"].clone())
             .collect();
         assert!(!snapshots.is_empty());
         for snapshot in &snapshots {
@@ -740,7 +1142,7 @@ mod tests {
             .broadcaster
             .drain()
             .into_iter()
-            .filter(|event| event["event"] == "transfer-done")
+            .filter(|event| event["topic"] == "transfer-done")
             .count();
         assert_eq!(done, 1);
         plugin.shutdown();
@@ -847,7 +1249,7 @@ mod tests {
         let (mut plugin, _temp) = local_plugin();
         call(&mut plugin, "start_localsend", json!({}));
         let running = wait_state(&mut plugin, "running");
-        let client = crate::sender::http_client();
+        let client = crate::sender::http_client(None).expect("test HTTP client");
         let port = running["port"].as_u64().unwrap();
         let request = plugin.runtime.spawn(async move {
             client.post(format!("https://127.0.0.1:{port}/api/localsend/v2/prepare-upload"))
@@ -891,7 +1293,7 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|event| event["event"] == "transfer-done")
+                .filter(|event| event["topic"] == "transfer-done")
                 .count(),
             1
         );
@@ -947,7 +1349,7 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|event| event["event"] == "transfer-done")
+                .filter(|event| event["topic"] == "transfer-done")
                 .count(),
             1
         );
@@ -1136,7 +1538,7 @@ mod tests {
                 .broadcaster
                 .drain()
                 .into_iter()
-                .filter(|event| event["event"] == "transfer-done")
+                .filter(|event| event["topic"] == "transfer-done")
                 .count(),
             1
         );
@@ -1146,6 +1548,9 @@ mod tests {
 
     #[test]
     fn saved_port_applies_only_on_next_start() {
+        let _ports = FIXED_PORT_TESTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let (mut plugin, _temp) = local_plugin();
         call(&mut plugin, "start_localsend", json!({}));
         let running = wait_state(&mut plugin, "running");
@@ -1176,6 +1581,9 @@ mod tests {
 
     #[test]
     fn bind_failure_is_failed_and_retries_after_resources_quiesce() {
+        let _ports = FIXED_PORT_TESTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let (mut plugin, _temp) = local_plugin();
         let (port, blockers) = (30000..60000)
             .step_by(23)

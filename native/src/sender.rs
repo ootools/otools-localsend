@@ -6,10 +6,10 @@
 //! stay separate from plain, directly testable pieces (`build_entry`,
 //! [`SendSessions::report_progress`], the prepare/upload outcome switches), so
 //! the unit tests drive the same code paths over plain HTTP (`scheme: "http"`)
-//! against tiny axum servers. Production always talks `https://` with a
-//! self-signed-tolerant rustls client — `danger_accept_invalid_certs(true)`,
-//! aligned with the official app (the certificate fingerprint is only used by
-//! the discovery layer to dedupe devices).
+//! against tiny axum servers. Production honors the peer's HTTP/HTTPS
+//! protocol; HTTPS uses the service certificate as client identity and a
+//! self-signed-tolerant rustls client (`danger_accept_invalid_certs(true)`).
+//! The fingerprint remains the discovery layer's device deduplication key.
 //!
 //! Protocol facts (localsend/protocol v2.2 + official app behavior):
 //! - `POST /api/localsend/v2/prepare-upload?pin=` carries `{info, files}` and
@@ -40,12 +40,14 @@
 //!   percent; the final 100% tick is emitted with the file's success so no
 //!   last tick is stranded in the pending map (Task 5 review handoff).
 
-use crate::crypto::sha256_hex;
+use crate::crypto::{sha256_hex, CertMaterial};
 use crate::discovery::{DiscoveryShared, PROTOCOL_VERSION};
 use crate::event_bridge::{coalesce_progress, WebEventBroadcaster};
 use crate::models::{DeviceInfo, Direction, FileEntry, Metadata, TransferRecord, TransferStatus};
 use crate::server::ReceiveSessions;
 use crate::service::ServiceScope;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -78,17 +80,39 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_CHUNK: usize = 64 * 1024;
 
 /// reqwest client for every outbound v2 exchange: rustls, self-signed
-/// certificates accepted (official behavior), 5s connect timeout and NO
-/// default total timeout — per-request timeouts are applied only to the
-/// short best-effort calls.
-pub fn http_client() -> reqwest::Client {
+/// certificates accepted, LAN proxies disabled, 5s connect timeout and NO
+/// default total timeout. Production supplies the service's identity; isolated
+/// tests may omit it. Only short best-effort calls set a total timeout.
+pub fn http_client(cert: Option<&CertMaterial>) -> Result<reqwest::Client, String> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .use_rustls_tls()
         .danger_accept_invalid_certs(true)
-        .connect_timeout(CONNECT_TIMEOUT)
+        .no_proxy()
+        .connect_timeout(CONNECT_TIMEOUT);
+    if let Some(cert) = cert {
+        // The same identity served and announced by this generation. Never log
+        // this PEM or create another certificate just for the client.
+        let pem = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            STANDARD.encode(&cert.key_der),
+            STANDARD.encode(&cert.cert_der),
+        );
+        let identity = reqwest::Identity::from_pem(pem.as_bytes())
+            .map_err(|_| "TLS client identity is invalid".to_string())?;
+        builder = builder.identity(identity);
+    }
+    builder
         .build()
-        .expect("reqwest client builds")
+        .map_err(|_| "TLS HTTP client setup failed".to_string())
+}
+
+pub fn validate_protocol(protocol: &str) -> Result<&'static str, String> {
+    match protocol {
+        "http" => Ok("http"),
+        "https" => Ok("https"),
+        _ => Err("payload.protocol must be http or https".into()),
+    }
 }
 
 /// One item the user wants to send.
@@ -105,6 +129,7 @@ pub enum SendItem {
 pub struct SendPeer {
     pub ip: String,
     pub port: u16,
+    pub protocol: &'static str,
     /// Best-known alias (from the device table) for the history record.
     pub alias: String,
 }
@@ -152,12 +177,12 @@ enum SendSource {
 type PendingProgress = HashMap<(String, String), (u32, Value, Instant)>;
 
 /// Per-file result feeding the session's final status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum FileOutcome {
     Uploaded,
     /// The receiver's response did not carry a token for this file.
     Skipped,
-    Failed,
+    Failed(String),
 }
 
 /// State shared by all outbound jobs: the session registry behind
@@ -170,8 +195,8 @@ pub struct SendSessions {
     receive: Arc<ReceiveSessions>,
     discovery: Option<Arc<DiscoveryShared>>,
     client: reqwest::Client,
-    /// "https" in production; "http" in the unit tests, which drive the same
-    /// code paths against plain axum servers.
+    /// Fallback protocol when neither an explicit argument nor a discovered
+    /// endpoint exists: HTTPS in production, HTTP in isolated unit tests.
     scheme: &'static str,
     scope: Option<Arc<ServiceScope>>,
 }
@@ -181,8 +206,9 @@ impl SendSessions {
         receive: Arc<ReceiveSessions>,
         events: Arc<WebEventBroadcaster>,
         discovery: Option<Arc<DiscoveryShared>>,
+        client: reqwest::Client,
     ) -> Self {
-        Self::build("https", receive, events, discovery)
+        Self::build("https", receive, events, discovery, client)
     }
 
     pub(crate) fn in_service(
@@ -190,8 +216,9 @@ impl SendSessions {
         events: Arc<WebEventBroadcaster>,
         discovery: Arc<DiscoveryShared>,
         scope: Arc<ServiceScope>,
+        client: reqwest::Client,
     ) -> Self {
-        let mut sessions = Self::new(receive, events, Some(discovery));
+        let mut sessions = Self::new(receive, events, Some(discovery), client);
         sessions.scope = Some(scope);
         sessions
     }
@@ -202,7 +229,13 @@ impl SendSessions {
         events: Arc<WebEventBroadcaster>,
         scheme: &'static str,
     ) -> Self {
-        Self::build(scheme, receive, events, None)
+        Self::build(
+            scheme,
+            receive,
+            events,
+            None,
+            http_client(None).expect("test HTTP client"),
+        )
     }
 
     fn build(
@@ -210,6 +243,7 @@ impl SendSessions {
         receive: Arc<ReceiveSessions>,
         events: Arc<WebEventBroadcaster>,
         discovery: Option<Arc<DiscoveryShared>>,
+        client: reqwest::Client,
     ) -> Self {
         Self {
             jobs: Mutex::new(HashMap::new()),
@@ -217,7 +251,7 @@ impl SendSessions {
             events,
             receive,
             discovery,
-            client: http_client(),
+            client,
             scheme,
             scope: None,
         }
@@ -244,11 +278,38 @@ impl SendSessions {
     /// Best-known alias for a peer, falling back to `ip:port`.
     fn peer_alias(&self, ip: &str, port: u16) -> String {
         if let Some(discovery) = &self.discovery {
-            if let Some(entry) = discovery.devices.list().into_iter().find(|e| e.ip == ip) {
+            if let Some(entry) = discovery
+                .devices
+                .list()
+                .into_iter()
+                .find(|e| e.ip == ip && e.info.port == port)
+            {
                 return entry.info.alias;
             }
         }
         format!("{ip}:{port}")
+    }
+
+    fn peer_protocol(
+        &self,
+        ip: &str,
+        port: u16,
+        protocol: Option<&str>,
+    ) -> Result<&'static str, String> {
+        if let Some(protocol) = protocol {
+            return validate_protocol(protocol);
+        }
+        if let Some(discovery) = &self.discovery {
+            if let Some(peer) = discovery
+                .devices
+                .list()
+                .into_iter()
+                .find(|entry| entry.ip == ip && entry.info.port == port)
+            {
+                return validate_protocol(&peer.info.protocol);
+            }
+        }
+        validate_protocol(self.scheme)
     }
 
     /// UI cancel of an outbound session: flips the job's cancel flag. The job
@@ -350,10 +411,26 @@ impl SendSessions {
     /// history record to its final status, emit `transfer-done` and evict the
     /// job from the registry (official drops the slot on completion).
     fn finalize_job(&self, job: &SendJob, status: TransferStatus) {
+        let error = if status == TransferStatus::Failed {
+            Some("Transfer task stopped before completion".into())
+        } else {
+            None
+        };
+        self.finalize_job_with_error(job, status, error);
+    }
+
+    fn finalize_job_with_error(
+        &self,
+        job: &SendJob,
+        status: TransferStatus,
+        error: Option<String>,
+    ) {
         if job.finalized.swap(true, Ordering::SeqCst) {
             return;
         }
         self.cleanup_progress(&job.session_id);
+        self.receive
+            .set_send_feedback(&job.session_id, "finished", error.clone());
         self.receive.set_send_record(&job.session_id, status, None);
         let status_name = match status {
             TransferStatus::Done => "done",
@@ -362,7 +439,7 @@ impl SendSessions {
         };
         self.events.send(
             "transfer-done",
-            json!({ "sessionId": job.session_id, "status": status_name }),
+            json!({ "sessionId": job.session_id, "status": status_name, "stage": "finished", "error": error }),
         );
         self.jobs
             .lock()
@@ -403,6 +480,20 @@ pub fn start_send(
     items: Vec<SendItem>,
     pin: Option<String>,
 ) -> Result<(String, impl Future<Output = ()> + Send + 'static), String> {
+    start_send_with_protocol(state, peer_ip, peer_port, None, items, pin)
+}
+
+/// Explicit protocol from a new caller, or the exact discovered endpoint for
+/// older callers. Validation runs before any transfer history is registered.
+pub fn start_send_with_protocol(
+    state: Arc<SendSessions>,
+    peer_ip: String,
+    peer_port: u16,
+    protocol: Option<String>,
+    items: Vec<SendItem>,
+    pin: Option<String>,
+) -> Result<(String, impl Future<Output = ()> + Send + 'static), String> {
+    let protocol = state.peer_protocol(&peer_ip, peer_port, protocol.as_deref())?;
     if items.is_empty() {
         return Err("no items to send".into());
     }
@@ -427,6 +518,7 @@ pub fn start_send(
     let peer = SendPeer {
         ip: peer_ip,
         port: peer_port,
+        protocol,
         alias,
     };
     let file_ids: Vec<String> = entries_sources
@@ -461,6 +553,8 @@ pub fn start_send(
             .map(|(entry, _)| entry.clone())
             .collect(),
         status: TransferStatus::Pending,
+        stage: Some("preparing".into()),
+        error: None,
         created_at: now_ms(),
         destinations: HashMap::new(),
     });
@@ -611,7 +705,7 @@ async fn run_send_job(
     let mut prepared: Vec<(FileEntry, SendSource)> = Vec::with_capacity(entries_sources.len());
     for (entry, source) in entries_sources {
         if job.is_cancelled() {
-            results.insert(entry.id, FileOutcome::Failed);
+            results.insert(entry.id, FileOutcome::Failed("Transfer cancelled".into()));
             continue;
         }
         if let SendSource::File(path) = &source {
@@ -623,8 +717,9 @@ async fn run_send_job(
                         prepared.push((hashed, source));
                     }
                     Err(error) => {
-                        eprintln!("otools-localsend sender: hash {}: {error}", path.display());
-                        results.insert(entry.id, FileOutcome::Failed);
+                        let error = format!("File hashing failed: {error}");
+                        eprintln!("otools-localsend sender: {error}");
+                        results.insert(entry.id, FileOutcome::Failed(error));
                     }
                 }
                 continue;
@@ -638,7 +733,11 @@ async fn run_send_job(
         return;
     }
     if prepared.is_empty() {
-        state.finalize_job(&job, TransferStatus::Failed);
+        let error = results.values().find_map(|outcome| match outcome {
+            FileOutcome::Failed(error) => Some(error.clone()),
+            _ => None,
+        });
+        state.finalize_job_with_error(&job, TransferStatus::Failed, error);
         return;
     }
     // Refresh the history record with the hashed entries before the request.
@@ -648,13 +747,16 @@ async fn run_send_job(
         Some(prepared.iter().map(|(entry, _)| entry.clone()).collect()),
     );
 
+    state
+        .receive
+        .set_send_feedback(&session_id, "waiting", None);
     // Phase 2 — prepare-upload. Metadata only, NO total timeout (the official
     // receiver holds the response until a user decides).
     let mut builder = state
         .client
         .post(format!(
             "{}://{}:{}{API_ROOT}/prepare-upload",
-            state.scheme, job.peer.ip, job.peer.port
+            job.peer.protocol, job.peer.ip, job.peer.port
         ))
         .json(&json!({
             "info": state.local_info(),
@@ -677,7 +779,7 @@ async fn run_send_job(
         _ = wait_cancelled(&mut cancel_rx) => Prepare::Cancelled,
         result = builder.send() => match result {
             Ok(response) => Prepare::Response(response),
-            Err(error) => Prepare::Network(error.to_string()),
+            Err(error) => Prepare::Network(network_error("prepare-upload", &job.peer, error)),
         },
     };
 
@@ -690,11 +792,8 @@ async fn run_send_job(
             return;
         }
         Prepare::Network(error) => {
-            eprintln!(
-                "otools-localsend sender: prepare {}:{}: {error}",
-                job.peer.ip, job.peer.port
-            );
-            state.finalize_job(&job, TransferStatus::Failed);
+            eprintln!("otools-localsend sender: {error}");
+            state.finalize_job_with_error(&job, TransferStatus::Failed, Some(error));
             return;
         }
         Prepare::Response(response) => {
@@ -712,19 +811,45 @@ async fn run_send_job(
                         return;
                     }
                     Some(Ok(payload)) => {
-                        let remote_session = payload
+                        let Some(remote_session) = payload
                             .get("sessionId")
                             .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        (remote_session, parse_tokens(&payload))
+                            .filter(|session| !session.is_empty())
+                        else {
+                            state.finalize_job_with_error(
+                                &job,
+                                TransferStatus::Failed,
+                                Some("Invalid prepare-upload response".into()),
+                            );
+                            return;
+                        };
+                        let Some(files) = payload.get("files").and_then(Value::as_object) else {
+                            state.finalize_job_with_error(
+                                &job,
+                                TransferStatus::Failed,
+                                Some("Invalid prepare-upload response".into()),
+                            );
+                            return;
+                        };
+                        if files
+                            .values()
+                            .any(|token| token.as_str().is_none_or(str::is_empty))
+                        {
+                            state.finalize_job_with_error(
+                                &job,
+                                TransferStatus::Failed,
+                                Some("Invalid prepare-upload response".into()),
+                            );
+                            return;
+                        }
+                        (remote_session.to_string(), parse_tokens(&payload))
                     }
-                    Some(Err(error)) => {
-                        eprintln!(
-                            "otools-localsend sender: prepare body {}: {error}",
-                            job.peer.ip
+                    Some(Err(_)) => {
+                        state.finalize_job_with_error(
+                            &job,
+                            TransferStatus::Failed,
+                            Some("Invalid prepare-upload response".into()),
                         );
-                        state.finalize_job(&job, TransferStatus::Failed);
                         return;
                     }
                 }
@@ -734,7 +859,12 @@ async fn run_send_job(
                     403 => TransferStatus::Cancelled,
                     _ => TransferStatus::Failed,
                 };
-                state.finalize_job(&job, final_status);
+                let error = if final_status == TransferStatus::Failed {
+                    Some(http_status_error("prepare-upload", status))
+                } else {
+                    None
+                };
+                state.finalize_job_with_error(&job, final_status, error);
                 return;
             }
         }
@@ -743,6 +873,9 @@ async fn run_send_job(
     // Phase 3 — mark Transferring and upload in parallel; only accepted
     // files (i.e. the ones carrying a token) are uploaded, the rest are
     // skipped (official: the response only carries accepted file ids).
+    state
+        .receive
+        .set_send_feedback(&session_id, "uploading", None);
     state
         .receive
         .set_send_record(&session_id, TransferStatus::Transferring, None);
@@ -769,18 +902,27 @@ async fn run_send_job(
 
     // Phase 4 — notify the peer on cancel, then the terminal transition
     // (record + transfer-done + pending-map cleanup + registry eviction).
+    let error = results.values().find_map(|outcome| match outcome {
+        FileOutcome::Failed(error) => Some(error.clone()),
+        _ => None,
+    });
     let final_status = if job.is_cancelled() {
         post_cancel(&state, &job.peer, Some(&remote_session)).await;
         TransferStatus::Cancelled
-    } else if results
-        .values()
-        .any(|outcome| *outcome == FileOutcome::Failed)
-    {
+    } else if error.is_some() {
         TransferStatus::Failed
     } else {
         TransferStatus::Done
     };
-    state.finalize_job(&job, final_status);
+    state.finalize_job_with_error(
+        &job,
+        final_status,
+        if final_status == TransferStatus::Failed {
+            error
+        } else {
+            None
+        },
+    );
 }
 
 /// Upload one file with its own checksum-mismatch retry budget. Returns the
@@ -806,17 +948,18 @@ async fn upload_file(
             }
             Attempt::ChecksumMismatch => {
                 if attempt >= MAX_UPLOAD_ATTEMPTS {
-                    eprintln!(
-                        "otools-localsend sender: upload {file_id}: checksum mismatch retry budget exhausted"
-                    );
-                    return (file_id, FileOutcome::Failed);
+                    let error = "upload: Checksum mismatch retry budget exhausted".to_string();
+                    eprintln!("otools-localsend sender: {error}");
+                    return (file_id, FileOutcome::Failed(error));
                 }
                 // Official: retry with the SAME token (attempt 3 is the last).
             }
-            Attempt::Cancelled => return (file_id, FileOutcome::Failed),
+            Attempt::Cancelled => {
+                return (file_id, FileOutcome::Failed("Transfer cancelled".into()))
+            }
             Attempt::Error(error) => {
                 eprintln!("otools-localsend sender: upload {file_id} attempt {attempt}: {error}");
-                return (file_id, FileOutcome::Failed);
+                return (file_id, FileOutcome::Failed(error));
             }
         }
     }
@@ -843,7 +986,7 @@ async fn upload_attempt(
         .client
         .post(format!(
             "{}://{}:{}{API_ROOT}/upload",
-            state.scheme, job.peer.ip, job.peer.port
+            job.peer.protocol, job.peer.ip, job.peer.port
         ))
         .query(&[
             ("sessionId", remote_session),
@@ -856,7 +999,7 @@ async fn upload_attempt(
             let file = match tokio::fs::File::open(path).await {
                 Ok(file) => file,
                 Err(error) => {
-                    return Attempt::Error(format!("open {}: {error}", path.display()));
+                    return Attempt::Error(format!("File upload read failed: {error}"));
                 }
             };
             // A streamed body has no known length; declare it so the receiver
@@ -878,7 +1021,7 @@ async fn upload_attempt(
         _ = wait_cancelled(&mut cancel_rx) => return Attempt::Cancelled,
         result = builder.send() => match result {
             Ok(response) => response,
-            Err(error) => return Attempt::Error(error.to_string()),
+            Err(error) => return Attempt::Error(network_error("upload", &job.peer, error)),
         },
     };
     let status = response.status().as_u16();
@@ -887,16 +1030,15 @@ async fn upload_attempt(
     }
     // Drain retry/error bodies for connection reuse, but never let a peer's
     // incomplete body hold a cancelled session open.
-    let body = tokio::select! {
+    let _body = tokio::select! {
         biased;
         _ = wait_cancelled(&mut cancel_rx) => return Attempt::Cancelled,
-        result = response.text() => result.unwrap_or_default(),
+        result = response.bytes() => result.ok(),
     };
     if status == 422 {
         Attempt::ChecksumMismatch
     } else {
-        let body = body.chars().take(200).collect::<String>();
-        Attempt::Error(format!("peer answered {status}: {body}"))
+        Attempt::Error(http_status_error("upload", status))
     }
 }
 
@@ -981,15 +1123,71 @@ async fn wait_cancelled(rx: &mut watch::Receiver<bool>) {
 async fn post_cancel(state: &SendSessions, peer: &SendPeer, remote_session: Option<&str>) {
     let url = format!(
         "{}://{}:{}{API_ROOT}/cancel",
-        state.scheme, peer.ip, peer.port
+        peer.protocol, peer.ip, peer.port
     );
     let mut builder = state.client.post(&url).timeout(CANCEL_REQUEST_TIMEOUT);
     if let Some(session) = remote_session {
         builder = builder.query(&[("sessionId", session)]);
     }
     if let Err(error) = builder.send().await {
-        eprintln!("otools-localsend sender: cancel POST {url}: {error}");
+        let error = network_error("cancel", peer, error);
+        eprintln!("otools-localsend sender: {error}");
     }
+}
+
+/// Strip the reqwest URL before traversing its source chain. Library causes
+/// contain useful socket/TLS facts; query strings and response text never do.
+pub(crate) fn network_error(operation: &str, peer: &SendPeer, error: reqwest::Error) -> String {
+    use std::error::Error as _;
+    let error = error.without_url();
+    let mut details = error.to_string();
+    let mut cause = error.source();
+    while let Some(source) = cause {
+        let text = source.to_string();
+        if !details.contains(&text) {
+            details.push_str(": ");
+            details.push_str(&text);
+        }
+        cause = source.source();
+    }
+    // Defensive final scrub: no URL or query from a nested library error may
+    // reach persistence or the event bridge.
+    let safe = details
+        .split_whitespace()
+        .map(|word| {
+            if word.contains("://")
+                || word.contains('?')
+                || word.contains("pin=")
+                || word.contains("token=")
+            {
+                "[redacted]"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "{operation} {}:{}: {}",
+        peer.ip,
+        peer.port,
+        safe.chars().take(700).collect::<String>()
+    )
+}
+
+/// Fixed descriptions never include a peer-controlled response body or query.
+fn http_status_error(operation: &str, status: u16) -> String {
+    let reason = match status {
+        400 => "Invalid request",
+        401 => "PIN required or invalid",
+        403 => "Request rejected",
+        409 => "Receiver busy or session unavailable",
+        422 => "Checksum mismatch",
+        429 => "Too many attempts",
+        500..=599 => "Receiver error",
+        _ => "Unexpected response",
+    };
+    format!("{operation}: HTTP {status} ({reason})")
 }
 
 /// Parse the accepted-file token map out of a prepare-upload response.
@@ -1063,8 +1261,8 @@ mod tests {
             .events
             .drain()
             .into_iter()
-            .filter(|event| event["event"] == name)
-            .map(|event| event["data"].clone())
+            .filter(|event| event["topic"] == name)
+            .map(|event| event["payload"].clone())
             .collect()
     }
 
@@ -1084,6 +1282,421 @@ mod tests {
             Json(json!({ "sessionId": "remote-session", "files": tokens })),
         )
             .into_response()
+    }
+
+    /// Run the real client in a child so proxy configuration never mutates the
+    /// host process or races the rest of the test suite.
+    #[test]
+    fn http_client_bypasses_lan_proxy_in_isolated_process() {
+        use crate::test_peer::{observed, Peer, Response};
+        let target = Peer::https(None, |request| {
+            assert_eq!(request.method, "GET");
+            assert_eq!(request.path, "/api/localsend/v2/info");
+            Response::json(200, r#"{"alias":"Direct LAN fixture"}"#)
+        });
+        let intercepted = observed();
+        let proxy_requests = Arc::clone(&intercepted);
+        let proxy = Peer::http(move |request| {
+            proxy_requests.lock().unwrap().push(request);
+            Response::json(502, "")
+        });
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.args([
+            "sender::tests::lan_proxy_probe_child",
+            "--exact",
+            "--nocapture",
+        ]);
+        for name in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ] {
+            child.env_remove(name);
+        }
+        let proxy_url = format!("http://127.0.0.1:{}", proxy.port);
+        child
+            .env("HTTPS_PROXY", &proxy_url)
+            .env("ALL_PROXY", &proxy_url)
+            .env("NO_PROXY", "");
+        child.env(
+            "OTOOLS_LAN_PROXY_TARGET",
+            format!("https://127.0.0.1:{}/api/localsend/v2/info", target.port),
+        );
+        let result = child.output().expect("isolated proxy probe");
+        assert!(
+            result.status.success(),
+            "direct LAN request must succeed despite environment proxy: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            intercepted.lock().unwrap().is_empty(),
+            "LAN client must never CONNECT through the proxy"
+        );
+    }
+
+    #[test]
+    fn lan_proxy_probe_child() {
+        let Ok(target) = std::env::var("OTOOLS_LAN_PROXY_TARGET") else {
+            return;
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let response = runtime
+            .block_on(async {
+                super::http_client(None)
+                    .expect("real client")
+                    .get(target)
+                    .timeout(std::time::Duration::from_secs(2))
+                    .send()
+                    .await
+            })
+            .expect("LAN request bypasses configured proxy");
+        assert_eq!(response.status().as_u16(), 200);
+    }
+
+    #[tokio::test]
+    async fn send_stages_follow_preparation_decision_upload_and_completion() {
+        let preparing = Arc::new(tokio::sync::Notify::new());
+        let accept = Arc::new(tokio::sync::Notify::new());
+        let uploading = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let app = Router::new()
+            .route(
+                &format!("{API_ROOT}/prepare-upload"),
+                axum::routing::post({
+                    let preparing = Arc::clone(&preparing);
+                    let accept = Arc::clone(&accept);
+                    move |Json(body): Json<Value>| {
+                        let preparing = Arc::clone(&preparing);
+                        let accept = Arc::clone(&accept);
+                        async move {
+                            preparing.notify_one();
+                            accept.notified().await;
+                            let files: serde_json::Map<String, Value> = body["files"]
+                                .as_object()
+                                .unwrap()
+                                .keys()
+                                .map(|id| (id.clone(), json!("fixture-token")))
+                                .collect();
+                            Json(json!({"sessionId":"remote-stages", "files":files}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                &format!("{API_ROOT}/upload"),
+                axum::routing::post({
+                    let uploading = Arc::clone(&uploading);
+                    let finish = Arc::clone(&finish);
+                    move |body: axum::body::Body| {
+                        let uploading = Arc::clone(&uploading);
+                        let finish = Arc::clone(&finish);
+                        async move {
+                            let _ = http_body_util::BodyExt::collect(body).await.unwrap();
+                            uploading.notify_one();
+                            finish.notified().await;
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            );
+        let port = serve(app).await;
+        let (state, _dir) = test_state();
+        let (id, run) = super::start_send(
+            Arc::clone(&state),
+            "127.0.0.1".into(),
+            port,
+            vec![SendItem::Text("hello world!".into())],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(record_of(&state, &id)).unwrap()["stage"],
+            "preparing"
+        );
+        let task = tokio::spawn(run);
+        tokio::time::timeout(std::time::Duration::from_secs(2), preparing.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(record_of(&state, &id)).unwrap()["stage"],
+            "waiting"
+        );
+        accept.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), uploading.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(record_of(&state, &id)).unwrap()["stage"],
+            "uploading"
+        );
+        finish.notify_one();
+        task.await.unwrap();
+        let record = serde_json::to_value(record_of(&state, &id)).unwrap();
+        assert_eq!(record["stage"], "finished");
+        assert_eq!(record["status"], "Done");
+        assert!(record.get("error").is_none());
+        let done = events_named(&state, "transfer-done");
+        assert_eq!(done[0]["stage"], "finished");
+        assert!(done[0]["error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn prepare_http_failures_persist_safe_reason_and_terminal_stage() {
+        use crate::test_peer::{Peer, Response};
+        for (status, expected) in [
+            (400, "Invalid request"),
+            (401, "PIN"),
+            (409, "busy"),
+            (429, "Too many"),
+            (500, "Receiver error"),
+        ] {
+            let peer = Peer::http(move |_| {
+                Response::json(
+                    status,
+                    r#"{"error":"do not persist preview or token from a peer response"}"#,
+                )
+            });
+            let (state, _dir) = test_state();
+            let id = send_to_peer(
+                Arc::clone(&state),
+                "127.0.0.1".into(),
+                peer.port,
+                vec![SendItem::Text("private message".into())],
+                None,
+            )
+            .await
+            .unwrap();
+            let record = serde_json::to_value(record_of(&state, &id)).unwrap();
+            assert_eq!(record["status"], "Failed");
+            assert_eq!(record["stage"], "finished");
+            let error = record["error"]
+                .as_str()
+                .expect("specific terminal reason is persisted");
+            assert!(error.contains(&status.to_string()));
+            assert!(error.contains(expected));
+            assert!(
+                !error.contains("private message")
+                    && !error.contains("preview")
+                    && !error.contains("token from")
+            );
+            let done = events_named(&state, "transfer-done");
+            assert_eq!(done[0]["stage"], "finished");
+            assert_eq!(done[0]["error"], record["error"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_prepare_response_is_failed_not_false_done() {
+        use crate::test_peer::{Peer, Response};
+        for body in [
+            r#"{}"#,
+            r#"{"sessionId":"remote","files":null}"#,
+            r#"{"files":{"f":"token"}}"#,
+        ] {
+            let peer = Peer::http(move |_| Response::json(200, body));
+            let (state, _dir) = test_state();
+            let id = send_to_peer(
+                Arc::clone(&state),
+                "127.0.0.1".into(),
+                peer.port,
+                vec![SendItem::Text("hello world!".into())],
+                None,
+            )
+            .await
+            .unwrap();
+            let record = serde_json::to_value(record_of(&state, &id)).unwrap();
+            assert_eq!(
+                record["status"], "Failed",
+                "invalid accepted-token response must not claim delivery"
+            );
+            assert!(record["error"]
+                .as_str()
+                .unwrap()
+                .contains("Invalid prepare-upload response"));
+        }
+    }
+
+    #[tokio::test]
+    async fn send_cancel_uses_selected_http_protocol_and_finishes_without_error() {
+        let prepared = Arc::new(tokio::sync::Notify::new());
+        let cancelled = Arc::new(tokio::sync::Notify::new());
+        let app = Router::new()
+            .route(
+                &format!("{API_ROOT}/prepare-upload"),
+                axum::routing::post({
+                    let prepared = Arc::clone(&prepared);
+                    move || {
+                        let prepared = Arc::clone(&prepared);
+                        async move {
+                            prepared.notify_one();
+                            std::future::pending::<StatusCode>().await
+                        }
+                    }
+                }),
+            )
+            .route(
+                &format!("{API_ROOT}/cancel"),
+                axum::routing::post({
+                    let cancelled = Arc::clone(&cancelled);
+                    move || {
+                        let cancelled = Arc::clone(&cancelled);
+                        async move {
+                            cancelled.notify_one();
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            );
+        let port = serve(app).await;
+        let (state, _dir) = test_state();
+        let (id, run) = super::start_send_with_protocol(
+            Arc::clone(&state),
+            "127.0.0.1".into(),
+            port,
+            Some("http".into()),
+            vec![SendItem::Text("hello world!".into())],
+            None,
+        )
+        .unwrap();
+        let task = tokio::spawn(run);
+        tokio::time::timeout(std::time::Duration::from_secs(2), prepared.notified())
+            .await
+            .unwrap();
+        assert!(state.cancel_session(&id));
+        tokio::time::timeout(std::time::Duration::from_secs(2), cancelled.notified())
+            .await
+            .unwrap();
+        task.await.unwrap();
+        let record = serde_json::to_value(record_of(&state, &id)).unwrap();
+        assert_eq!(record["status"], "Cancelled");
+        assert_eq!(record["stage"], "finished");
+        assert!(record.get("error").is_none());
+    }
+
+    #[tokio::test]
+    async fn transport_errors_retain_tls_cause_without_url_pin_or_token() {
+        use crate::test_peer::{observed, Peer, Response};
+        let requests = observed();
+        let seen = Arc::clone(&requests);
+        let peer = Peer::https(Some("wrong-certificate".into()), move |request| {
+            seen.lock().unwrap().push(request);
+            Response::json(204, "")
+        });
+        let (state, _dir) = test_state();
+        let (id, run) = super::start_send_with_protocol(
+            Arc::clone(&state),
+            "127.0.0.1".into(),
+            peer.port,
+            Some("https".into()),
+            vec![SendItem::Text("private message".into())],
+            Some("secret-pin".into()),
+        )
+        .unwrap();
+        run.await;
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "handshake failed before HTTP"
+        );
+        let record = serde_json::to_value(record_of(&state, &id)).unwrap();
+        let error = record["error"].as_str().expect("transport cause retained");
+        assert!(error.contains("prepare-upload"));
+        assert!(
+            error.to_ascii_lowercase().contains("certificate")
+                || error.to_ascii_lowercase().contains("tls"),
+            "TLS cause not generic Failed: {error}"
+        );
+        for forbidden in ["https://", "?", "secret-pin", "private message", "pin="] {
+            assert!(!error.contains(forbidden), "diagnostic leaked {forbidden}");
+        }
+        let done = events_named(&state, "transfer-done");
+        assert_eq!(done[0]["error"], record["error"]);
+    }
+
+    #[tokio::test]
+    async fn upload_http_failure_keeps_safe_reason_not_peer_body() {
+        use crate::test_peer::{Peer, Response};
+        let peer = Peer::http(|request| {
+            if request.path.starts_with("/api/localsend/v2/prepare-upload") {
+                let request: Value = serde_json::from_slice(&request.body).unwrap();
+                let files: serde_json::Map<String, Value> = request["files"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(|id| (id.clone(), json!("secret-token")))
+                    .collect();
+                Response::json(
+                    200,
+                    &json!({"sessionId":"remote", "files":files}).to_string(),
+                )
+            } else {
+                Response::json(
+                    403,
+                    r#"{"error":"private-message secret-token secret-pin"}"#,
+                )
+            }
+        });
+        let (state, _dir) = test_state();
+        let id = send_to_peer(
+            Arc::clone(&state),
+            "127.0.0.1".into(),
+            peer.port,
+            vec![SendItem::Text("private-message".into())],
+            Some("secret-pin".into()),
+        )
+        .await
+        .unwrap();
+        let record = serde_json::to_value(record_of(&state, &id)).unwrap();
+        assert_eq!(record["status"], "Failed");
+        let error = record["error"].as_str().unwrap();
+        assert!(
+            error.contains("upload") && error.contains("403"),
+            "upload failure persisted: {error}"
+        );
+        for forbidden in [
+            "secret-token",
+            "secret-pin",
+            "private-message",
+            "?",
+            "http://",
+        ] {
+            assert!(!error.contains(forbidden));
+        }
+        assert_eq!(
+            events_named(&state, "transfer-done")[0]["error"],
+            record["error"]
+        );
+    }
+
+    #[tokio::test]
+    async fn file_hash_failure_is_not_an_unexplained_pending_transfer() {
+        let (state, directory) = test_state();
+        let path = directory.path().join("vanishing.txt");
+        std::fs::write(&path, b"payload").unwrap();
+        let (id, run) = super::start_send(
+            Arc::clone(&state),
+            "127.0.0.1".into(),
+            1,
+            vec![SendItem::File(path.clone())],
+            None,
+        )
+        .unwrap();
+        std::fs::remove_file(path).unwrap();
+        run.await;
+        let record = serde_json::to_value(record_of(&state, &id)).unwrap();
+        assert_eq!(record["status"], "Failed");
+        assert!(record["error"]
+            .as_str()
+            .unwrap()
+            .contains("File hashing failed"));
+        assert_eq!(record["stage"], "finished");
     }
 
     #[test]
@@ -1319,8 +1932,8 @@ mod tests {
         let events = state.events.drain();
         let progress: Vec<u64> = events
             .iter()
-            .filter(|event| event["event"] == "transfer-progress")
-            .map(|event| event["data"]["percent"].as_u64().expect("percent"))
+            .filter(|event| event["topic"] == "transfer-progress")
+            .map(|event| event["payload"]["percent"].as_u64().expect("percent"))
             .collect();
         assert!(!progress.is_empty(), "progress events must flow");
         for pair in progress.windows(2) {
@@ -1342,8 +1955,8 @@ mod tests {
 
         let done: Vec<&Value> = events
             .iter()
-            .filter(|event| event["event"] == "transfer-done")
-            .map(|event| &event["data"])
+            .filter(|event| event["topic"] == "transfer-done")
+            .map(|event| &event["payload"])
             .collect();
         assert_eq!(done.len(), 1, "one transfer-done: {events:?}");
         assert_eq!(done[0]["sessionId"], session_id.as_str());

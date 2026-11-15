@@ -12,7 +12,53 @@ pub struct DeviceInfo {
     pub fingerprint: String,
     pub port: u16,
     pub protocol: String,
+    #[serde(default)]
     pub download: bool,
+}
+
+/// Official register/info response: the contacted endpoint already supplies
+/// port and protocol, so neither field is present in this wire DTO.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterResponse {
+    pub alias: String,
+    pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_type: Option<String>,
+    #[serde(default)]
+    pub fingerprint: String,
+    #[serde(default)]
+    pub download: bool,
+}
+
+impl From<DeviceInfo> for RegisterResponse {
+    fn from(info: DeviceInfo) -> Self {
+        Self {
+            alias: info.alias,
+            version: info.version,
+            device_model: info.device_model,
+            device_type: info.device_type,
+            fingerprint: info.fingerprint,
+            download: info.download,
+        }
+    }
+}
+
+impl RegisterResponse {
+    pub fn into_device_info(self, port: u16, protocol: String) -> DeviceInfo {
+        DeviceInfo {
+            alias: self.alias,
+            version: self.version,
+            device_model: self.device_model,
+            device_type: self.device_type,
+            fingerprint: self.fingerprint,
+            port,
+            protocol,
+            download: self.download,
+        }
+    }
 }
 
 /// Optional file timestamps from the v2 protocol (ISO 8601 strings, nullable).
@@ -60,6 +106,10 @@ pub struct TransferRecord {
     pub peer_alias: String,
     pub files: Vec<FileEntry>,
     pub status: TransferStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     pub created_at: u64,
     /// Final destination (absolute path) of every received file, keyed by
     /// fileId. Filled when a receive session reaches a terminal state; empty

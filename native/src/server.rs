@@ -21,7 +21,9 @@
 use crate::crypto::CertMaterial;
 use crate::discovery::{self, DiscoveryShared};
 use crate::event_bridge::{coalesce_progress, WebEventBroadcaster};
-use crate::models::{DeviceInfo, Direction, FileEntry, TransferRecord, TransferStatus};
+use crate::models::{
+    DeviceInfo, Direction, FileEntry, RegisterResponse, TransferRecord, TransferStatus,
+};
 use crate::service::{wait_cancelled, ServiceScope};
 use crate::settings::Settings;
 use axum::body::Body;
@@ -270,6 +272,8 @@ impl ReceiveSessions {
         for record in &mut records {
             if !record.status.is_terminal() {
                 record.status = TransferStatus::Failed;
+                record.stage = Some("finished".into());
+                record.error = Some("Transfer interrupted before completion".into());
                 residual_failed = true;
             }
         }
@@ -482,7 +486,7 @@ impl ReceiveSessions {
         }
         self.events.send(
             "transfer-done",
-            json!({ "sessionId": session_id, "status": "cancelled" }),
+            json!({ "sessionId": session_id, "status": "cancelled", "stage": "finished", "error": null }),
         );
         if cleanup.uploads.count.load(Ordering::SeqCst) == 0 {
             if let Err(error) = clean_cancelled_files(&cleanup) {
@@ -613,7 +617,7 @@ impl ReceiveSessions {
         if finished_empty {
             self.events.send(
                 "transfer-done",
-                json!({ "sessionId": session_id, "status": "done" }),
+                json!({ "sessionId": session_id, "status": "done", "stage": "finished", "error": null }),
             );
         }
         if let Some(decision_tx) = decision_tx {
@@ -644,6 +648,17 @@ impl ReceiveSessions {
             .find(|record| record.session_id == session_id)
         {
             record.status = status;
+            record.stage = Some(
+                match status {
+                    TransferStatus::Pending => "waiting",
+                    TransferStatus::Transferring => "uploading",
+                    _ => "finished",
+                }
+                .into(),
+            );
+            if status != TransferStatus::Failed {
+                record.error = None;
+            }
             if let Some(destinations) = destinations {
                 record.destinations = destinations;
             }
@@ -683,6 +698,21 @@ impl ReceiveSessions {
                 existing.status = record.status;
             }
             None => inner.records.push(record),
+        }
+        persist_records(&inner.records, &self.transfers_path);
+    }
+
+    /// Persist outbound feedback independently of progress events, so history
+    /// can recover the real stage and terminal reason after an event is lost.
+    pub(crate) fn set_send_feedback(&self, session_id: &str, stage: &str, error: Option<String>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(record) = inner
+            .records
+            .iter_mut()
+            .find(|record| record.session_id == session_id)
+        {
+            record.stage = Some(stage.into());
+            record.error = error;
         }
         persist_records(&inner.records, &self.transfers_path);
     }
@@ -992,6 +1022,15 @@ pub fn prepare_upload(
             peer_alias: sender.alias.clone(),
             files: files_list.clone(),
             status,
+            stage: Some(
+                if status == TransferStatus::Pending {
+                    "waiting"
+                } else {
+                    "uploading"
+                }
+                .into(),
+            ),
+            error: None,
             created_at,
             destinations: HashMap::new(),
         });
@@ -1082,8 +1121,25 @@ impl ReceiveSessions {
         file_id: &str,
         ok: bool,
         download_dir: Option<&Path>,
+        error: Option<String>,
     ) -> Option<TerminalPlan> {
         let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if inner
+            .sessions
+            .get(session_id)
+            .is_none_or(|session| *session.cancel_rx.borrow() || session.status.is_terminal())
+        {
+            return None;
+        }
+        if let Some(record) = inner
+            .records
+            .iter_mut()
+            .find(|record| record.session_id == session_id)
+        {
+            if let Some(error) = &error {
+                record.error = Some(error.clone());
+            }
+        }
         let plan = {
             let session = inner.sessions.get_mut(session_id)?;
             if *session.cancel_rx.borrow() || session.status.is_terminal() {
@@ -1104,6 +1160,7 @@ impl ReceiveSessions {
                 .filter(|id| session.tokens.contains_key(*id))
                 .all(|id| session.uploaded.contains(id) || session.failed.contains(id));
             if !all_terminal {
+                persist_records(&inner.records, &self.transfers_path);
                 return None;
             }
             let status = if session.failed.is_empty() {
@@ -1207,9 +1264,14 @@ async fn execute_terminal_plan(sessions: Arc<ReceiveSessions>, plan: TerminalPla
     } else {
         "failed"
     };
+    let error = sessions
+        .transfer_records()
+        .into_iter()
+        .find(|record| record.session_id == plan.session_id)
+        .and_then(|record| record.error);
     sessions.events.send(
         "transfer-done",
-        json!({ "sessionId": plan.session_id, "status": status }),
+        json!({ "sessionId": plan.session_id, "status": status, "stage": "finished", "error": error }),
     );
 }
 
@@ -1373,8 +1435,19 @@ pub async fn upload_stream(
         workers.push(tokio::spawn(async move {
             let _lease = lease;
             let run = async {
-                if let Err(error) = tokio::fs::create_dir_all(&temp_dir).await {
-                    return (500, json!({ "error": format!("create temp dir: {error}") }));
+                if tokio::fs::create_dir_all(&temp_dir).await.is_err() {
+                    let error = "Receive temporary directory creation failed";
+                    let plan = sessions.mark_file_terminal(
+                        &session_id,
+                        &file_id,
+                        false,
+                        download_dir.as_deref(),
+                        Some(error.into()),
+                    );
+                    if let Some(plan) = plan {
+                        execute_terminal_plan(Arc::clone(&sessions), plan).await;
+                    }
+                    return (500, json!({ "error": error }));
                 }
 
                 // Phase 2 — stream the body to disk. No lock is held: chunks are written
@@ -1386,8 +1459,19 @@ pub async fn upload_stream(
                 let mut body_error = false;
                 let mut file = match tokio::fs::File::create(&temp_path).await {
                     Ok(file) => file,
-                    Err(error) => {
-                        return (500, json!({ "error": format!("open temp file: {error}") }))
+                    Err(_) => {
+                        let error = "Receive file open failed";
+                        let plan = sessions.mark_file_terminal(
+                            &session_id,
+                            &file_id,
+                            false,
+                            download_dir.as_deref(),
+                            Some(error.into()),
+                        );
+                        if let Some(plan) = plan {
+                            execute_terminal_plan(Arc::clone(&sessions), plan).await;
+                        }
+                        return (500, json!({ "error": error }));
                     }
                 };
                 let mut body = body;
@@ -1456,6 +1540,7 @@ pub async fn upload_stream(
                         &file_id,
                         false,
                         download_dir.as_deref(),
+                        Some("Receive file write failed".into()),
                     );
                     if let Some(plan) = plan {
                         execute_terminal_plan(Arc::clone(&sessions), plan).await;
@@ -1469,6 +1554,7 @@ pub async fn upload_stream(
                         &file_id,
                         false,
                         download_dir.as_deref(),
+                        Some("Upload aborted by the sender".into()),
                     );
                     if let Some(plan) = plan {
                         execute_terminal_plan(Arc::clone(&sessions), plan).await;
@@ -1523,6 +1609,7 @@ pub async fn upload_stream(
                             &file_id,
                             false,
                             download_dir.as_deref(),
+                            Some("Checksum mismatch retry budget exhausted".into()),
                         );
                         if let Some(plan) = plan {
                             execute_terminal_plan(Arc::clone(&sessions), plan).await;
@@ -1535,6 +1622,7 @@ pub async fn upload_stream(
                     &file_id,
                     true,
                     download_dir.as_deref(),
+                    None,
                 );
                 if let Some(plan) = plan {
                     execute_terminal_plan(Arc::clone(&sessions), plan).await;
@@ -1690,12 +1778,12 @@ fn json_response(status: u16, value: Value) -> Response {
 
 /// `POST /api/localsend/v2/register` — announce our own device info. No auth.
 async fn register_handler(State(state): State<Arc<ServerShared>>) -> Response {
-    Json(our_info(&state)).into_response()
+    Json(RegisterResponse::from(our_info(&state))).into_response()
 }
 
 /// `GET /api/localsend/v2/info` — debug route, same payload as register.
 async fn info_handler(State(state): State<Arc<ServerShared>>) -> Response {
-    Json(our_info(&state)).into_response()
+    Json(RegisterResponse::from(our_info(&state))).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -2004,8 +2092,8 @@ mod tests {
         events
             .drain()
             .into_iter()
-            .filter(|event| event["event"] == name)
-            .map(|event| event["data"].clone())
+            .filter(|event| event["topic"] == name)
+            .map(|event| event["payload"].clone())
             .collect()
     }
 
@@ -2063,8 +2151,8 @@ mod tests {
         let snapshots: Vec<Value> = events
             .drain()
             .into_iter()
-            .filter(|event| event["event"] == "server-status")
-            .map(|event| event["data"].clone())
+            .filter(|event| event["topic"] == "server-status")
+            .map(|event| event["payload"].clone())
             .collect();
         assert!(snapshots.iter().any(|status| status["state"] == "running"));
         assert_eq!(snapshots.last().expect("stopped event")["state"], "stopped");
@@ -2096,6 +2184,161 @@ mod tests {
             assert_eq!(status["activeTransfers"], 0);
             assert!(status["error"].is_null());
         }
+    }
+
+    #[tokio::test]
+    async fn receive_stage_and_checksum_reason_survive_history_and_done_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions =
+            Arc::new(ReceiveSessions::new(directory.path(), Arc::clone(&events)).unwrap());
+        let digest = "0".repeat(64);
+        let (id, decision_rx) =
+            prepare_manual(&sessions, &[file_entry("f", 7, Some(&digest))], SENDER_IP);
+        assert_eq!(
+            serde_json::to_value(record_snapshot(&sessions, &id)).unwrap()["stage"],
+            "waiting"
+        );
+        let waiter = spawn_waiter(&sessions, id.clone(), decision_rx);
+        session_accept(&sessions, &id, None).unwrap();
+        let (_, prepared) = waiter.await.unwrap();
+        assert_eq!(
+            serde_json::to_value(record_snapshot(&sessions, &id)).unwrap()["stage"],
+            "uploading"
+        );
+        for _ in 0..3 {
+            let (status, _) = upload_stream(
+                Arc::clone(&sessions),
+                None,
+                id.clone(),
+                "f".into(),
+                prepared["files"]["f"].as_str().unwrap().into(),
+                SENDER_IP,
+                Body::from("payload"),
+            )
+            .await;
+            assert_eq!(status, 422);
+        }
+        let record = serde_json::to_value(record_snapshot(&sessions, &id)).unwrap();
+        assert_eq!(record["status"], "Failed");
+        assert_eq!(record["stage"], "finished");
+        assert!(record["error"]
+            .as_str()
+            .unwrap()
+            .contains("Checksum mismatch"));
+        let done = event_data(&events, "transfer-done");
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0]["stage"], "finished");
+        assert_eq!(done[0]["error"], record["error"]);
+        let reloaded = ReceiveSessions::new(directory.path(), Arc::clone(&events)).unwrap();
+        assert_eq!(
+            serde_json::to_value(record_snapshot(&reloaded, &id)).unwrap(),
+            record
+        );
+    }
+
+    #[test]
+    fn old_history_without_feedback_loads_and_interrupted_transfer_gets_reason() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("transfers.json"), r#"{"transfers":[
+            {"sessionId":"old-done","direction":"Receive","peerAlias":"Old peer","files":[],"status":"Done","createdAt":1},
+            {"sessionId":"interrupted","direction":"Send","peerAlias":"Old peer","files":[],"status":"Pending","createdAt":2}
+        ]}"#).unwrap();
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions = ReceiveSessions::new(directory.path(), events).unwrap();
+        let old = serde_json::to_value(record_snapshot(&sessions, "old-done")).unwrap();
+        assert_eq!(old["status"], "Done");
+        assert!(
+            old.get("stage").is_none() && old.get("error").is_none(),
+            "old successful history stays compatible"
+        );
+        let interrupted = serde_json::to_value(record_snapshot(&sessions, "interrupted")).unwrap();
+        assert_eq!(interrupted["status"], "Failed");
+        assert_eq!(interrupted["stage"], "finished");
+        assert!(interrupted["error"]
+            .as_str()
+            .unwrap()
+            .contains("interrupted"));
+    }
+
+    #[test]
+    fn receive_cancel_finishes_stage_without_spurious_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions =
+            Arc::new(ReceiveSessions::new(directory.path(), Arc::clone(&events)).unwrap());
+        let (id, _decision) = prepare_manual(&sessions, &[file_entry("f", 7, None)], SENDER_IP);
+        session_cancel(&sessions, &id).unwrap();
+        let record = serde_json::to_value(record_snapshot(&sessions, &id)).unwrap();
+        assert_eq!(record["stage"], "finished");
+        assert!(record.get("error").is_none());
+        let done = event_data(&events, "transfer-done");
+        assert_eq!(done[0]["stage"], "finished");
+        assert!(done[0]["error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn receive_open_failure_is_terminal_and_reported_without_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions =
+            Arc::new(ReceiveSessions::new(directory.path(), Arc::clone(&events)).unwrap());
+        let (_, prepared) = prepare_now(
+            &sessions,
+            &settings(true, None),
+            &[file_entry("f", 7, None)],
+            None,
+            SENDER_IP,
+        );
+        let id = prepared["sessionId"].as_str().unwrap().to_string();
+        // A directory where the writable target belongs gives a real OS open
+        // error without permissions hacks or changing the user's filesystem.
+        std::fs::create_dir(sessions.tmp_root().join(&id).join("f")).unwrap();
+        let (status, _) = upload_stream(
+            Arc::clone(&sessions),
+            None,
+            id.clone(),
+            "f".into(),
+            prepared["files"]["f"].as_str().unwrap().into(),
+            SENDER_IP,
+            Body::from("private-payload"),
+        )
+        .await;
+        assert_eq!(status, 500);
+        let record = serde_json::to_value(record_snapshot(&sessions, &id)).unwrap();
+        assert_eq!(
+            record["status"], "Failed",
+            "an open error must not pin the active receive slot forever"
+        );
+        assert_eq!(record["stage"], "finished");
+        let error = record["error"].as_str().unwrap();
+        assert!(error.contains("open failed"));
+        assert!(!error.contains("private-payload"));
+        assert_eq!(
+            event_data(&events, "transfer-done")[0]["error"],
+            record["error"]
+        );
+        assert_eq!(session_status(&sessions, &id), None);
+    }
+
+    #[test]
+    fn cancelled_receive_ignores_late_file_failure_reason() {
+        let directory = tempfile::tempdir().unwrap();
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions =
+            Arc::new(ReceiveSessions::new(directory.path(), Arc::clone(&events)).unwrap());
+        let (id, _decision) = prepare_manual(&sessions, &[file_entry("f", 7, None)], SENDER_IP);
+        session_cancel(&sessions, &id).unwrap();
+        let before = serde_json::to_value(record_snapshot(&sessions, &id)).unwrap();
+        assert!(sessions
+            .mark_file_terminal(&id, "f", false, None, Some("late file error".into()))
+            .is_none());
+        assert_eq!(
+            serde_json::to_value(record_snapshot(&sessions, &id)).unwrap(),
+            before,
+            "late file worker must not overwrite the cancelled record"
+        );
+        assert_eq!(event_data(&events, "transfer-done").len(), 1);
     }
 
     #[test]
@@ -2498,16 +2741,16 @@ mod tests {
         let drained = events.drain();
         let done: Vec<Value> = drained
             .iter()
-            .filter(|event| event["event"] == "transfer-done")
-            .map(|event| event["data"].clone())
+            .filter(|event| event["topic"] == "transfer-done")
+            .map(|event| event["payload"].clone())
             .collect();
         assert_eq!(done.len(), 1, "exactly one transfer-done");
         assert_eq!(done[0]["sessionId"], session_id);
         assert_eq!(done[0]["status"], "done");
         let progress: Vec<Value> = drained
             .iter()
-            .filter(|event| event["event"] == "transfer-progress")
-            .map(|event| event["data"].clone())
+            .filter(|event| event["topic"] == "transfer-progress")
+            .map(|event| event["payload"].clone())
             .collect();
         assert!(
             progress.iter().any(|event| event["percent"] == 100),
@@ -3155,7 +3398,7 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(5));
         }
-        let client = crate::sender::http_client();
+        let client = crate::sender::http_client(None).expect("test HTTP client");
         let port = controller.status().port;
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
         runtime

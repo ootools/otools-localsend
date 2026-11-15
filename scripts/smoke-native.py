@@ -42,11 +42,21 @@ def invoke(method, payload=None):
         _NATIVE.otools_plugin_free(ptr, size.value)
 
 
-def drain_events():
-    """Poll the plugin event queue and return the drained event list."""
+def drain_host_events():
+    """Validate raw topic/payload before any test-only convenience normalization."""
     result = invoke("poll_events")
     assert result.get("ok") is True, f"poll_events: {result.get('error')}"
-    return result["data"]["events"]
+    events = result["data"]["events"]
+    for event in events:
+        assert isinstance(event, dict) and isinstance(event.get("topic"), str) and event["topic"] and "payload" in event, (
+            "invalid host event envelope: expected topic/payload"
+        )
+    return events
+
+
+def drain_events():
+    """Return internal event/data only after the actual host wire gate passes."""
+    return [{"event": event["topic"], "data": event["payload"]} for event in drain_host_events()]
 
 
 def find_service_test_port(candidates=None):

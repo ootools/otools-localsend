@@ -52,6 +52,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+      - name: 安装独立协议测试依赖
+        run: pnpm install --frozen-lockfile
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -66,7 +73,10 @@ jobs:
       - name: 原生启停与端口释放冒烟
         run: |
           python -I scripts/service-ports.test.py
+          python -I scripts/native-events.test.py
           python -I scripts/smoke-native.py --library lib/${{ matrix.library }}
+      - name: 独立官方线格式与 TLS 客户端身份互测
+        run: python -I scripts/official-wire-test.py --library lib/${{ matrix.library }}
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -92,6 +102,8 @@ jobs:
           cache: pnpm
       - name: 安装依赖
         run: pnpm install --frozen-lockfile
+      - name: 前端与事件桥回归测试
+        run: pnpm test
       - name: 构建前端
         run: node scripts/build-web.mjs
       - uses: actions/upload-artifact@v4

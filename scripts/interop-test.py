@@ -486,13 +486,17 @@ def discovery():
     # (3) the mock completes its protocol register POST against the DLL and
     # sees the DLL's device info (the "register" stdout event).
     register = mock.wait_event(
-        "register", lambda e: e.get("peer", {}).get("alias") == CTX["alias"], timeout=15
+        "register",
+        lambda e: e.get("peer", {}).get("fingerprint") == CTX["fingerprint"]
+        and e.get("origin", "").endswith(f":{CTX['tcp_port']}"),
+        timeout=15,
     )
     assert register, f"mock never registered against the DLL: {mock.diagnostics()}"
     assert register["peer"]["fingerprint"] == CTX["fingerprint"], "register fingerprint mismatch"
-    assert register["peer"]["port"] == CTX["tcp_port"], (
-        f"announced port {register['peer']['port']} != bound tcp port {CTX['tcp_port']}"
+    assert "port" not in register["peer"] and "protocol" not in register["peer"], (
+        f"register response must use the official minimal DTO: {register['peer']}"
     )
+    assert register["origin"].endswith(f":{CTX['tcp_port']}"), "register used the wrong advertised endpoint"
     return f"udp {CTX['udp_port']} tcp {CTX['tcp_port']}, peer ip {entry['ip']}"
 
 

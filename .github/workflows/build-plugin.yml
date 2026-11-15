@@ -52,7 +52,11 @@ jobs:
       - name: 原生启停与端口释放冒烟
         run: |
           python -I scripts/service-ports.test.py
+          python -I scripts/native-events.test.py
           python -I scripts/smoke-native.py --library lib/Windows.dll
+
+      - name: 独立官方线格式与 TLS 客户端身份互测
+        run: python -I scripts/official-wire-test.py --library lib/Windows.dll
 
       - name: 构建前端
         run: node scripts/build-web.mjs

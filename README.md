@@ -1,7 +1,7 @@
 # otools-localsend
 
 LocalSend 协议 v2 兼容的局域网互传 OTools 面板插件：与手机、电脑上的官方 LocalSend
-互相发现并收发文件与文本（协议兼容经 mock 对端矩阵验证，真机对测清单见文末）。
+互相发现并收发文件与文本（已通过独立官方线格式/HTTPS 客户端身份测试及互操作矩阵，手机真机复测见文末）。
 
 - 发现：UDP 组播 `224.0.0.167:53317`（announce / register 按官方语义回源）
 - 传输：自签 HTTPS `53317`，端点 `register` / `prepare-upload` / `upload` / `cancel` / `info`
@@ -34,6 +34,14 @@ LocalSend 协议 v2 兼容的局域网互传 OTools 面板插件：与手机、�
 - **自动保存开启**：来件不再弹确认框，直接接收并落盘到下载目录。
 - **PIN**：开启后对方必须输入正确 PIN 才能发送；同一 IP 连续 3 次错误会被限流（429，30 分钟）。
 - **文本消息**按官方线格式发送：单条 `<uuid>.txt` 且文本置于 `preview`，官方客户端渲染为消息气泡。
+- **传输反馈**显示准备文件、等待对方确认、上传与最终状态；失败时保留脱敏的 HTTP/TLS/连接原因。
+  等待或传输中的任务可在传输卡片点击取消。界面定期读取后台记录，单个事件丢失也能恢复收件确认与终态。
+
+### 主题
+
+默认使用明亮主题；宿主已声明暗色/明亮时采用宿主主题，并跟随宿主 `otools-theme-changed`
+事件或受信任父窗口的 `otools:theme-sync` 更新。不会因为操作系统偏好暗色而覆盖默认明亮。
+没有宿主主题信号时仍保持明亮，品牌蓝色与状态颜色不改变。
 
 ### 手动启动与停止
 
@@ -63,6 +71,8 @@ LocalSend），会自动递增到空闲端口，并在公告中上报实际端�
   **可以**发现本插件并回源 register；但其他设备的公告也发往标准端口，本插件已回退**收不到**，
   因此本插件无法通过组播主动发现其他设备，发现依赖对方收到公告后回源。
 - v1 未实现：浏览器反向传输（`prepare-download` / `download`）、收藏设备同步、protocol v3。
+- 局域网发送显式绕过 HTTP 代理，并使用同一插件证书作为 HTTPS 客户端身份，兼容新版官方端的客户端证书要求；
+  支持对端公告的 HTTP/HTTPS。HTTPS 仍接受对端自签证书，本版未新增证书指纹固定验证。
 
 ## CI 与 macOS 原生库
 
@@ -99,7 +109,9 @@ node scripts/verify-plugin.mjs    # 校验 ZIP/CRC/SHA256、清单、桥标记�
 cargo test --manifest-path native/Cargo.toml     # 原生单测
 node --test scripts/package.test.mjs             # 打包/校验门槛（含篡改拒绝）
 python -I scripts/smoke-native.py                # DLL 冒烟（隔离数据目录）
-python -I scripts/interop-test.py                # mock 对端互操作矩阵
+python -I scripts/native-events.test.py         # 原始 topic/payload 宿主事件契约
+python -I scripts/official-wire-test.py           # 独立官方 JSON/HTTP/HTTPS 身份互测
+python -I scripts/interop-test.py                # 独立 mock 对端互操作矩阵
 ```
 
 `scripts/interop-test.py` 用 `scripts/mock-peer.mjs`（独立 Node 实现的 LocalSend v2 对端，
@@ -107,6 +119,12 @@ python -I scripts/interop-test.py                # mock 对端互操作矩阵
 面板关闭后重建、sha256 失配重试、PIN 限流、发送文件/文本、自动保存接收，以及真实
 动态库的手动启停、端口释放、保存端口后重启、活动传输停止确认和完成文件保留。
 可用 `--scenario service_restart` 等参数单独跑一个场景。
+
+`scripts/official-wire-test.py` 使用独立 loopback 对端，直接检查真实动态库的官方精简注册响应、
+省略可选字段的收件请求、手动确认、HTTP 文件收发、HTTPS 客户端证书身份以及失败原因脱敏。
+原始队列先通过宿主实际 `topic/payload` 解析规则，不能用前端归一化掩盖丢失的 payload。
+Node TLS 对端在 HTTP 层强制证书指纹匹配；严格 TLS 握手要求客户端证书的场景由独立 Rust
+原生 fixture 补充验证。这些本机隔离测试不等同于真实手机和已安装宿主的端到端验收。
 
 本地部署到 OTools 主仓库试跑：
 
@@ -116,7 +134,7 @@ pwsh -File scripts/deploy-to-otools.ps1 -OtoolsRoot D:\Repos\xyito\otools\otools
 
 ## 真机对测待办
 
-以下需要在具备条件时手工验证（当前自动化只覆盖 mock 对端）：
+以下需要在具备条件时手工验证（自动化包含独立协议/TLS fixture 与 mock 对端，尚未代替真实手机复测）：
 
 - [ ] 官方 LocalSend Windows 桌面端 ↔ 本插件：互相发现、互发多文件、取消、拒绝、PIN
 - [ ] 手机 App（Android / iOS）↔ 本插件：同上，以及文本消息气泡显示

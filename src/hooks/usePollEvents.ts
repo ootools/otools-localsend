@@ -121,6 +121,9 @@ export function usePollEvents() {
   const generationRef = useRef(0);
   const lastStatusRef = useRef<ServerStatus | null>(null);
   const transfersRequestRef = useRef(0);
+  const backgroundTransfersRef = useRef<{ generation: number; pending: Promise<void> } | null>(null);
+  const backgroundEventsRef = useRef<{ generation: number; pending: Promise<void> } | null>(null);
+  const backgroundStatusRef = useRef<{ generation: number; pending: Promise<void> } | null>(null);
   const devicesRequestRef = useRef(0);
   const unlistenersRef = useRef<UnlistenFn[]>([]);
   const timersRef = useRef<number[]>([]);
@@ -451,7 +454,26 @@ export function usePollEvents() {
             // 事件通道降级，不影响独立的 server_status 查询。
           }
         };
-        await Promise.all([consume(), recoverStatus()]);
+        // The host may drain events before the page fallback. History is an
+        // independent authoritative channel for consent and terminal status.
+        const coalesce = (
+          slot: { current: { generation: number; pending: Promise<void> } | null },
+          run: () => Promise<void>,
+        ) => {
+          if (slot.current?.generation === generation) return slot.current.pending;
+          const job = { generation, pending: Promise.resolve() };
+          slot.current = job;
+          job.pending = run().finally(() => { if (slot.current === job) slot.current = null; });
+          return job.pending;
+        };
+        const reconcileTransfers = async () => {
+          if (!controller.getState().serviceBusy) await refreshTransfers();
+        };
+        await Promise.all([
+          coalesce(backgroundEventsRef, consume),
+          coalesce(backgroundStatusRef, recoverStatus),
+          coalesce(backgroundTransfersRef, reconcileTransfers),
+        ]);
       };
 
       const subscribe = async () => {
@@ -542,7 +564,7 @@ export function usePollEvents() {
       for (const unlisten of unlistenersRef.current) void unlisten();
       unlistenersRef.current = [];
     };
-  }, [applyServerStatus, applyTransferSnapshot, controller, handleEvent, refreshDevices]);
+  }, [applyServerStatus, applyTransferSnapshot, controller, handleEvent, refreshDevices, refreshTransfers]);
 
   return {
     ready,

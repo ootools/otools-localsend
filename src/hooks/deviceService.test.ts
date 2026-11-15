@@ -117,11 +117,12 @@ test("review guarded sends: unchanged running selection still sends exact host t
     if (previous) Object.defineProperty(globalThis, "window", previous);
     else Reflect.deleteProperty(globalThis, "window");
   });
+  peer.info.protocol = "http";
   const page = mountHook(() => DevicesPage({ store: store(), onGoToTransfers: () => {} }));
-  t.after(() => page.unmount());
+  t.after(() => { page.unmount(); peer.info.protocol = "https"; });
   select(page);
   const button = sendButtons(page.current()).find((element) => text(element.props.children as ReactNode).includes("发送文件"));
   (button?.props.onClick as () => void)();
   await page.flush();
-  assert.deepEqual(sent, [{ ip: "192.168.1.2", port: 54445, files: [{ path: paths[0] }, { path: paths[1] }] }]);
+  assert.deepEqual(sent, [{ ip: "192.168.1.2", port: 54445, protocol: "http", files: [{ path: paths[0] }, { path: paths[1] }] }]);
 });

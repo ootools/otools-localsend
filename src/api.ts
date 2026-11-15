@@ -84,6 +84,10 @@ export interface TransferRecord {
    * 因此声明为可选，消费端一律 `record.destinations ?? {}` 归一化。
    */
   destinations?: Record<string, string>;
+  /** Native transport phase; optional for older persisted history. */
+  stage?: "preparing" | "waiting" | "uploading" | "finished";
+  /** Sanitized transport diagnostic; never contains a PIN, token or body. */
+  error?: string | null;
 }
 
 /** 本机设置（settings.json）。 */
@@ -487,6 +491,7 @@ export async function sendFiles(
   port: number,
   paths: string[],
   pin?: string,
+  protocol?: string,
 ): Promise<{ sessionId: string }> {
   const payload: Record<string, unknown> = {
     ip,
@@ -496,20 +501,23 @@ export async function sendFiles(
   if (pin) {
     payload.pin = pin;
   }
+  if (protocol) payload.protocol = protocol;
   return callNative<{ sessionId: string }>("send_files", payload);
 }
 
-/** 发送文本（native 转成虚拟 message.txt 条目走同一发送管线）。 */
+/** 发送文本（native 按官方 UUID .txt + preview 线格式走同一发送管线）。 */
 export async function sendText(
   ip: string,
   port: number,
   text: string,
   pin?: string,
+  protocol?: string,
 ): Promise<{ sessionId: string }> {
   const payload: Record<string, unknown> = { ip, port, text };
   if (pin) {
     payload.pin = pin;
   }
+  if (protocol) payload.protocol = protocol;
   return callNative<{ sessionId: string }>("send_text", payload);
 }
 
@@ -559,8 +567,25 @@ export async function stopService(force = false): Promise<StopServiceResult> {
   return callNative<StopServiceResult>("stop_localsend", { force });
 }
 
+/** Host wire format is topic/payload; accept legacy plugin queues at this boundary. */
+export function normalizeQueuedEvents(value: unknown): QueuedEvent[] {
+  if (!Array.isArray(value)) return [];
+  const events: QueuedEvent[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const wire = item as Record<string, unknown>;
+    const topic = typeof wire.topic === "string" ? wire.topic : wire.event;
+    if (typeof topic !== "string" || !topic.trim()) continue;
+    events.push({
+      event: topic.trim(),
+      data: Object.prototype.hasOwnProperty.call(wire, "payload") ? wire.payload : wire.data ?? null,
+    });
+  }
+  return events;
+}
+
 /** 取走事件队列里所有待处理事件（队列有界，满丢最旧）。 */
 export async function pollEvents(): Promise<QueuedEvent[]> {
-  const { events } = await callNative<{ events: QueuedEvent[] }>("poll_events");
-  return events;
+  const { events } = await callNative<{ events: unknown }>("poll_events");
+  return normalizeQueuedEvents(events);
 }

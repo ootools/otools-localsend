@@ -3,13 +3,15 @@
  * 接收完成记录展示落盘路径（destinations 线上可能缺席，归一化 ?? {}）。
  */
 
-import { formatBytes, formatTimestamp, transferStatusLabel } from "../format";
-import type { FileEntry, TransferRecord } from "../api";
+import { useState } from "react";
+import { cancelSession, type FileEntry, type TransferRecord } from "../api";
+import { formatBytes, formatError, formatTimestamp, transferStatusLabel } from "../format";
 
 interface TransferCardProps {
   record: TransferRecord;
   /** sessionId → fileId → percent；仅传输中的会话有意义。 */
   progress?: Record<string, number>;
+  onRefresh?: () => void | Promise<void>;
 }
 
 const STATUS_CHIPS: Record<string, string> = {
@@ -26,7 +28,26 @@ function filePercent(record: TransferRecord, percent?: number): number {
   return 0;
 }
 
-export function TransferCard({ record, progress }: TransferCardProps) {
+export function TransferCard({ record, progress, onRefresh }: TransferCardProps) {
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelError, setCancelError] = useState<string | null>(null);
+  const cancellable = record.status === "Pending" || record.status === "Transferring";
+  const cancel = async () => {
+    if (!cancellable || cancelling) return;
+    setCancelling(true);
+    setCancelError(null);
+    try {
+      await cancelSession(record.sessionId);
+      await onRefresh?.();
+    } catch (cause) {
+      setCancelError(formatError(cause));
+    } finally {
+      setCancelling(false);
+    }
+  };
+  const phase = record.status === "Pending"
+    ? (record.stage === "preparing" ? "正在准备文件…" : record.direction === "Send" ? "等待对方确认" : "等待接收确认")
+    : record.status === "Transferring" ? "正在传输文件…" : null;
   const destinations = record.destinations ?? {};
   const showProgress = record.status === "Transferring";
   const showDestinations = record.direction === "Receive" && record.status === "Done";
@@ -54,6 +75,19 @@ export function TransferCard({ record, progress }: TransferCardProps) {
       <p className="xfer-meta">
         {record.files.length} 个文件 · {formatBytes(totalSize)}
       </p>
+      {phase && <p className="xfer-meta" role="status">{phase}</p>}
+      {(record.error || cancelError) && (
+        <div className="banner banner-error" role="alert" style={{ marginTop: 10, marginBottom: 0 }}>
+          {cancelError ?? record.error}
+        </div>
+      )}
+      {cancellable && (
+        <div style={{ marginTop: 10 }}>
+          <button type="button" className="btn btn-sm btn-danger" disabled={cancelling} onClick={() => void cancel()}>
+            {cancelling ? "取消中…" : "取消传输"}
+          </button>
+        </div>
+      )}
 
       <ul className="xfer-files">
         {record.files.map((file) => (

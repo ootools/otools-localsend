@@ -26,6 +26,7 @@ export function TransfersPage({ store }: { store: PluginStore }) {
           key={record.sessionId}
           record={record}
           progress={store.progress[record.sessionId]}
+          onRefresh={store.refreshTransfers}
         />
       ))}
     </div>

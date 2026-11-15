@@ -78,7 +78,7 @@ export function DevicesPage({ store, onGoToTransfers }: DevicesPageProps) {
         setError("服务状态已变化，请在服务运行后重新选择文件");
         return;
       }
-      await sendFiles(selected.ip, selected.info.port, paths, pin.trim() || undefined);
+      await sendFiles(selected.ip, selected.info.port, paths, pin.trim() || undefined, selected.info.protocol);
       await store.refreshTransfers();
       onGoToTransfers();
     } catch (cause) {
@@ -98,7 +98,7 @@ export function DevicesPage({ store, onGoToTransfers }: DevicesPageProps) {
     setBusy("text");
     setError(null);
     try {
-      await sendText(selected.ip, selected.info.port, body, pin.trim() || undefined);
+      await sendText(selected.ip, selected.info.port, body, pin.trim() || undefined, selected.info.protocol);
       setText("");
       await store.refreshTransfers();
       onGoToTransfers();

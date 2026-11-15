@@ -2,7 +2,7 @@
  *
  * 令牌通过 CSS 变量下发；宿主给插件 webview 注入 html.light / html.dark
  * （webview/core.rs build_child_webview_theme_script），浏览器直跑两者皆无，
- * 默认呈现暗色。组件一律使用本文件的语义类，不直接写 zinc 工具类。
+ * 默认呈现亮色；仅 html.dark 启用暗色。组件一律使用本文件的语义类，不直接写 zinc 工具类。
  */
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -16,23 +16,7 @@
   --accent-deep: #2b5be0;
   --accent-ink: #1d3a8f;
 
-  /* 暗色（默认） */
-  --bg: #10141d;
-  --panel: #171c28;
-  --card: #1a2030;
-  --card2: #1f2638;
-  --line: #2a3145;
-  --line2: #232a3c;
-  --text: #e6ebf5;
-  --text2: #9aa5bd;
-  --dim: #6b7690;
-  --shadow: 0 12px 34px rgba(0, 0, 0, .45);
-  --shadow-sm: 0 2px 10px rgba(0, 0, 0, .35);
-  --input-bg: #121826;
-  --hover: #212941;
-}
-
-html.light {
+  /* 亮色（默认） */
   color-scheme: light;
   --bg: #eef2f9;
   --panel: #ffffff;
@@ -47,6 +31,23 @@ html.light {
   --shadow-sm: 0 2px 8px rgba(29, 42, 68, .07);
   --input-bg: #fbfcfe;
   --hover: #f2f5fb;
+}
+
+html.dark {
+  color-scheme: dark;
+  --bg: #10141d;
+  --panel: #171c28;
+  --card: #1a2030;
+  --card2: #1f2638;
+  --line: #2a3145;
+  --line2: #232a3c;
+  --text: #e6ebf5;
+  --text2: #9aa5bd;
+  --dim: #6b7690;
+  --shadow: 0 12px 34px rgba(0, 0, 0, .45);
+  --shadow-sm: 0 2px 10px rgba(0, 0, 0, .35);
+  --input-bg: #121826;
+  --hover: #212941;
 }
 
 html, body { height: 100%; }
@@ -132,7 +133,7 @@ input, select, textarea { accent-color: var(--accent); }
 .service-action { justify-content: center; }
 .service-error { font-size: 12px; line-height: 1.5; color: #e0857c; overflow-wrap: anywhere; }
 .service-compact .service-error { font-size: 11px; }
-html.light .service-error { color: #a3362d; }
+html:not(.dark) .service-error { color: #a3362d; }
 .preview-label { font-size: 11px; color: var(--text2); }
 .service-kv { margin-top: 14px; }
 
@@ -204,11 +205,11 @@ textarea.field { resize: vertical; line-height: 1.55; }
   margin-bottom: 12px;
 }
 .banner-error { background: rgba(212, 84, 74, .12); color: #e0857c; border: 1px solid rgba(212, 84, 74, .35); }
-html.light .banner-error { color: #a3362d; }
+html:not(.dark) .banner-error { color: #a3362d; }
 .banner-warn { background: rgba(224, 162, 60, .12); color: #e5b76a; border: 1px solid rgba(224, 162, 60, .3); }
-html.light .banner-warn { color: #a3691d; }
+html:not(.dark) .banner-warn { color: #a3691d; }
 .banner-ok { background: rgba(43, 182, 115, .12); color: #58c893; border: 1px solid rgba(43, 182, 115, .3); }
-html.light .banner-ok { color: #1d7a4f; }
+html:not(.dark) .banner-ok { color: #1d7a4f; }
 
 .empty {
   border: 1.5px dashed var(--line);
@@ -230,10 +231,10 @@ html.light .banner-ok { color: #1d7a4f; }
 .chip-done { color: #58c893; background: rgba(43, 182, 115, .15); }
 .chip-cancelled { color: var(--dim); background: color-mix(in srgb, var(--dim) 16%, transparent); }
 .chip-failed { color: #e0857c; background: rgba(212, 84, 74, .15); }
-html.light .chip-pending { color: #a3691d; }
-html.light .chip-transferring { color: #2b5be0; }
-html.light .chip-done { color: #1d7a4f; }
-html.light .chip-failed { color: #a3362d; }
+html:not(.dark) .chip-pending { color: #a3691d; }
+html:not(.dark) .chip-transferring { color: #2b5be0; }
+html:not(.dark) .chip-done { color: #1d7a4f; }
+html:not(.dark) .chip-failed { color: #a3362d; }
 
 .tile {
   display: inline-grid; place-items: center;
@@ -334,7 +335,7 @@ html.light .chip-failed { color: #a3362d; }
 .file-pick-head { display: flex; align-items: center; justify-content: space-between; font-size: 12px; color: var(--text2); }
 .file-pick-head button { color: var(--accent); font-size: 12px; }
 .file-pick-head button:hover { color: var(--accent-deep); }
-html.light .file-pick-head button:hover { color: var(--accent-ink); }
+html:not(.dark) .file-pick-head button:hover { color: var(--accent-ink); }
 .file-list { list-style: none; margin-top: 8px; max-height: 220px; overflow-y: auto; display: grid; gap: 2px; }
 .file-row {
   display: flex; align-items: center; gap: 9px;
@@ -381,8 +382,8 @@ html.light .file-pick-head button:hover { color: var(--accent-ink); }
   transition: all .15s ease;
 }
 .link-chip:hover { background: color-mix(in srgb, var(--accent) 20%, transparent); }
-html.light .link-chip { color: var(--accent-ink); }
-html.light .link-chip:hover { background: color-mix(in srgb, var(--accent) 18%, transparent); }
+html:not(.dark) .link-chip { color: var(--accent-ink); }
+html:not(.dark) .link-chip:hover { background: color-mix(in srgb, var(--accent) 18%, transparent); }
 
 /* ---------- 滚动条 ---------- */
 

@@ -88,6 +88,109 @@ function bridge(over: Partial<{
   };
 }
 
+test("slow periodic history responses are coalesced and still recover consent and failure details", async (t) => {
+  let slow = false;
+  const requests: Array<ReturnType<typeof deferred<TransferRecord[]>>> = [];
+  const native = bridge({
+    transfers: () => {
+      if (!slow) return Promise.resolve([]);
+      const request = deferred<TransferRecord[]>();
+      requests.push(request);
+      return request.promise;
+    },
+    poll: async () => [],
+  });
+  const hook = mountHook(usePollEvents);
+  t.after(async () => {
+    hook.unmount();
+    for (const request of requests) request.resolve([]);
+    await hook.flush();
+    native.restore();
+  });
+  await hook.flush();
+  slow = true;
+  native.drain();
+  await hook.flush();
+  for (let tick = 0; tick < 20; tick++) {
+    native.drain();
+    await hook.flush();
+  }
+  assert.equal(requests.length, 1, "periodic ticks accumulated overlapping history calls");
+  requests[0].resolve([
+    { ...pending, sessionId: "slow-incoming" },
+    { ...done, direction: "Send", status: "Failed", stage: "finished", error: "prepare-upload: HTTP 401 (PIN required or invalid)" },
+  ]);
+  await hook.flush();
+  assert.equal(hook.current().incoming[0]?.sessionId, "slow-incoming");
+  assert.equal(hook.current().transfers.find((record) => record.sessionId === "done")?.status, "Failed");
+  assert.match(hook.current().transfers.find((record) => record.sessionId === "done")?.error ?? "", /HTTP 401/);
+  native.drain();
+  await hook.flush();
+  assert.equal(requests.length, 2, "background refresh did not resume after completion");
+});
+
+test("manual history refresh can supersede a slow background call without losing completed paths", async (t) => {
+  const slow = deferred<TransferRecord[]>();
+  let hold = false;
+  let records: TransferRecord[] = [{ ...pending, status: "Transferring" }];
+  const native = bridge({ transfers: () => hold ? slow.promise : Promise.resolve(records), poll: async () => [] });
+  const hook = mountHook(usePollEvents);
+  t.after(async () => { hook.unmount(); slow.resolve([]); await hook.flush(); native.restore(); });
+  await hook.flush();
+  hold = true;
+  native.drain();
+  await hook.flush();
+  hold = false;
+  records = [{ ...pending, status: "Done", destinations: { file: "D:\\slow-completed.txt" } }];
+  await hook.current().refreshTransfers();
+  await hook.flush();
+  slow.resolve([{ ...pending, status: "Transferring" }]);
+  await hook.flush();
+  assert.equal(hook.current().transfers[0]?.status, "Done");
+  assert.equal(hook.current().transfers[0]?.destinations?.file, "D:\\slow-completed.txt");
+  assert.deepEqual(hook.current().incoming, []);
+});
+
+test("lost host events recover Pending confirmation and terminal records through periodic authority reads", async (t) => {
+  let records: TransferRecord[] = [];
+  const native = bridge({ transfers: async () => records, poll: async () => [] });
+  const hook = mountHook(usePollEvents);
+  t.after(async () => { hook.unmount(); await hook.flush(); native.restore(); });
+  await hook.flush();
+  assert.deepEqual(hook.current().incoming, []);
+  records = [{ ...pending, sessionId: "lost-incoming" }];
+  native.drain();
+  await hook.flush();
+  assert.equal(hook.current().incoming[0]?.sessionId, "lost-incoming", "no consent dialog appeared when the host had already drained its event");
+  assert.equal(hook.current().transfers[0]?.status, "Pending");
+
+  records = [{ ...pending, sessionId: "lost-incoming", status: "Done", destinations: { file: "D:\\completed.txt" } }];
+  native.drain();
+  await hook.flush();
+  assert.deepEqual(hook.current().incoming, []);
+  assert.equal(hook.current().transfers[0]?.status, "Done", "missed completion event left the UI pending");
+  assert.equal(hook.current().transfers[0]?.destinations?.file, "D:\\completed.txt");
+});
+
+test("periodic history recovery does not depend on the event channel succeeding", async (t) => {
+  let records: TransferRecord[] = [];
+  const native = bridge({
+    transfers: async () => records,
+    poll: async () => { throw new Error("events temporarily unavailable"); },
+  });
+  const hook = mountHook(usePollEvents);
+  t.after(async () => { hook.unmount(); await hook.flush(); native.restore(); });
+  await hook.flush();
+  records = [pending];
+  native.drain();
+  await hook.flush();
+  assert.equal(hook.current().incoming[0]?.sessionId, "pending");
+  hook.current().dismissIncoming("pending");
+  native.drain();
+  await hook.flush();
+  assert.deepEqual(hook.current().incoming, [], "authority recovery reopened an already handled request");
+});
+
 test("mount rebuilds Pending receive state passively; stopped clears live state and ignores old listen/poll status", async (t) => {
   const native = bridge();
   const hook = mountHook(usePollEvents);

@@ -21,13 +21,15 @@ interface Draft {
   notifyOnIncoming: boolean;
 }
 
+const DEFAULT_DOWNLOAD_DIR = "~/Download/OToolsLocalSend";
+
 function draftFrom(settings: Settings): Draft {
   return {
     alias: settings.alias ?? "",
     deviceModel: settings.deviceModel ?? "",
     deviceType: settings.deviceType || "desktop",
     port: String(settings.port ?? 53317),
-    downloadDir: settings.downloadDir ?? "",
+    downloadDir: settings.downloadDir?.trim() || DEFAULT_DOWNLOAD_DIR,
     pin: settings.pin ?? "",
     autoSave: Boolean(settings.autoSave),
     notifyOnIncoming: Boolean(settings.notifyOnIncoming),
@@ -54,7 +56,7 @@ export function SettingsPage({ store }: { store: PluginStore }) {
 
   const pickDownloadDir = async () => {
     try {
-      const dir = isPreviewMode() ? "D:\\Downloads" : await pickDirectory({ title: "选择下载目录" });
+      const dir = isPreviewMode() ? DEFAULT_DOWNLOAD_DIR : await pickDirectory({ title: "选择下载目录" });
       if (dir && draft) {
         setDraft({ ...draft, downloadDir: dir });
       }
@@ -82,13 +84,14 @@ export function SettingsPage({ store }: { store: PluginStore }) {
         deviceModel: draft.deviceModel.trim() || null,
         deviceType: draft.deviceType,
         port,
-        downloadDir: draft.downloadDir.trim() || null,
+        downloadDir: draft.downloadDir.trim() || DEFAULT_DOWNLOAD_DIR,
         pin: draft.pin.trim() || null,
         autoSave: draft.autoSave,
         notifyOnIncoming: draft.notifyOnIncoming,
       };
       await setSettings(next);
       await store.refreshSettings();
+      setDraft((current) => current ? { ...current, downloadDir: next.downloadDir || DEFAULT_DOWNLOAD_DIR } : current);
       setSaved(true);
       window.setTimeout(() => setSaved(false), 2000);
     } catch (cause) {
@@ -193,13 +196,13 @@ export function SettingsPage({ store }: { store: PluginStore }) {
             />
           </label>
           <label className="field-label">
-            下载目录（留空则保存在插件数据目录）
+            下载目录（留空恢复默认目录）
             <span className="send-row" style={{ flexWrap: "nowrap" }}>
               <input
                 type="text"
                 value={draft.downloadDir}
                 onChange={(event) => setDraft({ ...draft, downloadDir: event.target.value })}
-                placeholder="如 D:\\Downloads"
+                placeholder={DEFAULT_DOWNLOAD_DIR}
                 className="field"
               />
               <button

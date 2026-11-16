@@ -184,15 +184,29 @@ pub(crate) struct ServiceController {
     inner: Mutex<Inner>,
     runtime: Handle,
     data_dir: PathBuf,
+    home_dir: PathBuf,
     settings: Arc<RwLock<Settings>>,
     receive: Arc<ReceiveSessions>,
     events: Arc<WebEventBroadcaster>,
 }
 
 impl ServiceController {
+    #[cfg(test)]
     pub fn new(
         runtime: Handle,
         data_dir: PathBuf,
+        settings: Arc<RwLock<Settings>>,
+        receive: Arc<ReceiveSessions>,
+        events: Arc<WebEventBroadcaster>,
+    ) -> Self {
+        let home_dir = data_dir.join("home");
+        Self::new_with_home(runtime, data_dir, home_dir, settings, receive, events)
+    }
+
+    pub fn new_with_home(
+        runtime: Handle,
+        data_dir: PathBuf,
+        home_dir: PathBuf,
         settings: Arc<RwLock<Settings>>,
         receive: Arc<ReceiveSessions>,
         events: Arc<WebEventBroadcaster>,
@@ -207,6 +221,7 @@ impl ServiceController {
             }),
             runtime,
             data_dir,
+            home_dir,
             settings,
             receive,
             events,
@@ -381,7 +396,7 @@ impl ServiceController {
     }
 
     async fn initialize(self: &Arc<Self>, generation: &Arc<Generation>) -> Result<(), String> {
-        let loaded = settings::load(&self.data_dir);
+        let loaded = settings::load(&self.data_dir).for_runtime(&self.home_dir)?;
         *self
             .settings
             .write()

@@ -557,6 +557,15 @@ pub fn start_send_with_protocol(
         error: None,
         created_at: now_ms(),
         destinations: HashMap::new(),
+        sources: entries_sources
+            .iter()
+            .filter_map(|(entry, source)| match source {
+                SendSource::File(path) => {
+                    Some((entry.id.clone(), path.to_string_lossy().into_owned()))
+                }
+                SendSource::Bytes(_) => None,
+            })
+            .collect(),
     });
 
     let guard = SendGuard {
@@ -612,8 +621,18 @@ fn build_entry(item: &SendItem) -> Result<(FileEntry, SendSource), String> {
             ))
         }
         SendItem::File(path) => {
+            let path = if path.is_absolute() {
+                path.clone()
+            } else {
+                std::env::current_dir()
+                    .map_err(|error| error.to_string())?
+                    .join(path)
+            };
             let metadata =
-                std::fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+                std::fs::metadata(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+            if !metadata.is_file() {
+                return Err(format!("not a file: {}", path.display()));
+            }
             let file_name = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -624,7 +643,7 @@ fn build_entry(item: &SendItem) -> Result<(FileEntry, SendSource), String> {
                     id: uuid::Uuid::new_v4().to_string(),
                     file_name,
                     size: metadata.len(),
-                    file_type: mime_for(path),
+                    file_type: mime_for(&path),
                     sha256: None, // streamed hash inside the job
                     preview: None,
                     metadata: file_metadata(&metadata),
@@ -649,6 +668,7 @@ fn mime_for(path: &Path) -> String {
             "png" => Some("image/png"),
             "jpg" | "jpeg" => Some("image/jpeg"),
             "gif" => Some("image/gif"),
+            "bmp" => Some("image/bmp"),
             "svg" => Some("image/svg+xml"),
             "webp" => Some("image/webp"),
             "pdf" => Some("application/pdf"),
@@ -1847,6 +1867,48 @@ mod tests {
             0,
             "pending map cleaned at session end"
         );
+    }
+
+    #[tokio::test]
+    async fn send_sources_persist_locally_without_leaking_into_prepare_wire() {
+        use crate::test_peer::{Peer, Response};
+        let peer = Peer::http(|request| {
+            assert_eq!(request.path, "/api/localsend/v2/prepare-upload");
+            let body: Value = serde_json::from_slice(&request.body).expect("prepare JSON");
+            assert!(body.get("sources").is_none());
+            let entry = body["files"].as_object().unwrap().values().next().unwrap();
+            assert!(entry.get("path").is_none());
+            assert!(entry.get("sources").is_none());
+            assert!(entry.get("destinations").is_none());
+            Response::json(204, "")
+        });
+        let (state, directory) = test_state();
+        let path = directory.path().join("local-image.bmp");
+        std::fs::write(&path, b"fixture source bytes").expect("source");
+        let id = send_to_peer(
+            Arc::clone(&state),
+            "127.0.0.1".into(),
+            peer.port,
+            vec![SendItem::File(path.clone())],
+            None,
+        )
+        .await
+        .expect("send");
+        let record = serde_json::to_value(record_of(&state, &id)).expect("local history");
+        let file_id = record["files"][0]["id"].as_str().unwrap();
+        assert_eq!(
+            record["sources"][file_id],
+            path.to_string_lossy().as_ref(),
+            "sender discarded local source path"
+        );
+        let reloaded = ReceiveSessions::new(directory.path(), Arc::new(WebEventBroadcaster::new()))
+            .expect("reload history");
+        let loaded = serde_json::to_value(reloaded.transfer_records()).unwrap();
+        assert_eq!(
+            loaded[0]["sources"][file_id],
+            path.to_string_lossy().as_ref()
+        );
+        assert_eq!(loaded[0]["files"][0]["fileType"], "image/bmp");
     }
 
     #[tokio::test]

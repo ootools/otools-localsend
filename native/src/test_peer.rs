@@ -108,6 +108,18 @@ impl Peer {
                                 }
                             }
                             if !handshake_ok {
+                                // Deliver the fatal alert before closing; unread client bytes
+                                // otherwise turn this fixture failure into a Winsock reset.
+                                while connection.wants_write() {
+                                    if connection.write_tls(&mut socket).is_err() {
+                                        break;
+                                    }
+                                }
+                                let _ = socket.flush();
+                                let _ = socket.shutdown(std::net::Shutdown::Write);
+                                let _ = socket.set_read_timeout(Some(Duration::from_millis(200)));
+                                let mut remaining = [0; 1024];
+                                while socket.read(&mut remaining).is_ok_and(|size| size > 0) {}
                                 continue;
                             }
                             let fingerprint = connection

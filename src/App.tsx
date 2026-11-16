@@ -1,7 +1,7 @@
 /**
  * 应用壳：汇澜式侧栏布局（品牌 + 导航 + 服务状态徽标）+ 主区（标题栏 +
  * 滚动视图）+ 传入请求弹窗队列。服务快照、手动控制与单个停服确认均由
- * usePollEvents 提供共享状态；查询与挂载绝不自动启动服务。
+ * usePollEvents 提供共享状态；打开页面时自动启动一次，查询仍保持被动。
  */
 
 import { useState } from "react";
@@ -49,16 +49,16 @@ export function App() {
     await store.refreshTransfers();
   };
 
-  const acceptAll = () => {
+  const acceptAll = (destinations?: Record<string, string>) => {
     if (!activeRequest) return;
     const sessionId = activeRequest.sessionId;
-    void respondAndClose(() => acceptSession(sessionId, "all"));
+    void respondAndClose(() => acceptSession(sessionId, "all", destinations));
   };
 
-  const acceptSelected = (fileIds: string[]) => {
+  const acceptSelected = (fileIds: string[], destinations?: Record<string, string>) => {
     if (!activeRequest) return;
     const sessionId = activeRequest.sessionId;
-    void respondAndClose(() => acceptSession(sessionId, fileIds));
+    void respondAndClose(() => acceptSession(sessionId, fileIds, destinations));
   };
 
   const decline = () => {
@@ -142,6 +142,7 @@ export function App() {
         <IncomingDialog
           key={activeRequest.sessionId}
           request={activeRequest}
+          downloadDir={store.settings?.downloadDir}
           busy={dialogBusy || store.serviceBusy || store.server?.state !== "running"}
           error={dialogError ?? store.serviceError}
           onAcceptAll={acceptAll}

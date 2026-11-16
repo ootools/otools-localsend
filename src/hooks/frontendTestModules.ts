@@ -6,7 +6,7 @@ import React from "react";
 
 /** A small hook lifecycle driver; production hooks and their native boundary stay real. */
 export function mountHook<T>(hook: () => T, commit?: (value: T) => void) {
-  type Cell = { value?: unknown; dependencies?: readonly unknown[]; cleanup?: () => void };
+  type Cell = { value?: unknown; dependencies?: readonly unknown[]; cleanup?: () => void; effect?: () => (() => void) | void };
   const cells: Cell[] = [];
   let index = 0;
   let dirty = true;
@@ -52,7 +52,7 @@ export function mountHook<T>(hook: () => T, commit?: (value: T) => void) {
       const position = index++;
       if (cells[position] && same(cells[position].dependencies, dependencies)) return;
       const previous = cells[position];
-      cells[position] = { dependencies };
+      cells[position] = { dependencies, effect };
       effects.push(() => {
         previous?.cleanup?.();
         cells[position].cleanup = effect() || undefined;
@@ -78,6 +78,10 @@ export function mountHook<T>(hook: () => T, commit?: (value: T) => void) {
         if (dirty) render();
       }
       return value;
+    },
+    replayEffects: () => {
+      for (const cell of cells) { cell?.cleanup?.(); if (cell) cell.cleanup = undefined; }
+      for (const cell of cells) if (cell?.effect) cell.cleanup = cell.effect() || undefined;
     },
     unmount: () => { for (const cell of cells) cell?.cleanup?.(); },
   };

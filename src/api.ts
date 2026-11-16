@@ -84,10 +84,30 @@ export interface TransferRecord {
    * 因此声明为可选，消费端一律 `record.destinations ?? {}` 归一化。
    */
   destinations?: Record<string, string>;
+  /** Absolute local send sources; never part of a LocalSend network file DTO. */
+  sources?: Record<string, string>;
   /** Native transport phase; optional for older persisted history. */
   stage?: "preparing" | "waiting" | "uploading" | "finished";
   /** Sanitized transport diagnostic; never contains a PIN, token or body. */
   error?: string | null;
+}
+
+export type FileResourceQuery = { path: string } | { sessionId: string; fileId: string };
+
+export interface FilePreview {
+  status: "ready" | "unavailable";
+  dataUrl?: string;
+  width?: number;
+  height?: number;
+  version?: string;
+  reason?: string;
+}
+
+export interface ImageCopy {
+  resourceId: string;
+  path: string;
+  width: number;
+  height: number;
 }
 
 /** 本机设置（settings.json）。 */
@@ -259,7 +279,7 @@ const previewIncoming: IncomingRequestEvent = {
   files: [
     { id: "p1", fileName: "旅游照片合集.zip", size: 1_284_337_664, fileType: "application/zip", sha256: null, preview: null, metadata: null },
     { id: "p2", fileName: "会议纪要.docx", size: 38_912, fileType: "application/msword", sha256: null, preview: null, metadata: null },
-    { id: "p3", fileName: "设计稿-终版.pdf", size: 9_420_288, fileType: "application/pdf", sha256: null, preview: null, metadata: null },
+    { id: "p3", fileName: "旅行风景.png", size: 2_420_288, fileType: "image/png", sha256: null, preview: null, metadata: null },
   ],
 };
 
@@ -267,7 +287,7 @@ const previewIncoming: IncomingRequestEvent = {
 const previewListeners = new Map<string, Set<(payload: unknown) => void>>();
 let previewSettings: Settings = {
   alias: "My-PC", deviceModel: "Windows 11 Pro", deviceType: "desktop",
-  port: 53317, downloadDir: "D:\\Downloads", pin: null,
+  port: 53317, downloadDir: "~/Download/OToolsLocalSend", pin: null,
   autoSave: false, notifyOnIncoming: true,
 };
 const previewKnownDevices = [
@@ -302,7 +322,13 @@ let previewTransfers: TransferRecord[] = [
     files: [
       { id: "f4", fileName: "message.txt", size: 24, fileType: "text/plain", sha256: null, preview: "晚上一起吃饭？", metadata: null },
     ],
-    destinations: { f4: "D:\\Downloads\\message.txt" },
+    destinations: { f4: "/preview/Download/OToolsLocalSend/message.txt" },
+  },
+  {
+    sessionId: "preview-photo", direction: "Receive", peerAlias: "iPhone 15 Pro",
+    status: "Done", createdAt: Date.now() - 300_000,
+    files: [{ id: "photo", fileName: "旅行风景.png", size: 2_420_288, fileType: "image/png", sha256: null, preview: null, metadata: null }],
+    destinations: { photo: "/preview/Download/OToolsLocalSend/旅行风景.png" },
   },
 ];
 let previewServer: ServerStatus = {
@@ -344,6 +370,24 @@ function cancelPreviewSession(sessionId: string): void {
   emitPreview(EVENTS.transferDone, { sessionId, status: "cancelled" });
 }
 
+const previewCopies = new Set<string>();
+const previewImageDataUrl = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAPAAAACMCAMAAAB1a9QaAAAAD1BMVEWr1PT/03hLiY5hmaZHkbeC32Z2AAABeElEQVR42u3YUXLCMAxFUUuv+19zhw9aSkmIExMe1r0b0JwPz1hqjYiIiIiIiOgji9+KcUuQI2qJI2qJI2qJI2qJI4qJq4EjiokBAwYMGDBgwIAB85cGzD7MxaND3FotcWu1xK1AxbhERETrZWY1byVxXqvmrSHOv1Xzzi7OR1XzzivO5ap5ZxTns6p55xLntqp5ZxFnT9W8ny/O/kaO1yVz70Cxrllzh5F1m7d3hFj3OXOPk/Uoa+8hsZYy5h4gay1n7z6xnuXL3UPWloy9nWJtzZbbRVZPvt6tYvXmyt1E1r5cvc/E2p8nd52sY5l6F8U6niV3gawxeXr/izUuR+49WWOz9N6INT5D7g9Zr8nRexHrdflxL0lvI2fOJ5Yd923kzGnFj8z57k4mZ04vlhf3VHJmFbG8vGeRs5ZYXuAzXnIWE9uBX76uAAYMGPBHgb+KBRgwYMCAAQMGDBgwYMCAAQMGDBgwYMCAAQMGDBgwYMCAAQOeoW+7Y8hdZ4LceQAAAABJRU5ErkJggg==";
+
+function previewMime(path: string): string {
+  const extension = path.split(".").pop()?.toLowerCase() ?? "";
+  const types: Record<string, string> = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", bmp: "image/bmp", webp: "image/webp", heic: "image/heic" };
+  return types[extension] ?? "application/octet-stream";
+}
+
+function previewLocalPath(payload: Record<string, unknown>): { path: string; image: boolean } | null {
+  if (typeof payload.path === "string") return { path: payload.path, image: previewMime(payload.path).startsWith("image/") };
+  const record = previewTransfers.find((item) => item.sessionId === payload.sessionId);
+  const file = record?.files.find((item) => item.id === payload.fileId);
+  if (!record || !file) return null;
+  const path = (record.direction === "Send" ? record.sources : record.destinations)?.[file.id];
+  return path ? { path, image: file.fileType.startsWith("image/") } : null;
+}
+
 function requirePreviewRunning(): void {
   if (previewServer.state !== "running") throw new Error("预览模拟：服务未运行");
 }
@@ -353,6 +397,7 @@ function previewInvoke(method: string, payload: Record<string, unknown> = {}): u
     case "settings_get": return { ...previewSettings };
     case "settings_set": {
       previewSettings = { ...(payload.settings as Settings) };
+      if (!previewSettings.downloadDir?.trim()) previewSettings.downloadDir = "~/Download/OToolsLocalSend";
       return { ...previewSettings };
     }
     case "server_status": return previewStatusSnapshot();
@@ -406,8 +451,21 @@ function previewInvoke(method: string, payload: Record<string, unknown> = {}): u
       const sessionId = String(payload.sessionId);
       const record = previewTransfers.find((item) => item.sessionId === sessionId && item.status === "Pending");
       if (!record) throw new Error("预览模拟：会话已不存在");
-      record.status = "Transferring";
-      return { accepted: record.files.map((file) => file.id) };
+      const fileIds = Array.isArray(payload.fileIds) ? payload.fileIds as string[] : record.files.map((file) => file.id);
+      if (fileIds.some((id) => !record.files.some((file) => file.id === id))) throw new Error("预览模拟：未知文件");
+      const selected = record.files.filter((file) => fileIds.includes(file.id));
+      const targets = (payload.destinations ?? {}) as Record<string, string>;
+      if (Object.keys(targets).some((id) => !fileIds.includes(id))) throw new Error("预览模拟：保存目标不在接受范围");
+      record.status = selected.length ? "Transferring" : "Done";
+      record.stage = selected.length ? "uploading" : "finished";
+      setTimeout(() => {
+        if (record.status !== "Transferring") return;
+        record.destinations = Object.fromEntries(selected.map((file) => [file.id, targets[file.id] ?? `/preview/Download/OToolsLocalSend/${file.fileName}`]));
+        record.status = "Done";
+        record.stage = "finished";
+        emitPreview(EVENTS.transferDone, { sessionId, status: "done" });
+      }, 500);
+      return { accepted: fileIds };
     }
     case "session_decline":
     case "session_cancel": {
@@ -423,13 +481,35 @@ function previewInvoke(method: string, payload: Record<string, unknown> = {}): u
         fileType: "text/plain", sha256: null, preview: String(payload.text), metadata: null,
       }] : (payload.files as Array<{ path: string }>).map(({ path }, index) => ({
         id: `file-${index}`, fileName: path.split(/[\\/]/).pop() || path, size: 238_912,
-        fileType: "application/octet-stream", sha256: null, preview: null, metadata: null,
+        fileType: previewMime(path), sha256: null, preview: null, metadata: null,
       }));
+      const sources = method === "send_files" ? Object.fromEntries((payload.files as Array<{ path: string }>).map((item, index) => [files[index].id, item.path])) : {};
       previewTransfers = [{
         sessionId, direction: "Send", peerAlias: previewDevices.find((device) => device.ip === payload.ip)?.info.alias ?? "预览设备",
-        files, status: "Transferring", createdAt: Date.now(),
+        files, sources, status: "Transferring", createdAt: Date.now(),
       }, ...previewTransfers];
       return { sessionId };
+    }
+    case "file_preview": {
+      const resource = previewLocalPath(payload);
+      return resource?.image ? { status: "ready", dataUrl: previewImageDataUrl, width: 240, height: 140, version: resource.path }
+        : { status: "unavailable", reason: resource ? "unsupported" : "not-received" };
+    }
+    case "prepare_image_copy": {
+      const resource = previewLocalPath(payload);
+      if (!resource?.image) throw new Error("预览模拟：图片尚不可用");
+      const resourceId = `preview-copy-${++previewSequence}`;
+      previewCopies.add(resourceId);
+      return { resourceId, path: `/preview/copies/${resourceId}.png`, width: 240, height: 140 };
+    }
+    case "release_image_copy": {
+      if (!previewCopies.delete(String(payload.resourceId))) throw new Error("预览模拟：未知图片资源");
+      return {};
+    }
+    case "resolve_transfer_file": {
+      const resource = previewLocalPath(payload);
+      if (!resource) throw new Error("预览模拟：文件尚不可用");
+      return { path: resource.path };
     }
     default: throw new Error(`预览模式未仿真该 method: ${method}`);
   }
@@ -523,17 +603,39 @@ export async function sendText(
 
 /**
  * 接收会话接受。fileIds 传 "all"（或不传）表示全部接受；传数组表示只接受
- * 勾选文件（native 会跳过未知 id）。
+ * 勾选文件；未知 id 或不合法保存目标会被 native 拒绝且不会接受。
  */
 export async function acceptSession(
   sessionId: string,
   fileIds: string[] | "all" = "all",
+  destinations?: Record<string, string>,
 ): Promise<void> {
   const payload: Record<string, unknown> = { sessionId };
   if (fileIds !== "all") {
     payload.fileIds = fileIds;
   }
+  if (destinations && Object.keys(destinations).length > 0) payload.destinations = destinations;
   await callNative<{ accepted: string[] }>("session_accept", payload);
+}
+
+export async function resolveDownloadDirectory(path?: string | null): Promise<{ path: string }> {
+  return callNative<{ path: string }>("resolve_download_directory", path == null ? {} : { path });
+}
+
+export async function previewFile(query: FileResourceQuery): Promise<FilePreview> {
+  return callNative<FilePreview>("file_preview", { ...query });
+}
+
+export async function prepareImageCopy(query: FileResourceQuery): Promise<ImageCopy> {
+  return callNative<ImageCopy>("prepare_image_copy", { ...query });
+}
+
+export async function releaseImageCopy(resourceId: string): Promise<void> {
+  await callNative<Record<string, never>>("release_image_copy", { resourceId });
+}
+
+export async function resolveTransferFile(sessionId: string, fileId: string): Promise<{ path: string }> {
+  return callNative<{ path: string }>("resolve_transfer_file", { sessionId, fileId });
 }
 
 export async function declineSession(sessionId: string): Promise<void> {

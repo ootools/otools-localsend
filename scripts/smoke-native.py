@@ -96,7 +96,8 @@ def main():
         assert unknown["ok"] is False, f"unknown method must fail: {unknown}"
         print("PASS: settings_get defaults, empty event drain, unknown method rejected")
 
-        updated = invoke("settings_set", {"settings": {"alias": "Smoke设备", "port": 53318}})
+        updated = invoke("settings_set", {"settings": {"alias": "Smoke设备", "port": 53318,
+            "downloadDir": str(Path(directory) / "downloads")}})
         assert updated["ok"] is True, f"settings_set: {updated.get('error')}"
         reloaded = invoke("settings_get")
         assert reloaded["data"]["alias"] == "Smoke设备", f"alias lost: {reloaded['data']}"

@@ -1,11 +1,13 @@
 use crate::discovery::{DeviceEntry, DiscoveryShared};
 use crate::event_bridge::WebEventBroadcaster;
-use crate::models::RegisterResponse;
+use crate::file_resources::{FileResources, ResourceOperation};
+use crate::models::{Direction, RegisterResponse};
 use crate::sender::{self, SendItem};
 use crate::server::{self, ReceiveSessions};
 use crate::service::{wait_cancelled, ServiceController};
 use crate::settings::{self, Settings};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -25,6 +27,8 @@ enum Slot {
 struct PluginRuntime {
     runtime: Runtime,
     data_dir: PathBuf,
+    home_dir: PathBuf,
+    resources: Arc<FileResources>,
     service: Arc<ServiceController>,
     /// Native→frontend event queue. Shared as `Arc` so background workers
     /// spawned on the runtime can emit events without touching the plugin
@@ -38,10 +42,20 @@ struct PluginRuntime {
 
 impl PluginRuntime {
     fn new() -> Result<Self, String> {
-        Self::new_at(settings::resolve_data_dir()?)
+        let home = directories::BaseDirs::new()
+            .ok_or("could not resolve the user home directory")?
+            .home_dir()
+            .to_path_buf();
+        Self::new_with_home(settings::resolve_data_dir()?, home)
     }
 
+    #[cfg(test)]
     fn new_at(data_dir: PathBuf) -> Result<Self, String> {
+        let home = data_dir.join("home");
+        Self::new_with_home(data_dir, home)
+    }
+
+    fn new_with_home(data_dir: PathBuf, home_dir: PathBuf) -> Result<Self, String> {
         let runtime = Builder::new_multi_thread()
             .worker_threads(4)
             .thread_name("otools-localsend")
@@ -51,14 +65,18 @@ impl PluginRuntime {
         std::fs::create_dir_all(&data_dir)
             .map_err(|error| format!("create data dir {}: {error}", data_dir.display()))?;
         let broadcaster = Arc::new(WebEventBroadcaster::new());
-        let settings_snapshot = Arc::new(RwLock::new(settings::load(&data_dir)));
+        let settings_snapshot = Arc::new(RwLock::new(
+            settings::load(&data_dir).for_runtime(&home_dir)?,
+        ));
+        let resources = Arc::new(FileResources::new(&data_dir)?);
         let receive = Arc::new(
             ReceiveSessions::new(&data_dir, Arc::clone(&broadcaster))
                 .map_err(|error| format!("receive sessions: {error}"))?,
         );
-        let service = Arc::new(ServiceController::new(
+        let service = Arc::new(ServiceController::new_with_home(
             runtime.handle().clone(),
             data_dir.clone(),
+            home_dir.clone(),
             Arc::clone(&settings_snapshot),
             Arc::clone(&receive),
             Arc::clone(&broadcaster),
@@ -66,6 +84,8 @@ impl PluginRuntime {
         Ok(Self {
             runtime,
             data_dir,
+            home_dir,
+            resources,
             service,
             broadcaster,
             settings_snapshot,
@@ -76,6 +96,7 @@ impl PluginRuntime {
     fn shutdown(self) {
         // The caller has already released Slot. Cancel/drain service ownership
         // first, then dropping Tokio joins its workers before DLL unload.
+        self.resources.shutdown();
         self.runtime.block_on(self.service.shutdown());
         drop(self.runtime);
     }
@@ -134,7 +155,107 @@ pub fn invoke(method: &str, payload: Value) -> Result<Value, String> {
         return Err("plugin retired".into());
     }
     let plugin = ensure_running(&mut guard)?;
+    if is_resource_method(method) {
+        let operation = plugin.resources.enter()?;
+        let receive = Arc::clone(&plugin.receive);
+        drop(guard);
+        return invoke_resource(&operation, &receive, method, payload);
+    }
     invoke_plugin(plugin, method, payload)
+}
+
+fn is_resource_method(method: &str) -> bool {
+    matches!(
+        method,
+        "file_preview" | "prepare_image_copy" | "release_image_copy" | "resolve_transfer_file"
+    )
+}
+
+fn resource_path(
+    sessions: &ReceiveSessions,
+    payload: &Value,
+    allow_path: bool,
+) -> Result<(PathBuf, Option<u64>), String> {
+    let has_path = payload.get("path").is_some();
+    let has_reference = payload.get("sessionId").is_some() || payload.get("fileId").is_some();
+    if has_path {
+        if !allow_path || has_reference {
+            return Err("use exactly one local path or transfer reference".into());
+        }
+        return payload
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(|path| (PathBuf::from(path), None))
+            .ok_or_else(|| "payload.path must be a local file path".into());
+    }
+    let session_id = require_session_id(payload)?;
+    let file_id = payload
+        .get("fileId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or("payload.fileId is required")?;
+    let record = sessions
+        .transfer_records()
+        .into_iter()
+        .find(|record| record.session_id == session_id)
+        .ok_or("transfer file is unavailable")?;
+    let entry = record
+        .files
+        .iter()
+        .find(|file| file.id == file_id)
+        .ok_or("transfer file is unavailable")?;
+    let paths = match record.direction {
+        Direction::Send => &record.sources,
+        Direction::Receive => &record.destinations,
+    };
+    paths
+        .get(file_id)
+        .filter(|path| !path.is_empty())
+        .map(|path| (PathBuf::from(path), Some(entry.size)))
+        .ok_or_else(|| "transfer file is unavailable".into())
+}
+
+fn invoke_resource(
+    operation: &ResourceOperation,
+    sessions: &ReceiveSessions,
+    method: &str,
+    payload: Value,
+) -> Result<Value, String> {
+    if method == "release_image_copy" {
+        let id = payload
+            .get("resourceId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or("payload.resourceId is required")?;
+        operation.release_image_copy(id)?;
+        return Ok(json!({}));
+    }
+    let (path, expected_size) =
+        match resource_path(sessions, &payload, method != "resolve_transfer_file") {
+            Ok(path) => path,
+            Err(_) if method == "file_preview" => {
+                return Ok(json!({"status":"unavailable", "reason":"not-received"}))
+            }
+            Err(error) => return Err(error),
+        };
+    if let Some(size) = expected_size {
+        if let Err(error) = operation.resolve_file_with_size(&path, size) {
+            if method == "file_preview" {
+                return Ok(json!({"status":"unavailable", "reason":"unavailable"}));
+            }
+            return Err(error);
+        }
+    }
+    match method {
+        "file_preview" => {
+            serde_json::to_value(operation.preview(&path)).map_err(|error| error.to_string())
+        }
+        "prepare_image_copy" => serde_json::to_value(operation.prepare_image_copy(&path)?)
+            .map_err(|error| error.to_string()),
+        "resolve_transfer_file" => Ok(json!({"path": operation.resolve_file(&path)?})),
+        _ => Err(format!("unknown method: {method}")),
+    }
 }
 
 fn invoke_plugin(
@@ -142,10 +263,21 @@ fn invoke_plugin(
     method: &str,
     payload: Value,
 ) -> Result<Value, String> {
+    if is_resource_method(method) {
+        return invoke_resource(&plugin.resources.enter()?, &plugin.receive, method, payload);
+    }
     // FFI dispatch has no Tokio context; asynchronous receiver cleanup must
     // still spawn on this plugin's long-lived shell, without waiting here.
     let _runtime = plugin.runtime.enter();
     match method {
+        "resolve_download_directory" => {
+            let value = match payload.get("path") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(path)) => Some(path.as_str()),
+                Some(_) => return Err("payload.path must be a directory string".into()),
+            };
+            Ok(json!({"path": settings::resolve_download_dir(value, &plugin.home_dir)?}))
+        }
         "settings_get" => {
             let loaded = settings::load(&plugin.data_dir);
             serde_json::to_value(loaded).map_err(|error| error.to_string())
@@ -157,14 +289,16 @@ fn invoke_plugin(
                 .ok_or("payload.settings object is required")?;
             let update: Settings = serde_json::from_value(value.clone())
                 .map_err(|error| format!("invalid settings: {error}"))?;
+            let update = update.normalized();
+            let runtime_settings = update.for_runtime(&plugin.home_dir)?;
             update
                 .save(&plugin.data_dir)
                 .map_err(|error| format!("save settings: {error}"))?;
             *plugin
                 .settings_snapshot
                 .write()
-                .unwrap_or_else(|error| error.into_inner()) = update.clone();
-            plugin.service.update_settings(&update);
+                .unwrap_or_else(|error| error.into_inner()) = runtime_settings.clone();
+            plugin.service.update_settings(&runtime_settings);
             serde_json::to_value(update).map_err(|error| error.to_string())
         }
         "start_localsend" => plugin.service.start(),
@@ -193,16 +327,45 @@ fn invoke_plugin(
         }
         "session_accept" => {
             let session_id = require_session_id(&payload)?;
-            let file_ids: Option<Vec<String>> = payload
-                .get("fileIds")
-                .and_then(Value::as_array)
-                .map(|list| {
+            let file_ids = match payload.get("fileIds") {
+                None => None,
+                Some(Value::Array(list)) => Some(
                     list.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                });
-            let accepted = server::session_accept(&plugin.receive, &session_id, file_ids)?;
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_string)
+                                .ok_or_else(|| {
+                                    "payload.fileIds must contain non-empty strings".to_string()
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+                Some(_) => return Err("payload.fileIds must be an array".into()),
+            };
+            let destinations: HashMap<String, String> = match payload.get("destinations") {
+                None => HashMap::new(),
+                Some(Value::Object(map)) => map
+                    .iter()
+                    .map(|(id, value)| {
+                        value
+                            .as_str()
+                            .filter(|value| !value.is_empty())
+                            .map(|path| (id.clone(), path.to_string()))
+                            .ok_or_else(|| {
+                                "payload.destinations must contain local path strings".to_string()
+                            })
+                    })
+                    .collect::<Result<_, _>>()?,
+                Some(_) => return Err("payload.destinations must be an object".into()),
+            };
+            let accepted = server::session_accept_with_destinations(
+                &plugin.receive,
+                &session_id,
+                file_ids,
+                destinations,
+            )?;
             Ok(json!({ "accepted": accepted }))
         }
         "session_decline" => {
@@ -440,9 +603,11 @@ fn ensure_running(guard: &mut Slot) -> Result<&mut PluginRuntime, String> {
 #[cfg(test)]
 mod tests {
     use super::{invoke_plugin, PluginRuntime};
+    use crate::server;
     use crate::settings::Settings;
     use serde_json::{json, Value};
     use std::net::{Ipv4Addr, TcpListener, UdpSocket};
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -523,6 +688,270 @@ mod tests {
         assert_ne!(udp, 0);
         let _tcp = TcpListener::bind((Ipv4Addr::UNSPECIFIED, tcp)).expect("old TCP port released");
         let _udp = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, udp)).expect("old UDP port released");
+    }
+
+    #[test]
+    fn runtime_resource_lookup_requires_real_history_file_and_preserves_legacy_records() {
+        let (mut plugin, temp) = local_plugin();
+        let path = temp.path().join("resource.pdf");
+        std::fs::write(&path, b"fixture").expect("file");
+        let record = serde_json::from_value(json!({
+            "sessionId":"resource-session", "direction":"Send", "peerAlias":"fixture",
+            "status":"Done", "createdAt":1,
+            "files":[{"id":"f", "fileName":"resource.pdf", "size":7, "fileType":"application/pdf"}],
+            "sources":{"f":path}
+        }))
+        .expect("new history");
+        plugin.receive.upsert_send_record(record);
+        let result = invoke_plugin(
+            &mut plugin,
+            "resolve_transfer_file",
+            json!({"sessionId":"resource-session","fileId":"f"}),
+        );
+        assert!(
+            result.is_ok(),
+            "local resource query not implemented: {result:?}"
+        );
+        assert_eq!(
+            std::fs::canonicalize(PathBuf::from(result.unwrap()["path"].as_str().unwrap()))
+                .unwrap(),
+            std::fs::canonicalize(&path).unwrap()
+        );
+        assert!(invoke_plugin(
+            &mut plugin,
+            "resolve_transfer_file",
+            json!({"sessionId":"resource-session","fileId":"missing"})
+        )
+        .is_err());
+        assert!(invoke_plugin(
+            &mut plugin,
+            "resolve_transfer_file",
+            json!({"sessionId":"unknown","fileId":"f"})
+        )
+        .is_err());
+        assert!(invoke_plugin(
+            &mut plugin,
+            "resolve_transfer_file",
+            json!({"sessionId":"resource-session","fileId":"f","path":path})
+        )
+        .is_err());
+        std::fs::remove_file(&path).unwrap();
+        assert!(invoke_plugin(
+            &mut plugin,
+            "resolve_transfer_file",
+            json!({"sessionId":"resource-session","fileId":"f"})
+        )
+        .is_err());
+        plugin.shutdown();
+    }
+
+    #[test]
+    fn history_resource_rejects_replaced_size_for_receive_and_send_references() {
+        let (mut plugin, temp) = local_plugin();
+        let path = temp.path().join("original.pdf");
+        std::fs::write(&path, b"original").unwrap();
+        for direction in ["Receive", "Send"] {
+            let record = serde_json::from_value(json!({
+                "sessionId":direction,"direction":direction,"peerAlias":"fixture","status":"Done","createdAt":1,
+                "files":[{"id":"f","fileName":"original.pdf","size":8,"fileType":"application/pdf"}],
+                "destinations":if direction == "Receive" {json!({"f":path})} else {json!({})},
+                "sources":if direction == "Send" {json!({"f":path})} else {json!({})}
+            })).unwrap();
+            plugin.receive.upsert_send_record(record);
+        }
+        std::fs::write(&path, b"replacement changed size").unwrap();
+        for direction in ["Receive", "Send"] {
+            assert!(
+                invoke_plugin(
+                    &mut plugin,
+                    "resolve_transfer_file",
+                    json!({"sessionId":direction,"fileId":"f"})
+                )
+                .is_err(),
+                "history returned a changed-size replacement as the transferred file"
+            );
+            let preview = invoke_plugin(
+                &mut plugin,
+                "file_preview",
+                json!({"sessionId":direction,"fileId":"f"}),
+            )
+            .unwrap();
+            assert_eq!(preview["status"], "unavailable");
+        }
+        plugin.shutdown();
+    }
+
+    #[test]
+    fn runtime_settings_expand_default_against_fixture_home_and_reject_relative_save_directory() {
+        let (mut plugin, temp) = local_plugin();
+        call(
+            &mut plugin,
+            "settings_set",
+            json!({"settings":{"port":0,"downloadDir":null}}),
+        );
+        let settings = call(&mut plugin, "settings_get", json!({}));
+        assert_eq!(settings["downloadDir"], "~/Download/OToolsLocalSend");
+        let runtime_dir = plugin
+            .settings_snapshot
+            .read()
+            .unwrap()
+            .download_dir
+            .clone()
+            .unwrap();
+        assert_eq!(
+            PathBuf::from(runtime_dir),
+            temp.path()
+                .join("home")
+                .join("Download")
+                .join("OToolsLocalSend")
+        );
+        assert!(
+            !temp.path().join("home").exists(),
+            "settings query created the download tree"
+        );
+        let resolved = invoke_plugin(
+            &mut plugin,
+            "resolve_download_directory",
+            json!({"path":"~/Download/OToolsLocalSend"}),
+        );
+        assert!(
+            resolved.is_ok(),
+            "default picker directory resolution missing: {resolved:?}"
+        );
+        assert_eq!(
+            PathBuf::from(resolved.unwrap()["path"].as_str().unwrap()),
+            temp.path()
+                .join("home")
+                .join("Download")
+                .join("OToolsLocalSend")
+        );
+        assert!(invoke_plugin(
+            &mut plugin,
+            "settings_set",
+            json!({"settings":{"downloadDir":"relative/download"}})
+        )
+        .is_err());
+        plugin.shutdown();
+    }
+
+    #[test]
+    fn malformed_accept_file_ids_do_not_resolve_pending_request() {
+        use crate::models::{DeviceInfo, FileEntry, TransferStatus};
+        let (mut plugin, _temp) = local_plugin();
+        let info = DeviceInfo {
+            alias: "fixture".into(),
+            version: "2.2".into(),
+            device_model: None,
+            device_type: None,
+            fingerprint: "peer".into(),
+            port: 53317,
+            protocol: "https".into(),
+            download: false,
+        };
+        let file = FileEntry {
+            id: "f".into(),
+            file_name: "image.png".into(),
+            size: 7,
+            file_type: "image/png".into(),
+            sha256: None,
+            preview: None,
+            metadata: None,
+        };
+        let settings = plugin.settings_snapshot.read().unwrap().clone();
+        let prepared = server::prepare_upload(
+            &plugin.receive,
+            &settings,
+            info,
+            std::collections::HashMap::from([("f".into(), file)]),
+            None,
+            "127.0.0.1".parse().unwrap(),
+        );
+        let server::PrepareOutcome::AwaitDecision {
+            session_id: id,
+            decision_rx: _decision,
+        } = prepared
+        else {
+            panic!("manual Pending expected")
+        };
+        assert!(invoke_plugin(
+            &mut plugin,
+            "session_accept",
+            json!({"sessionId":id,"fileIds":"all"})
+        )
+        .is_err());
+        assert!(invoke_plugin(
+            &mut plugin,
+            "session_accept",
+            json!({"sessionId":id,"fileIds":[9]})
+        )
+        .is_err());
+        assert!(invoke_plugin(
+            &mut plugin,
+            "session_accept",
+            json!({"sessionId":id,"destinations":{"f":9}})
+        )
+        .is_err());
+        assert_eq!(
+            plugin.receive.transfer_records()[0].status,
+            TransferStatus::Pending
+        );
+        plugin.shutdown();
+    }
+
+    #[test]
+    fn default_receive_directory_remains_expanded_across_start_and_restart() {
+        let (mut plugin, temp) = local_plugin();
+        call(
+            &mut plugin,
+            "settings_set",
+            json!({"settings":{"port":0,"autoSave":true,"downloadDir":null}}),
+        );
+        let expected = temp
+            .path()
+            .join("home")
+            .join("Download")
+            .join("OToolsLocalSend");
+        for index in 0..2 {
+            call(&mut plugin, "start_localsend", json!({}));
+            wait_state(&mut plugin, "running");
+            let loaded = plugin.settings_snapshot.read().unwrap().clone();
+            assert_eq!(
+                loaded.download_dir.as_deref(),
+                expected.to_str(),
+                "startup replaced the expanded default directory"
+            );
+            let client = crate::sender::http_client(None).unwrap();
+            let port = plugin.service.status().port;
+            let file_name = format!("default-receive-{index}.txt");
+            let response = plugin.runtime.block_on(async {
+                let prepared = client.post(format!("https://127.0.0.1:{port}/api/localsend/v2/prepare-upload"))
+                    .json(&json!({"info":{"alias":"fixture","version":"2.2","fingerprint":"default-fixture","port":53317,"protocol":"https"},
+                        "files":{"f":{"id":"f","fileName":file_name,"size":7,"fileType":"text/plain"}}}))
+                    .send().await.unwrap().json::<Value>().await.unwrap();
+                let status = client.post(format!("https://127.0.0.1:{port}/api/localsend/v2/upload"))
+                    .query(&[("sessionId",prepared["sessionId"].as_str().unwrap()),("fileId","f"),("token",prepared["files"]["f"].as_str().unwrap())])
+                    .body("fixture").send().await.unwrap().status().as_u16();
+                (status, prepared["sessionId"].as_str().unwrap().to_string())
+            });
+            assert_eq!(response.0, 200);
+            assert_eq!(
+                std::fs::read(expected.join(&file_name)).unwrap(),
+                b"fixture"
+            );
+            let record = plugin
+                .receive
+                .transfer_records()
+                .into_iter()
+                .find(|record| record.session_id == response.1)
+                .unwrap();
+            assert_eq!(
+                PathBuf::from(&record.destinations["f"]),
+                expected.join(&file_name)
+            );
+            call(&mut plugin, "stop_localsend", json!({}));
+            wait_state(&mut plugin, "stopped");
+        }
+        plugin.shutdown();
     }
 
     #[test]

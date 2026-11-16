@@ -88,6 +88,150 @@ function bridge(over: Partial<{
   };
 }
 
+test("terminal history refresh preserves source paths and text/image metadata when omitted by a later snapshot", async (t) => {
+  const enriched: TransferRecord = {
+    ...done, direction: "Send", sessionId: "rich-history", sources: { file: "D:\\fixture\\image.png" },
+    files: [{ ...pending.files[0], preview: "original\ntext", metadata: { modified: "2026-11-16T01:00:00Z", accessed: null } }],
+  };
+  let records = [enriched];
+  const native = bridge({ transfers: async () => records, poll: async () => [] });
+  const hook = mountHook(usePollEvents);
+  t.after(async () => { hook.unmount(); await hook.flush(); native.restore(); });
+  await hook.flush();
+  records = [{ ...done, direction: "Send", sessionId: "rich-history" }];
+  await hook.current().refreshTransfers();
+  await hook.flush();
+  const record = hook.current().transfers.find((item) => item.sessionId === "rich-history");
+  assert.equal(record?.sources?.file, "D:\\fixture\\image.png");
+  assert.equal(record?.files[0]?.preview, "original\ntext");
+  assert.deepEqual(record?.files[0]?.metadata, { modified: "2026-11-16T01:00:00Z", accessed: null });
+});
+
+test("a newer successful save path is authoritative while prior source metadata survives", async (t) => {
+  let records: TransferRecord[] = [{ ...done, sessionId: "moved", sources: { file: "D:\\fixture\\source.png" }, destinations: { file: "D:\\fixture\\tmp.png" } }];
+  const native = bridge({ transfers: async () => records, poll: async () => [] });
+  const hook = mountHook(usePollEvents);
+  t.after(async () => { hook.unmount(); await hook.flush(); native.restore(); });
+  await hook.flush();
+  records = [{ ...done, sessionId: "moved", destinations: { file: "D:\\fixture\\saved.png" } }];
+  await hook.current().refreshTransfers();
+  await hook.flush();
+  const record = hook.current().transfers.find((item) => item.sessionId === "moved");
+  assert.equal(record?.destinations?.file, "D:\\fixture\\saved.png");
+  assert.equal(record?.sources?.file, "D:\\fixture\\source.png");
+});
+
+test("opening a stopped plugin starts the saved service once and manual stop is not undone by later polling", async (t) => {
+  let current = status({ state: "stopped", port: 0, udpPort: 0, activeTransfers: 0 });
+  const native = bridge({
+    status: async () => current,
+    invoke: async (method) => {
+      if (method === "device_list") return { devices: [], udpPort: current.udpPort };
+      if (method === "start_localsend") { current = status({ activeTransfers: 0, revision: current.revision + 1 }); return { started: true, status: current }; }
+      if (method === "stop_localsend") { current = status({ state: "stopped", port: 0, udpPort: 0, activeTransfers: 0, revision: current.revision + 1 }); return { confirmationRequired: false, activeTransfers: 0, status: current }; }
+      throw new Error(`unexpected ${method}`);
+    },
+  });
+  const hook = mountHook(usePollEvents);
+  t.after(async () => { hook.unmount(); await hook.flush(); native.restore(); });
+  await hook.flush();
+  assert.equal(hook.current().server?.state, "running");
+  assert.deepEqual(native.calls.filter((call) => call.method === "start_localsend"), [{ method: "start_localsend", payload: {} }]);
+  assert.equal(native.calls.some((call) => call.method === "settings_set"), false);
+  for (let repeat = 0; repeat < 5; repeat++) { hook.rerender(); native.drain(); await hook.flush(); }
+  assert.equal(native.calls.filter((call) => call.method === "start_localsend").length, 1);
+  await hook.current().stopService();
+  await hook.flush();
+  for (let repeat = 0; repeat < 5; repeat++) { native.drain(); native.resync(); await hook.flush(); }
+  assert.equal(hook.current().server?.state, "stopped");
+  assert.equal(native.calls.filter((call) => call.method === "start_localsend").length, 1, "automatic startup reversed manual stop");
+});
+
+for (const initial of ["running", "starting", "stopping", "failed"] as const) {
+  test(`opening ${initial} consumes its decision and a later stopped state never triggers autostart`, async (t) => {
+    let current = status({ state: initial });
+    const native = bridge({ status: async () => current, poll: async () => [] });
+    const hook = mountHook(usePollEvents);
+    t.after(async () => { hook.unmount(); await hook.flush(); native.restore(); });
+    await hook.flush();
+    assert.equal(native.calls.filter((call) => call.method === "start_localsend").length, 0);
+    current = status({ state: "stopped", port: 0, udpPort: 0, activeTransfers: 0, revision: 10 });
+    await hook.current().refreshServer();
+    await hook.flush();
+    assert.equal(hook.current().server?.state, "stopped");
+    assert.equal(native.calls.filter((call) => call.method === "start_localsend").length, 0);
+  });
+}
+
+test("automatic start failure remains visible without retry loops and permits an explicit retry", async (t) => {
+  let current = status({ state: "stopped", port: 0, udpPort: 0, activeTransfers: 0 });
+  let starts = 0;
+  const native = bridge({
+    status: async () => current,
+    invoke: async (method) => {
+      if (method === "device_list") return { devices: [], udpPort: current.udpPort };
+      if (method === "start_localsend") {
+        if (++starts === 1) throw new Error("automatic startup refused");
+        current = status({ revision: 4 }); return { started: true, status: current };
+      }
+      throw new Error(`unexpected ${method}`);
+    },
+  });
+  const hook = mountHook(usePollEvents);
+  t.after(async () => { hook.unmount(); await hook.flush(); native.restore(); });
+  await hook.flush();
+  assert.equal(starts, 1);
+  assert.equal(hook.current().serviceError, "automatic startup refused");
+  for (let repeat = 0; repeat < 4; repeat++) { native.drain(); await hook.flush(); }
+  assert.equal(starts, 1);
+  assert.equal(hook.current().serviceError, "automatic startup refused");
+  await hook.current().startService();
+  await hook.flush();
+  assert.equal(starts, 2);
+  assert.equal(hook.current().server?.state, "running");
+  assert.equal(hook.current().serviceError, null);
+});
+
+test("a genuinely new plugin mount starts again after manual stop while StrictMode replay does not duplicate", async (t) => {
+  let current = status({ state: "stopped", port: 0, udpPort: 0, activeTransfers: 0 });
+  const native = bridge({
+    status: async () => current,
+    invoke: async (method) => {
+      if (method === "device_list") return { devices: [], udpPort: current.udpPort };
+      if (method === "start_localsend") { current = status({ activeTransfers: 0, revision: current.revision + 1 }); return { started: true, status: current }; }
+      if (method === "stop_localsend") { current = status({ state: "stopped", port: 0, udpPort: 0, activeTransfers: 0, revision: current.revision + 1 }); return { confirmationRequired: false, activeTransfers: 0, status: current }; }
+      throw new Error(`unexpected ${method}`);
+    },
+  });
+  const first = mountHook(usePollEvents);
+  first.replayEffects();
+  await first.flush();
+  assert.equal(native.calls.filter((call) => call.method === "start_localsend").length, 1);
+  first.replayEffects();
+  await first.flush();
+  assert.equal(native.calls.filter((call) => call.method === "start_localsend").length, 1);
+  await first.current().stopService();
+  await first.flush();
+  first.unmount();
+  await first.flush();
+  const second = mountHook(usePollEvents);
+  t.after(async () => { second.unmount(); await second.flush(); native.restore(); });
+  await second.flush();
+  assert.equal(native.calls.filter((call) => call.method === "start_localsend").length, 2);
+  assert.equal(second.current().server?.state, "running");
+});
+
+test("unmount before native reconstruction finishes never starts a service", async (t) => {
+  const held = deferred<ServerStatus>();
+  const native = bridge({ status: async () => held.promise, poll: async () => [] });
+  const hook = mountHook(usePollEvents);
+  t.after(() => native.restore());
+  hook.unmount();
+  held.resolve(status({ state: "stopped", port: 0, udpPort: 0 }));
+  await hook.flush();
+  assert.equal(native.calls.filter((call) => call.method === "start_localsend").length, 0);
+});
+
 test("slow periodic history responses are coalesced and still recover consent and failure details", async (t) => {
   let slow = false;
   const requests: Array<ReturnType<typeof deferred<TransferRecord[]>>> = [];
@@ -279,13 +423,10 @@ test("operation-result and query-only lifecycle changes refresh discovery and te
   const hook = mountHook(usePollEvents);
   t.after(async () => { hook.unmount(); await hook.flush(); native.restore(); });
   await hook.flush();
-  assert.deepEqual(hook.current().devices, []);
-  const beforeDevices = devicesReads;
-  await hook.current().startService();
-  await hook.flush();
+  assert.equal(native.calls.filter((call) => call.method === "start_localsend").length, 1);
   assert.equal(hook.current().server?.state, "running");
   assert.equal(hook.current().udpPort, 54444);
-  assert.ok(devicesReads > beforeDevices, "native operation snapshots must trigger device refresh");
+  assert.ok(devicesReads >= 2, "automatic operation snapshots must trigger device refresh");
   assert.equal(hook.current().devices[0]?.info.fingerprint, "peer");
   const beforeHistory = native.calls.filter((call) => call.method === "transfer_list").length;
   await hook.current().stopService();
@@ -482,25 +623,31 @@ test("review 5: independent state-query failure stays visible even if the event 
   assert.equal(hook.current().serviceError, "authoritative status failed");
 });
 
-test("review 6: a real native status success clears initial host-missing availability and passively resyncs", async (t) => {
+test("review 6: a real native status success clears initial host-missing availability and starts once when stopped", async (t) => {
   let available = false;
   let current = status({ state: "stopped", port: 0, udpPort: 0, activeTransfers: 0 });
   const native = bridge({
     status: async () => { if (!available) throw new Error("bridge not ready"); return current; },
     transfers: async () => { if (!available) throw new Error("bridge not ready"); return [done]; },
-    devices: async () => { if (!available) throw new Error("bridge not ready"); return { devices: [], udpPort: 0 }; },
+    devices: async () => { if (!available) throw new Error("bridge not ready"); return { devices: [], udpPort: current.udpPort }; },
+    invoke: async (method) => {
+      if (method === "device_list") { if (!available) throw new Error("bridge not ready"); return { devices: [], udpPort: current.udpPort }; }
+      if (method === "start_localsend") { current = status({ activeTransfers: 0, revision: 4 }); return { started: true, status: current }; }
+      throw new Error(`unexpected ${method}`);
+    },
   });
   const hook = mountHook(usePollEvents);
   t.after(async () => { hook.unmount(); await hook.flush(); native.restore(); });
   await hook.flush();
   assert.ok(hook.current().hostError);
+  assert.equal(native.calls.filter((call) => call.method === "start_localsend").length, 0);
   available = true;
   native.drain();
   await hook.flush();
-  assert.equal(hook.current().server?.state, "stopped");
+  assert.equal(hook.current().server?.state, "running");
   assert.equal(hook.current().hostError, null);
   assert.equal(hook.current().transfers[0]?.status, "Done");
-  assert.equal(native.calls.some((call) => call.method === "start_localsend"), false);
-  await hook.current().startService();
+  assert.equal(native.calls.filter((call) => call.method === "start_localsend").length, 1);
+  for (let repeat = 0; repeat < 5; repeat++) { native.drain(); await hook.flush(); }
   assert.equal(native.calls.filter((call) => call.method === "start_localsend").length, 1);
 });

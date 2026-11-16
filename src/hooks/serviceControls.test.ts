@@ -143,6 +143,49 @@ test("pending incoming dialog keeps a reachable parent stop action rather than t
   assert.match(html, /停止服务/);
 });
 
+test("App forwards staged image targets only when the explicit accept callback runs", async (t) => {
+  const calls: Array<{ method: string; payload: Record<string, unknown> }> = [];
+  let records = [{
+    sessionId: "save-request", direction: "Receive", peerAlias: "Phone", status: "Pending", createdAt: 1,
+    files: [{ id: "image", fileName: "photo.png", size: 123, fileType: "image/png", sha256: null, preview: null, metadata: null }],
+  }];
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", { configurable: true, value: {
+    setInterval: () => 1, clearInterval: () => {},
+    __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: () => {} },
+    __TAURI_INTERNALS__: {
+      transformCallback: () => 1,
+      invoke: async (method: string, payload: Record<string, unknown> = {}) => {
+        calls.push({ method, payload });
+        if (method === "plugin:event|listen" || method === "plugin:event|unlisten") return 1;
+        if (method === "server_status") return server();
+        if (method === "settings_get") return { alias: "PC", deviceModel: null, deviceType: "desktop", port: 53317, downloadDir: "~/Download/OToolsLocalSend", pin: null, autoSave: false, notifyOnIncoming: false };
+        if (method === "transfer_list") return { transfers: records };
+        if (method === "device_list") return { devices: [], udpPort: 53318 };
+        if (method === "poll_events") return { events: [] };
+        if (method === "session_accept") { records = []; return { accepted: ["image"] }; }
+        throw new Error(`unexpected ${method}`);
+      },
+    },
+  } });
+  const hook = mountHook(App);
+  t.after(async () => {
+    hook.unmount(); await hook.flush();
+    if (previous) Object.defineProperty(globalThis, "window", previous);
+    else Reflect.deleteProperty(globalThis, "window");
+  });
+  await hook.flush();
+  const incoming = elements(hook.current()).find((item) => item.type === IncomingDialog);
+  assert.ok(incoming);
+  assert.equal(incoming.props.downloadDir, "~/Download/OToolsLocalSend");
+  assert.equal(calls.some((item) => item.method === "session_accept"), false);
+  (incoming.props.onAcceptSelected as (ids: string[], targets: Record<string, string>) => void)(["image"], { image: "D:\\fixture\\chosen.png" });
+  await hook.flush();
+  assert.deepEqual(calls.filter((item) => item.method === "session_accept"), [{
+    method: "session_accept", payload: { sessionId: "save-request", fileIds: ["image"], destinations: { image: "D:\\fixture\\chosen.png" } },
+  }]);
+});
+
 test("App coordinates one native-count confirmation over Pending incoming and restores it on cancel", async (t) => {
   const settings = {
     alias: "Saved PC", deviceModel: null, deviceType: "desktop", port: 53317, downloadDir: null,
@@ -274,8 +317,11 @@ test("review 3: suspending the mounted IncomingDialog retains selected file ids 
   const firstCheckbox = elements(dialog.current()).find((element) => element.type === "input");
   (firstCheckbox?.props.onChange as () => void)();
   hidden = true;
-  dialog.current();
+  dialog.rerender();
+  buttons(dialog.current()).find((button) => text(button.props.children).includes("接受所选"))?.props.onClick?.();
+  assert.deepEqual(selected, [], "hidden request must not accept");
   hidden = false;
+  dialog.rerender();
   buttons(dialog.current()).find((button) => text(button.props.children).includes("接受所选"))?.props.onClick?.();
   assert.deepEqual(selected, [["second"]]);
   dialog.unmount();

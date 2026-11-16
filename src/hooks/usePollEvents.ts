@@ -113,6 +113,7 @@ export function usePollEvents() {
   const settingsRef = useRef<Settings | null>(null);
   const aliveRef = useRef(false);
   const readyRef = useRef(false);
+  const openStartHandledRef = useRef(false);
   const hostErrorRef = useRef<string | null>(null);
   const seenIncomingRef = useRef(new Set<string>());
   const handledIncomingRef = useRef(new Set<string>());
@@ -160,8 +161,12 @@ export function usePollEvents() {
   const controller = controllerRef.current;
   const stopReturnFocusRef = useRef<HTMLElement | null>(null);
 
-  const startService = useCallback(() => controllerRef.current!.start(), []);
+  const startService = useCallback(() => {
+    openStartHandledRef.current = true;
+    return controllerRef.current!.start();
+  }, []);
   const stopService = useCallback((force = false) => {
+    openStartHandledRef.current = true;
     if (!force && !controllerRef.current!.getState().serviceBusy && !controllerRef.current!.getState().stopConfirmation) {
       stopReturnFocusRef.current = typeof document === "undefined" ? null : document.activeElement as HTMLElement | null;
     }
@@ -202,8 +207,18 @@ export function usePollEvents() {
       if (terminal && record.status !== terminal) {
         return old ?? { ...record, status: terminal };
       }
-      if (old && isTerminal(old.status)) {
-        return { ...record, status: old.status, destinations: { ...old.destinations, ...record.destinations } };
+      if (old) {
+        const previousFiles = new Map(old.files.map((file) => [file.id, file]));
+        return {
+          ...record,
+          status: isTerminal(old.status) ? old.status : record.status,
+          sources: { ...old.sources, ...record.sources },
+          destinations: { ...old.destinations, ...record.destinations },
+          files: record.files.map((file) => {
+            const prior = previousFiles.get(file.id);
+            return prior ? { ...file, preview: file.preview ?? prior.preview, metadata: file.metadata ?? prior.metadata } : file;
+          }),
+        };
       }
       return record;
     });
@@ -565,6 +580,18 @@ export function usePollEvents() {
       unlistenersRef.current = [];
     };
   }, [applyServerStatus, applyTransferSnapshot, controller, handleEvent, refreshDevices, refreshTransfers]);
+
+  useEffect(() => {
+    if (!ready || hostError || !aliveRef.current || openStartHandledRef.current) return;
+    const current = controller.getState();
+    if (!current.server) return;
+    // One decision per page mount, including StrictMode replay. Manual stop is final
+    // for this opening; passive recovery must not start another generation.
+    openStartHandledRef.current = true;
+    if (current.server.state === "stopped" && !current.serviceBusy && !current.stopConfirmation) {
+      void controller.start();
+    }
+  }, [ready, hostError, service.server, controller]);
 
   return {
     ready,

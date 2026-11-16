@@ -75,6 +75,8 @@ jobs:
           python -I scripts/service-ports.test.py
           python -I scripts/native-events.test.py
           python -I scripts/smoke-native.py --library lib/${{ matrix.library }}
+      - name: 图片资源与另存为实际动态库回归
+        run: python -I scripts/file-content-test.py --library lib/${{ matrix.library }}
       - name: 独立官方线格式与 TLS 客户端身份互测
         run: python -I scripts/official-wire-test.py --library lib/${{ matrix.library }}
       - uses: actions/upload-artifact@v4
@@ -245,7 +247,11 @@ jobs:
         run: |
           set -euo pipefail
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" --target "$COMMIT_SHA" --title "$RELEASE_TAG" --notes "${PACKID} v${RELEASE_VERSION}"
+            if [[ -f "docs/releases/${RELEASE_VERSION}.md" ]]; then
+              gh release create "$RELEASE_TAG" --target "$COMMIT_SHA" --title "$RELEASE_TAG" --notes-file "docs/releases/${RELEASE_VERSION}.md"
+            else
+              gh release create "$RELEASE_TAG" --target "$COMMIT_SHA" --title "$RELEASE_TAG" --notes "${PACKID} v${RELEASE_VERSION}"
+            fi
           fi
           gh release upload "$RELEASE_TAG" release-assets/*.oplg release-assets/logo.svg release-assets/plugin.json release-assets/SHA256SUMS --clobber
       # OIDC 获取和使用在同一进程完成，秘密不经过 job outputs 或 artifact。

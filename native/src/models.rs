@@ -116,4 +116,7 @@ pub struct TransferRecord {
     /// for send-direction records.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub destinations: HashMap<String, String>,
+    /// Absolute local send sources. Kept only in local history, never FileEntry.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub sources: HashMap<String, String>,
 }

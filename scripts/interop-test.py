@@ -281,6 +281,8 @@ def start_dll():
     smoke_native.load_dll(LIBRARY)
     settings = ok_data("settings_get")
     assert settings["port"] == 53317, f"unexpected default port: {settings}"
+    settings["downloadDir"] = str(data_dir / "downloads")
+    ok_data("settings_set", {"settings": settings})
     started = ok_data("start_localsend")
     assert started.get("started") is True, f"start result: {started}"
     status, devices = wait_service_running()
@@ -1296,10 +1298,11 @@ def service_stop_send():
 @register_scenario
 @scenario
 def service_keep_completed_files():
-    """Files deliberately left in tmp without downloadDir survive a stop."""
+    """Completed files in an isolated download tree survive a stop."""
     drain_events()
     previous_settings = ok_data("settings_get")
-    set_settings(lambda s: s.update(autoSave=True, downloadDir=None))
+    retained_dir = CTX["data_dir"] / "Download" / "OToolsLocalSend"
+    set_settings(lambda s: s.update(autoSave=True, downloadDir=str(retained_dir)))
     payload = make_text_file(CTX["src"], "service-kept-without-download-dir.txt", "keep this completed file through service restart")
     expected = sha256_file(payload)
     mock = MockPeer(["send", "--to", f"127.0.0.1:{CTX['tcp_port']}", "--file", str(payload)])
@@ -1310,7 +1313,7 @@ def service_keep_completed_files():
     destinations = record.get("destinations") or {}
     assert len(destinations) == 1, record
     stored = Path(next(iter(destinations.values())))
-    assert stored.is_relative_to(CTX["data_dir"] / "tmp"), stored
+    assert stored.is_relative_to(retained_dir), stored
     assert sha256_file(stored) == expected
     mock.kill()
     drain_events()
@@ -1322,7 +1325,7 @@ def service_keep_completed_files():
     assert find_record(record["sessionId"])["status"] == "Done"
     ok_data("settings_set", {"settings": previous_settings})
     drain_events()
-    return "completed file under plugin tmp survives stop/restart with unchanged bytes and history"
+    return "completed file under isolated Download/OToolsLocalSend survives stop/restart with unchanged bytes and history"
 
 
 @register_scenario

@@ -3,8 +3,10 @@
  * 接收完成记录展示落盘路径（destinations 线上可能缺席，归一化 ?? {}）。
  */
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { cancelSession, type FileEntry, type TransferRecord } from "../api";
+import { copyImageContent, copyTextContent, isImageFile, openTransferFolder, textContent } from "../fileContent";
+import { FileImagePreview } from "./FileImagePreview";
 import { formatBytes, formatError, formatTimestamp, transferStatusLabel } from "../format";
 
 interface TransferCardProps {
@@ -48,9 +50,7 @@ export function TransferCard({ record, progress, onRefresh }: TransferCardProps)
   const phase = record.status === "Pending"
     ? (record.stage === "preparing" ? "正在准备文件…" : record.direction === "Send" ? "等待对方确认" : "等待接收确认")
     : record.status === "Transferring" ? "正在传输文件…" : null;
-  const destinations = record.destinations ?? {};
   const showProgress = record.status === "Transferring";
-  const showDestinations = record.direction === "Receive" && record.status === "Done";
   const totalSize = record.files.reduce((sum, file) => sum + (file.size ?? 0), 0);
 
   return (
@@ -92,10 +92,10 @@ export function TransferCard({ record, progress, onRefresh }: TransferCardProps)
       <ul className="xfer-files">
         {record.files.map((file) => (
           <FileRow
-            key={file.id}
+            key={`${record.sessionId}:${file.id}`}
             file={file}
+            record={record}
             percent={showProgress ? filePercent(record, progress?.[file.id]) : undefined}
-            destination={showDestinations ? destinations[file.id] : undefined}
           />
         ))}
       </ul>
@@ -105,38 +105,82 @@ export function TransferCard({ record, progress, onRefresh }: TransferCardProps)
 
 function FileRow({
   file,
+  record,
   percent,
-  destination,
 }: {
   file: FileEntry;
+  record: TransferRecord;
   /** 有值 = 渲染进度条；undefined = 非传输态。 */
   percent?: number;
-  destination?: string;
 }) {
+  const body = textContent(file);
+  const image = body === null && isImageFile(file);
+  const paths = record.direction === "Send" ? record.sources : record.destinations;
+  const resourcePath = paths?.[file.id];
+  const available = typeof resourcePath === "string" && resourcePath.trim() !== "";
+  // Maps are only an availability hint. Native resolves and validates the exact historical file.
+  const query = available ? { sessionId: record.sessionId, fileId: file.id } : null;
+  const version = JSON.stringify([resourcePath ?? "", file.size, file.metadata?.modified ?? null, file.metadata?.accessed ?? null]);
+  const identity = JSON.stringify([record.sessionId, file.id, version, body]);
+  const [actionBusy, setActionBusy] = useState(false);
+  const [feedback, setFeedback] = useState<{ identity: string; error?: string; success?: string } | null>(null);
+  const lifecycle = useRef({ alive: true, identity });
+  lifecycle.current.identity = identity;
+  const actionRef = useRef<object | null>(null);
+  useEffect(() => {
+    lifecycle.current.alive = true;
+    return () => { lifecycle.current.alive = false; actionRef.current = null; };
+  }, []);
+
+  const runAction = async () => {
+    if (!lifecycle.current.alive || actionRef.current || (body === null && !query)) return;
+    const operation = {};
+    actionRef.current = operation;
+    setActionBusy(true);
+    setFeedback(null);
+    try {
+      if (body !== null) await copyTextContent(body);
+      else if (image && query) await copyImageContent(query);
+      else await openTransferFolder(record.sessionId, file.id);
+      if (lifecycle.current.alive && lifecycle.current.identity === identity && actionRef.current === operation) {
+        setFeedback({ identity, success: body !== null ? "已复制文本" : image ? "已复制图片" : "已打开所在文件夹" });
+      }
+    } catch (cause) {
+      if (lifecycle.current.alive && lifecycle.current.identity === identity && actionRef.current === operation) {
+        setFeedback({ identity, error: formatError(cause) });
+      }
+    } finally {
+      if (lifecycle.current.alive && actionRef.current === operation) {
+        actionRef.current = null;
+        setActionBusy(false);
+      }
+    }
+  };
+  const currentFeedback = feedback?.identity === identity ? feedback : null;
+
   return (
     <li className="xfer-file">
       <div className="xfer-file-row">
-        <span className="name" title={file.fileName}>
-          {file.fileName || file.id}
-        </span>
+        <span className="name" title={file.fileName}>{file.fileName || file.id}</span>
         <span className="size">{formatBytes(file.size ?? 0)}</span>
       </div>
       {typeof percent === "number" && (
-        <div
-          className="progress"
-          role="progressbar"
-          aria-valuenow={percent}
-          aria-valuemin={0}
-          aria-valuemax={100}
-        >
+        <div className="progress" role="progressbar" aria-label={`${file.fileName || file.id} 的传输进度`} aria-valuenow={percent} aria-valuemin={0} aria-valuemax={100}>
           <div className="progress-fill" style={{ width: `${percent}%` }} />
         </div>
       )}
-      {destination && (
-        <p className="xfer-dest" title={destination}>
-          {destination}
-        </p>
-      )}
+      {body !== null ? <div className="msg-bubble">{body}</div> : image ? (
+        <FileImagePreview file={file} query={query} version={version} pending={record.direction === "Receive" && record.status === "Pending"} />
+      ) : null}
+      {available && <p className="xfer-dest" title={resourcePath}>{resourcePath}</p>}
+      <div className="content-actions">
+        <button type="button" className="btn btn-sm" disabled={actionBusy || (body === null && !available)} onClick={() => void runAction()}>
+          {actionBusy ? (body !== null || image ? "复制中…" : "打开中…") : body !== null ? "复制文本" : image ? "复制图片" : "打开所在文件夹"}
+        </button>
+      </div>
+      {body === null && !available && <p className="content-note">本机文件不可用：没有已保存的文件路径，旧记录无法定位。</p>}
+      {currentFeedback?.error && <p className="content-error" role="alert">{currentFeedback.error}</p>}
+      {currentFeedback?.success && <p className="content-success" role="status">{currentFeedback.success}</p>}
     </li>
   );
 }

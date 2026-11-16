@@ -25,7 +25,7 @@ use crate::models::{
     DeviceInfo, Direction, FileEntry, RegisterResponse, TransferRecord, TransferStatus,
 };
 use crate::service::{wait_cancelled, ServiceScope};
-use crate::settings::Settings;
+use crate::settings::{validate_local_absolute_path, Settings};
 use axum::body::Body;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, State};
 use axum::http::StatusCode;
@@ -96,6 +96,9 @@ pub struct ReceiveSession {
     pub files: HashMap<String, FileEntry>,
     /// fileId → upload token; only files accepted by the receiver get one.
     pub tokens: HashMap<String, String>,
+    /// Local-only authorized save choices. Never published as actual resources
+    /// until verified bytes have been committed to their final unique path.
+    save_targets: HashMap<String, PathBuf>,
     pub status: TransferStatus,
     pub sender_ip: IpAddr,
     pub created_at: u64,
@@ -458,11 +461,10 @@ impl ReceiveSessions {
             let destinations = session
                 .uploaded
                 .iter()
-                .map(|id| {
-                    (
-                        id.clone(),
-                        session.temp_dir.join(id).to_string_lossy().into_owned(),
-                    )
+                .filter_map(|id| {
+                    let path = session.temp_dir.join(id);
+                    is_completed_file(&path, &session.files[id])
+                        .then(|| (id.clone(), path.to_string_lossy().into_owned()))
                 })
                 .collect();
             inner.progress.retain(|(id, _), _| id != session_id);
@@ -544,15 +546,22 @@ impl ReceiveSessions {
         let _ = self.cancel_session(session_id);
     }
 
-    /// Issue tokens for the requested files of a Pending session, move it to
-    /// Transferring and resolve the suspended prepare-upload sender with the
-    /// Accept decision. `None` accepts every file; unknown ids are skipped.
-    /// Returns the sorted accepted file ids (empty → the sender gets 204,
-    /// nothing to transfer, and the terminal session is evicted at once).
+    /// Issue tokens only after validating the entire accepted set and every
+    /// local target. Invalid requests leave Pending and its decision untouched.
+    /// `None` accepts every file; an explicit empty set answers the sender 204.
     pub fn session_accept(
         &self,
         session_id: &str,
         file_ids: Option<Vec<String>>,
+    ) -> Result<Vec<String>, String> {
+        self.accept_with_destinations(session_id, file_ids, HashMap::new())
+    }
+
+    fn accept_with_destinations(
+        &self,
+        session_id: &str,
+        file_ids: Option<Vec<String>>,
+        destinations: HashMap<String, String>,
     ) -> Result<Vec<String>, String> {
         let scope = self.scope();
         let _admission = match &scope {
@@ -571,28 +580,41 @@ impl ReceiveSessions {
                     session.status
                 ));
             }
-            let requested: Vec<String> = match file_ids {
-                None => {
-                    let mut all: Vec<String> = session.files.keys().cloned().collect();
-                    all.sort();
-                    all
-                }
-                Some(ids) => ids
-                    .into_iter()
-                    .filter(|id| session.files.contains_key(id))
-                    .collect(),
+            let mut accepted = match file_ids {
+                None => session.files.keys().cloned().collect::<Vec<_>>(),
+                Some(ids) => ids,
             };
-            let mut accepted = Vec::new();
-            for file_id in requested {
-                if session.tokens.contains_key(&file_id) {
-                    continue;
+            if let Some(id) = accepted.iter().find(|id| !session.files.contains_key(*id)) {
+                return Err(format!("unknown accepted fileId: {id}"));
+            }
+            accepted.sort();
+            accepted.dedup();
+            let mut save_targets = HashMap::new();
+            for (id, value) in destinations {
+                if accepted.binary_search(&id).is_err() {
+                    return Err(format!("destination is not for an accepted fileId: {id}"));
                 }
+                let path = validate_local_absolute_path(&value)
+                    .map_err(|error| format!("invalid destination for {id}: {error}"))?;
+                if value.ends_with(['/', '\\'])
+                    || path.file_name().is_none()
+                    || value
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .is_some_and(|name| name == "." || name == "..")
+                {
+                    return Err(format!("destination must name a local file: {id}"));
+                }
+                save_targets.insert(id, path);
+            }
+            // Consent is committed atomically with the tokens only after the
+            // full request is valid. No filesystem operations happen here.
+            session.save_targets = save_targets;
+            for file_id in &accepted {
                 session
                     .tokens
                     .insert(file_id.clone(), uuid::Uuid::new_v4().to_string());
-                accepted.push(file_id);
             }
-            accepted.sort();
             let decision_tx = session.decision_tx.take();
             let tokens = session.tokens.clone();
             let finished_empty = accepted.is_empty();
@@ -656,7 +678,10 @@ impl ReceiveSessions {
                 }
                 .into(),
             );
-            if status != TransferStatus::Failed {
+            if matches!(
+                status,
+                TransferStatus::Pending | TransferStatus::Done | TransferStatus::Cancelled
+            ) {
                 record.error = None;
             }
             if let Some(destinations) = destinations {
@@ -668,12 +693,34 @@ impl ReceiveSessions {
 
     fn patch_record_destinations(&self, session_id: &str, destinations: HashMap<String, String>) {
         let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        self.update_record(
-            &mut inner,
-            session_id,
-            TransferStatus::Done,
-            Some(destinations),
-        );
+        if let Some(record) = inner
+            .records
+            .iter_mut()
+            .find(|record| record.session_id == session_id)
+        {
+            record.destinations = destinations;
+        }
+        // Committing bytes is not a terminal transition. Publish Done/Failed
+        // exactly once after every filesystem operation has settled.
+        persist_records(&inner.records, &self.transfers_path);
+    }
+
+    fn finish_receive_record(
+        &self,
+        session_id: &str,
+        status: TransferStatus,
+        destinations: HashMap<String, String>,
+        error: Option<String>,
+    ) {
+        let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(record) = inner
+            .records
+            .iter_mut()
+            .find(|record| record.session_id == session_id)
+        {
+            record.error = error;
+        }
+        self.update_record(&mut inner, session_id, status, Some(destinations));
     }
 
     /// Snapshot of the persisted history for `transfer_list`.
@@ -766,6 +813,16 @@ pub fn session_accept(
     file_ids: Option<Vec<String>>,
 ) -> Result<Vec<String>, String> {
     sessions.session_accept(session_id, file_ids)
+}
+
+/// Accept selected files with explicitly authorized local save targets.
+pub fn session_accept_with_destinations(
+    sessions: &Arc<ReceiveSessions>,
+    session_id: &str,
+    file_ids: Option<Vec<String>>,
+    destinations: HashMap<String, String>,
+) -> Result<Vec<String>, String> {
+    sessions.accept_with_destinations(session_id, file_ids, destinations)
 }
 
 /// Invoke-method surface: `session_decline {sessionId}` — the sender side
@@ -985,6 +1042,7 @@ pub fn prepare_upload(
         sender: sender.clone(),
         files,
         tokens,
+        save_targets: HashMap::new(),
         status,
         sender_ip: remote_ip,
         created_at,
@@ -1033,6 +1091,7 @@ pub fn prepare_upload(
             error: None,
             created_at,
             destinations: HashMap::new(),
+            sources: HashMap::new(),
         });
         sessions.update_record(&mut inner, &session_id, status, None);
     }
@@ -1104,9 +1163,12 @@ pub async fn await_user_decision(
 struct TerminalPlan {
     session_id: String,
     status: TransferStatus,
-    /// (fileId, source, target) moves — empty unless Done with a download dir.
+    /// (fileId, source, target) copies for completed files only. The original
+    /// remains available until its final unique destination has been patched.
     moves: Vec<(String, PathBuf, PathBuf)>,
     destinations: HashMap<String, String>,
+    completed_files: HashMap<String, FileEntry>,
+    error: Option<String>,
     temp_dir: PathBuf,
 }
 
@@ -1163,34 +1225,48 @@ impl ReceiveSessions {
                 persist_records(&inner.records, &self.transfers_path);
                 return None;
             }
-            let status = if session.failed.is_empty() {
+            let mut status = if session.failed.is_empty() {
                 TransferStatus::Done
             } else {
                 TransferStatus::Failed
             };
-            session.status = status;
             let mut moves = Vec::new();
             let mut destinations = HashMap::new();
+            let mut missing_completed = false;
             for id in &session.uploaded {
                 let source = session.temp_dir.join(id);
-                let target = match download_dir {
-                    Some(dir) => dir.join(safe_file_name(&session.files[id])),
-                    None => source.clone(),
-                };
-                destinations.insert(id.clone(), target.to_string_lossy().into_owned());
+                // A verified ID alone is not a resource. Missing/partial paths
+                // are never inferred from the planned target or failed IDs.
+                if !is_completed_file(&source, &session.files[id]) {
+                    missing_completed = true;
+                    continue;
+                }
+                let target = session.save_targets.get(id).cloned().unwrap_or_else(|| {
+                    download_dir
+                        .map(|dir| dir.join(safe_file_name(&session.files[id])))
+                        .unwrap_or_else(|| source.clone())
+                });
+                destinations.insert(id.clone(), source.to_string_lossy().into_owned());
                 if target != source {
                     moves.push((id.clone(), source, target));
                 }
             }
-            for id in &session.failed {
-                let source = session.temp_dir.join(id);
-                destinations.insert(id.clone(), source.to_string_lossy().into_owned());
+            moves.sort_by(|left, right| left.0.cmp(&right.0));
+            if missing_completed {
+                status = TransferStatus::Failed;
             }
             let plan = TerminalPlan {
                 session_id: session_id.to_string(),
                 status,
                 moves,
                 destinations,
+                completed_files: session
+                    .uploaded
+                    .iter()
+                    .map(|id| (id.clone(), session.files[id].clone()))
+                    .collect(),
+                error: missing_completed
+                    .then(|| "Receive completed file is missing or invalid".into()),
                 temp_dir: session.temp_dir.clone(),
             };
             // Terminal: evict immediately (official drops the slot on
@@ -1202,10 +1278,19 @@ impl ReceiveSessions {
             plan
         };
         inner.progress.retain(|(id, _), _| id != session_id);
+        if let Some(record) = inner
+            .records
+            .iter_mut()
+            .find(|record| record.session_id == session_id)
+        {
+            if let Some(error) = &plan.error {
+                record.error = Some(error.clone());
+            }
+        }
         self.update_record(
             &mut inner,
             session_id,
-            plan.status,
+            TransferStatus::Transferring,
             Some(plan.destinations.clone()),
         );
         Some(plan)
@@ -1228,86 +1313,164 @@ impl ReceiveSessions {
     }
 }
 
-/// Execute a terminal plan: move temp files into the download dir (rename
-/// with a copy+delete fallback for cross-volume moves), record the final
-/// destinations and emit `transfer-done`.
-async fn execute_terminal_plan(sessions: Arc<ReceiveSessions>, plan: TerminalPlan) {
-    if plan.status == TransferStatus::Done {
-        let mut final_destinations = plan.destinations.clone();
-        let mut all_moved = true;
-        for (file_id, source, target) in &plan.moves {
-            let unique = pick_unique_path(target).await;
-            match move_file(source, &unique).await {
-                Ok(()) => {
-                    final_destinations
-                        .insert(file_id.clone(), unique.to_string_lossy().into_owned());
-                }
-                Err(error) => {
-                    all_moved = false;
-                    eprintln!("otools-localsend server: move {source:?}: {error}");
-                    final_destinations
-                        .insert(file_id.clone(), source.to_string_lossy().into_owned());
-                }
-            }
-        }
-        if final_destinations != plan.destinations {
-            sessions.patch_record_destinations(&plan.session_id, final_destinations);
-        }
-        // Only clean the session dir when everything moved out; without a
-        // download dir the received files intentionally stay in tmp.
-        if all_moved && !plan.moves.is_empty() {
-            let _ = tokio::fs::remove_dir_all(&plan.temp_dir).await;
-        }
-    }
-    let status = if plan.status == TransferStatus::Done {
-        "done"
-    } else {
-        "failed"
-    };
-    let error = sessions
+/// Only closed, verified ordinary tmp files become visible local resources.
+fn is_completed_file(path: &Path, entry: &FileEntry) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.file_type().is_file() && metadata.len() == entry.size)
+}
+
+/// Execute copies for successful files even in a mixed Failed session. A
+/// cancelled partial session separately retains its completed tmp resources.
+/// Keep each original until publishing its real unique destination, then
+/// unlink only our own source and finally publish one terminal event/status.
+async fn execute_terminal_plan(sessions: Arc<ReceiveSessions>, plan: TerminalPlan) -> bool {
+    let mut destinations = plan.destinations.clone();
+    let mut status = plan.status;
+    let mut error = sessions
         .transfer_records()
         .into_iter()
         .find(|record| record.session_id == plan.session_id)
-        .and_then(|record| record.error);
-    sessions.events.send(
-        "transfer-done",
-        json!({ "sessionId": plan.session_id, "status": status, "stage": "finished", "error": error }),
-    );
-}
-
-/// Rename with a copy+delete fallback (Windows refuses cross-volume renames).
-async fn move_file(source: &Path, target: &Path) -> io::Result<()> {
-    match tokio::fs::rename(source, target).await {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            tokio::fs::copy(source, target).await?;
-            tokio::fs::remove_file(source).await
+        .and_then(|record| record.error)
+        .or(plan.error.clone());
+    let mut save_failed = false;
+    for (file_id, source, target) in &plan.moves {
+        let committed = if is_completed_file(source, &plan.completed_files[file_id]) {
+            move_file(source, target).await
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "completed source is missing or invalid",
+            ))
+        };
+        match committed {
+            Ok(unique) => {
+                destinations.insert(file_id.clone(), unique.to_string_lossy().into_owned());
+                // The copy is flushed/closed and the source still exists.
+                // History never points at a missing tmp or estimated target.
+                sessions.patch_record_destinations(&plan.session_id, destinations.clone());
+                if let Err(cleanup_error) = tokio::fs::remove_file(source).await {
+                    eprintln!("otools-localsend server: remove committed temp {source:?}: {cleanup_error}");
+                }
+            }
+            Err(save_error) => {
+                save_failed = true;
+                status = TransferStatus::Failed;
+                let reason = format!("Receive file save failed ({file_id}): {save_error}");
+                error = Some(match error {
+                    Some(previous) => format!("{previous}; {reason}"),
+                    None => reason,
+                });
+                // Atomic create/copy never removes the original on failure.
+                // If it vanished independently it is not a usable resource.
+                if !is_completed_file(source, &plan.completed_files[file_id]) {
+                    destinations.remove(file_id);
+                    sessions.patch_record_destinations(&plan.session_id, destinations.clone());
+                }
+            }
         }
     }
+    let invalid: Vec<String> = destinations
+        .iter()
+        .filter(|(id, path)| {
+            !is_completed_file(Path::new(path.as_str()), &plan.completed_files[*id])
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    if !invalid.is_empty() {
+        for id in invalid {
+            destinations.remove(&id);
+        }
+        save_failed = true;
+        status = TransferStatus::Failed;
+        let reason = "Receive completed file is missing or invalid";
+        error = Some(match error {
+            Some(previous) => format!("{previous}; {reason}"),
+            None => reason.into(),
+        });
+        sessions.patch_record_destinations(&plan.session_id, destinations.clone());
+    }
+    // Never sweep retained successful tmp files or preexisting paths. Only an
+    // empty session directory can be removed after its individual commits.
+    let _ = tokio::fs::remove_dir(&plan.temp_dir).await;
+    sessions.finish_receive_record(&plan.session_id, status, destinations, error.clone());
+    sessions.events.send(
+        "transfer-done",
+        json!({
+            "sessionId": plan.session_id,
+            "status": if status == TransferStatus::Done { "done" } else { "failed" },
+            "stage": "finished",
+            "error": error,
+        }),
+    );
+    !save_failed
 }
 
-/// Never overwrite an existing download: pick `name (n).ext`.
-async fn pick_unique_path(target: &Path) -> PathBuf {
-    if !tokio::fs::try_exists(target).await.unwrap_or(false) {
-        return target.to_path_buf();
+/// Commit by atomically reserving one bounded unique target, then copying.
+/// No exists→rename race, overwrite fallback, or cross-volume rename exists.
+/// The caller owns deletion only after it patches history to the returned path.
+async fn move_file(source: &Path, target: &Path) -> io::Result<PathBuf> {
+    validate_local_absolute_path(
+        target.to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "save target is not UTF-8")
+        })?,
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "save target has no parent"))?;
+    let mut original = tokio::fs::File::open(source).await?;
+    if !original.metadata().await?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "receive source is not a file",
+        ));
     }
+    tokio::fs::create_dir_all(parent).await?;
     let stem = target
         .file_stem()
         .and_then(|stem| stem.to_str())
-        .unwrap_or("file")
-        .to_string();
+        .unwrap_or("file");
     let extension = target
         .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| format!(".{ext}"))
+        .and_then(|extension| extension.to_str())
+        .map(|extension| format!(".{extension}"))
         .unwrap_or_default();
-    for index in 1..1000u32 {
-        let candidate = target.with_file_name(format!("{stem} ({index}){extension}"));
-        if !tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
-            return candidate;
+    for index in 0..1000u32 {
+        let unique = if index == 0 {
+            target.to_path_buf()
+        } else {
+            target.with_file_name(format!("{stem} ({index}){extension}"))
+        };
+        let mut destination = match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&unique)
+            .await
+        {
+            Ok(destination) => destination,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        let copied = async {
+            tokio::io::copy(&mut original, &mut destination).await?;
+            destination.flush().await?;
+            destination.sync_all().await
         }
+        .await;
+        drop(destination);
+        if let Err(error) = copied {
+            // This path was created by this exact worker, not the user. Failed
+            // partial copies are not published; the original bytes stay intact.
+            let _ = tokio::fs::remove_file(&unique).await;
+            return Err(error);
+        }
+        return Ok(unique);
     }
-    target.to_path_buf()
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "unique save target candidates exhausted",
+    ))
 }
 
 /// Throttled `transfer-progress` emission during the streaming write.
@@ -1625,7 +1788,9 @@ pub async fn upload_stream(
                     None,
                 );
                 if let Some(plan) = plan {
-                    execute_terminal_plan(Arc::clone(&sessions), plan).await;
+                    if !execute_terminal_plan(Arc::clone(&sessions), plan).await {
+                        return (500, json!({ "error": "Receive file save failed" }));
+                    }
                 }
                 (200, Value::Null)
             };
@@ -2115,6 +2280,686 @@ mod tests {
     }
 
     #[test]
+    fn receive_accept_destination_dot_component_leaves_pending() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = format!("{}/.", directory.path().join("chosen").display());
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions = Arc::new(ReceiveSessions::new(directory.path(), events).unwrap());
+        let (id, mut decision) = prepare_manual(&sessions, &[file_entry("f", 7, None)], SENDER_IP);
+        assert!(
+            super::session_accept_with_destinations(
+                &sessions,
+                &id,
+                None,
+                HashMap::from([("f".into(), target)]),
+            )
+            .is_err(),
+            "a save target must name a file, not a normalized dot directory"
+        );
+        assert_eq!(
+            session_status(&sessions, &id),
+            Some(TransferStatus::Pending)
+        );
+        assert!(sessions.inner.lock().unwrap().sessions[&id]
+            .tokens
+            .is_empty());
+        assert!(matches!(
+            decision.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn receive_completed_source_size_change_before_copy_is_failed_not_saved() {
+        let directory = tempfile::tempdir().unwrap();
+        let downloads = directory.path().join("downloads");
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions =
+            Arc::new(ReceiveSessions::new(directory.path(), Arc::clone(&events)).unwrap());
+        let (_, prepared) = prepare_now(
+            &sessions,
+            &settings(true, None),
+            &[file_entry("f", 7, None)],
+            None,
+            SENDER_IP,
+        );
+        let id = prepared["sessionId"].as_str().unwrap();
+        let source = sessions.tmp_root().join(id).join("f");
+        std::fs::write(&source, b"payload").unwrap();
+        let plan = sessions
+            .mark_file_terminal(id, "f", true, Some(&downloads), None)
+            .unwrap();
+        std::fs::write(&source, b"bad").unwrap();
+        assert!(!super::execute_terminal_plan(Arc::clone(&sessions), plan).await);
+        let record = record_snapshot(&sessions, id);
+        assert_eq!(record.status, TransferStatus::Failed);
+        assert!(
+            record.destinations.is_empty(),
+            "a changed-size source is no longer completed bytes"
+        );
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"bad",
+            "failed save must retain its original source"
+        );
+        assert!(!downloads.join("f.bin").exists());
+        assert_eq!(event_data(&events, "transfer-done")[0]["status"], "failed");
+    }
+
+    #[tokio::test]
+    async fn receive_missing_completed_tmp_before_final_publication_is_omitted() {
+        let directory = tempfile::tempdir().unwrap();
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions =
+            Arc::new(ReceiveSessions::new(directory.path(), Arc::clone(&events)).unwrap());
+        let (_, prepared) = prepare_now(
+            &sessions,
+            &settings(true, None),
+            &[file_entry("f", 7, None)],
+            None,
+            SENDER_IP,
+        );
+        let id = prepared["sessionId"].as_str().unwrap();
+        let source = sessions.tmp_root().join(id).join("f");
+        std::fs::write(&source, b"payload").unwrap();
+        let plan = sessions
+            .mark_file_terminal(id, "f", true, None, None)
+            .unwrap();
+        std::fs::remove_file(&source).unwrap();
+        assert!(!super::execute_terminal_plan(Arc::clone(&sessions), plan).await);
+        let record = record_snapshot(&sessions, id);
+        assert_eq!(record.status, TransferStatus::Failed);
+        assert!(record.destinations.is_empty());
+        assert!(record
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("missing or invalid")));
+        let done = event_data(&events, "transfer-done");
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0]["status"], "failed");
+    }
+
+    #[test]
+    fn receive_legacy_accept_rejects_unknown_id_without_mutating_pending() {
+        let directory = tempfile::tempdir().unwrap();
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions = Arc::new(ReceiveSessions::new(directory.path(), events).unwrap());
+        let (id, mut decision) =
+            prepare_manual(&sessions, &[file_entry("known", 7, None)], SENDER_IP);
+        assert!(
+            session_accept(&sessions, &id, Some(vec!["known".into(), "unknown".into()])).is_err()
+        );
+        assert_eq!(
+            session_status(&sessions, &id),
+            Some(TransferStatus::Pending)
+        );
+        assert!(sessions.inner.lock().unwrap().sessions[&id]
+            .tokens
+            .is_empty());
+        assert!(matches!(
+            decision.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn receive_accept_destinations_reject_invalid_before_tokens_and_decision() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory
+            .path()
+            .join("not-created")
+            .join("photo.png")
+            .to_string_lossy()
+            .into_owned();
+        let invalid_targets = [
+            "relative/photo.png".to_string(),
+            "~/photo.png".to_string(),
+            "https://example.test/photo.png".to_string(),
+            "file:///C:/photo.png".to_string(),
+            "//server/share/photo.png".to_string(),
+            "\\\\server\\share\\photo.png".to_string(),
+            "\\\\?\\C:\\photo.png".to_string(),
+            "C:photo.png".to_string(),
+            format!("{target}:stream"),
+            format!("{target}\n"),
+        ];
+        let mut cases = invalid_targets
+            .into_iter()
+            .map(|target| {
+                (
+                    Some(vec!["good".into()]),
+                    HashMap::from([("good".into(), target)]),
+                )
+            })
+            .collect::<Vec<_>>();
+        cases.extend([
+            (
+                Some(vec!["good".into()]),
+                HashMap::from([("other".into(), target.clone())]),
+            ),
+            (None, HashMap::from([("unknown".into(), target.clone())])),
+            (Some(vec!["good".into(), "unknown".into()]), HashMap::new()),
+            (
+                Some(Vec::new()),
+                HashMap::from([("good".into(), target.clone())]),
+            ),
+        ]);
+        for (file_ids, destinations) in cases {
+            let fixture = tempfile::tempdir().unwrap();
+            let events = Arc::new(WebEventBroadcaster::new());
+            let sessions =
+                Arc::new(ReceiveSessions::new(fixture.path(), Arc::clone(&events)).unwrap());
+            let (id, mut decision) = prepare_manual(
+                &sessions,
+                &[file_entry("good", 7, None), file_entry("other", 7, None)],
+                SENDER_IP,
+            );
+            let before = serde_json::to_value(record_snapshot(&sessions, &id)).unwrap();
+            let result = super::session_accept_with_destinations(
+                &sessions,
+                &id,
+                file_ids,
+                destinations.clone(),
+            );
+            assert!(
+                result.is_err(),
+                "invalid acceptance unexpectedly authorized: {destinations:?}"
+            );
+            {
+                let inner = sessions.inner.lock().unwrap();
+                let session = &inner.sessions[&id];
+                assert_eq!(session.status, TransferStatus::Pending);
+                assert!(session.tokens.is_empty());
+                assert!(session.decision_tx.is_some());
+            }
+            assert!(matches!(
+                decision.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert_eq!(
+                serde_json::to_value(record_snapshot(&sessions, &id)).unwrap(),
+                before
+            );
+            assert!(event_data(&events, "transfer-done").is_empty());
+            assert!(!directory.path().join("not-created").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_accept_destinations_wait_for_upload_before_creating_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let selected = directory
+            .path()
+            .join("chosen")
+            .join("nested")
+            .join("saved.png");
+        let fallback = directory.path().join("fallback");
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions =
+            Arc::new(ReceiveSessions::new(directory.path(), Arc::clone(&events)).unwrap());
+        let (id, decision) = prepare_manual(&sessions, &[file_entry("image", 7, None)], SENDER_IP);
+        let accepted = super::session_accept_with_destinations(
+            &sessions,
+            &id,
+            Some(vec!["image".into()]),
+            HashMap::from([("image".into(), selected.to_string_lossy().into_owned())]),
+        )
+        .expect("accept chosen image");
+        assert_eq!(accepted, vec!["image".to_string()]);
+        assert!(
+            !selected.parent().unwrap().exists(),
+            "accept issues consent, not disk writes"
+        );
+        assert!(record_snapshot(&sessions, &id).destinations.is_empty());
+        let (status, prepared) =
+            await_user_decision(Arc::clone(&sessions), id.clone(), decision).await;
+        assert_eq!(status, 200);
+        let (status, _) = upload_stream(
+            Arc::clone(&sessions),
+            Some(fallback.clone()),
+            id.clone(),
+            "image".into(),
+            prepared["files"]["image"].as_str().unwrap().into(),
+            SENDER_IP,
+            Body::from("payload"),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            selected.is_file(),
+            "authorized per-file target must override download directory"
+        );
+        assert_eq!(std::fs::read(&selected).unwrap(), b"payload");
+        assert!(!fallback.exists());
+        assert_eq!(
+            record_snapshot(&sessions, &id).destinations["image"],
+            selected.to_string_lossy()
+        );
+        assert_eq!(event_data(&events, "transfer-done").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn receive_cancel_with_selected_destination_keeps_only_completed_tmp() {
+        let directory = tempfile::tempdir().unwrap();
+        let selected = directory.path().join("chosen").join("saved.png");
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions =
+            Arc::new(ReceiveSessions::new(directory.path(), Arc::clone(&events)).unwrap());
+        let (id, decision) = prepare_manual(
+            &sessions,
+            &[file_entry("good", 7, None), file_entry("pending", 7, None)],
+            SENDER_IP,
+        );
+        super::session_accept_with_destinations(
+            &sessions,
+            &id,
+            None,
+            HashMap::from([("good".into(), selected.to_string_lossy().into_owned())]),
+        )
+        .unwrap();
+        let (_, prepared) = await_user_decision(Arc::clone(&sessions), id.clone(), decision).await;
+        let (status, _) = upload_stream(
+            Arc::clone(&sessions),
+            None,
+            id.clone(),
+            "good".into(),
+            prepared["files"]["good"].as_str().unwrap().into(),
+            SENDER_IP,
+            Body::from("payload"),
+        )
+        .await;
+        assert_eq!(status, 200);
+        session_cancel(&sessions, &id).unwrap();
+        sessions.drain().await.unwrap();
+        let source = sessions.tmp_root().join(&id).join("good");
+        let record = record_snapshot(&sessions, &id);
+        assert_eq!(record.status, TransferStatus::Cancelled);
+        assert_eq!(record.destinations.len(), 1);
+        assert_eq!(record.destinations["good"], source.to_string_lossy());
+        assert_eq!(std::fs::read(&source).unwrap(), b"payload");
+        assert!(!selected.parent().unwrap().exists());
+        assert!(!record.destinations.contains_key("pending"));
+        let done = event_data(&events, "transfer-done");
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0]["status"], "cancelled");
+    }
+
+    #[test]
+    fn receive_commit_publishes_no_terminal_status_before_io_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions = ReceiveSessions::new(directory.path(), Arc::clone(&events)).unwrap();
+        let (_, prepared) = prepare_now(
+            &sessions,
+            &settings(true, None),
+            &[file_entry("f", 7, None)],
+            None,
+            SENDER_IP,
+        );
+        let id = prepared["sessionId"].as_str().unwrap();
+        let source = sessions.tmp_root().join(id).join("f");
+        std::fs::write(&source, b"payload").unwrap();
+        let _plan = sessions
+            .mark_file_terminal(
+                id,
+                "f",
+                true,
+                Some(&directory.path().join("downloads")),
+                None,
+            )
+            .expect("commit plan");
+        assert_eq!(
+            record_snapshot(&sessions, id).status,
+            TransferStatus::Transferring,
+            "terminal status is not truthful until authorized save has settled"
+        );
+        assert!(event_data(&events, "transfer-done").is_empty());
+    }
+
+    #[test]
+    fn receive_terminal_record_uses_actual_tmp_until_target_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let downloads = directory.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
+        let old_target = downloads.join("f.bin");
+        std::fs::write(&old_target, b"old user bytes").unwrap();
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions = ReceiveSessions::new(directory.path(), events).unwrap();
+        let (_, prepared) = prepare_now(
+            &sessions,
+            &settings(true, None),
+            &[file_entry("f", 7, None)],
+            None,
+            SENDER_IP,
+        );
+        let id = prepared["sessionId"].as_str().unwrap();
+        let source = sessions.tmp_root().join(id).join("f");
+        std::fs::write(&source, b"payload").unwrap();
+        let _plan = sessions
+            .mark_file_terminal(id, "f", true, Some(&downloads), None)
+            .expect("terminal plan");
+        let record = record_snapshot(&sessions, id);
+        assert_eq!(record.destinations["f"], source.to_string_lossy());
+        assert_eq!(std::fs::read(&old_target).unwrap(), b"old user bytes");
+        assert_eq!(
+            std::fs::read(&record.destinations["f"]).unwrap(),
+            b"payload"
+        );
+    }
+
+    #[test]
+    fn receive_failed_terminal_omits_failed_file_destinations() {
+        let directory = tempfile::tempdir().unwrap();
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions = ReceiveSessions::new(directory.path(), events).unwrap();
+        let (_, prepared) = prepare_now(
+            &sessions,
+            &settings(true, None),
+            &[file_entry("good", 7, None), file_entry("bad", 7, None)],
+            None,
+            SENDER_IP,
+        );
+        let id = prepared["sessionId"].as_str().unwrap();
+        let source = sessions.tmp_root().join(id).join("good");
+        std::fs::write(&source, b"payload").unwrap();
+        assert!(sessions
+            .mark_file_terminal(id, "good", true, None, None)
+            .is_none());
+        let _plan = sessions
+            .mark_file_terminal(id, "bad", false, None, Some("Upload aborted".into()))
+            .expect("failed terminal plan");
+        let record = record_snapshot(&sessions, id);
+        assert_eq!(
+            record.status,
+            TransferStatus::Transferring,
+            "commit has not run yet"
+        );
+        assert_eq!(
+            record.destinations.len(),
+            1,
+            "failed files are not resources"
+        );
+        assert_eq!(record.destinations["good"], source.to_string_lossy());
+        assert!(!record.destinations.contains_key("bad"));
+    }
+
+    #[test]
+    fn receive_terminal_omits_missing_completed_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions = ReceiveSessions::new(directory.path(), events).unwrap();
+        let (_, prepared) = prepare_now(
+            &sessions,
+            &settings(true, None),
+            &[file_entry("missing", 7, None)],
+            None,
+            SENDER_IP,
+        );
+        let id = prepared["sessionId"].as_str().unwrap();
+        let _plan = sessions
+            .mark_file_terminal(id, "missing", true, None, None)
+            .expect("terminal plan");
+        assert!(
+            record_snapshot(&sessions, id).destinations.is_empty(),
+            "a missing path cannot be advertised as completed bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_save_parent_failure_retains_tmp_and_reports_failed() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocker = directory.path().join("preexisting-file");
+        std::fs::write(&blocker, b"untouched user bytes").unwrap();
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions =
+            Arc::new(ReceiveSessions::new(directory.path(), Arc::clone(&events)).unwrap());
+        let (_, prepared) = prepare_now(
+            &sessions,
+            &settings(true, None),
+            &[file_entry("f", 7, None)],
+            None,
+            SENDER_IP,
+        );
+        let id = prepared["sessionId"].as_str().unwrap().to_string();
+        let source = sessions.tmp_root().join(&id).join("f");
+        let (status, _) = upload_stream(
+            Arc::clone(&sessions),
+            Some(blocker.join("downloads")),
+            id.clone(),
+            "f".into(),
+            prepared["files"]["f"].as_str().unwrap().into(),
+            SENDER_IP,
+            Body::from("payload"),
+        )
+        .await;
+        assert_eq!(status, 500, "save failure must not be reported as success");
+        let record = record_snapshot(&sessions, &id);
+        assert_eq!(record.status, TransferStatus::Failed);
+        assert!(record
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("save failed")));
+        assert_eq!(record.destinations["f"], source.to_string_lossy());
+        assert_eq!(std::fs::read(&source).unwrap(), b"payload");
+        assert_eq!(std::fs::read(&blocker).unwrap(), b"untouched user bytes");
+        let done = event_data(&events, "transfer-done");
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0]["status"], "failed");
+        assert_eq!(done[0]["error"], record.error.unwrap());
+    }
+
+    #[tokio::test]
+    async fn receive_failed_session_commits_only_completed_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let downloads = directory.path().join("authorized-downloads");
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions =
+            Arc::new(ReceiveSessions::new(directory.path(), Arc::clone(&events)).unwrap());
+        let wrong_digest = "0".repeat(64);
+        let (_, prepared) = prepare_now(
+            &sessions,
+            &settings(true, None),
+            &[
+                file_entry("good", 7, None),
+                file_entry("bad", 7, Some(&wrong_digest)),
+            ],
+            None,
+            SENDER_IP,
+        );
+        let id = prepared["sessionId"].as_str().unwrap().to_string();
+        let (status, _) = upload_stream(
+            Arc::clone(&sessions),
+            Some(downloads.clone()),
+            id.clone(),
+            "good".into(),
+            prepared["files"]["good"].as_str().unwrap().into(),
+            SENDER_IP,
+            Body::from("payload"),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            !downloads.exists(),
+            "incomplete session has not committed targets"
+        );
+        for _ in 0..3 {
+            let (status, _) = upload_stream(
+                Arc::clone(&sessions),
+                Some(downloads.clone()),
+                id.clone(),
+                "bad".into(),
+                prepared["files"]["bad"].as_str().unwrap().into(),
+                SENDER_IP,
+                Body::from("invalid"),
+            )
+            .await;
+            assert_eq!(status, 422);
+        }
+        let record = record_snapshot(&sessions, &id);
+        assert_eq!(record.status, TransferStatus::Failed);
+        let saved = downloads.join("good.bin");
+        assert!(
+            saved.is_file(),
+            "a mixed failed session must commit its successful file"
+        );
+        assert_eq!(std::fs::read(&saved).unwrap(), b"payload");
+        assert_eq!(record.destinations.len(), 1);
+        assert_eq!(record.destinations["good"], saved.to_string_lossy());
+        assert!(record
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Checksum mismatch"));
+        assert!(!record.destinations.contains_key("bad"));
+        let done = event_data(&events, "transfer-done");
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0]["status"], "failed");
+    }
+
+    #[tokio::test]
+    async fn receive_cancel_omits_missing_completed_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let events = Arc::new(WebEventBroadcaster::new());
+        let sessions =
+            Arc::new(ReceiveSessions::new(directory.path(), Arc::clone(&events)).unwrap());
+        let (_, prepared) = prepare_now(
+            &sessions,
+            &settings(true, None),
+            &[
+                file_entry("finished", 7, None),
+                file_entry("pending", 7, None),
+            ],
+            None,
+            SENDER_IP,
+        );
+        let id = prepared["sessionId"].as_str().unwrap().to_string();
+        let (status, _) = upload_stream(
+            Arc::clone(&sessions),
+            None,
+            id.clone(),
+            "finished".into(),
+            prepared["files"]["finished"].as_str().unwrap().into(),
+            SENDER_IP,
+            Body::from("payload"),
+        )
+        .await;
+        assert_eq!(status, 200);
+        std::fs::remove_file(sessions.tmp_root().join(&id).join("finished")).unwrap();
+        session_cancel(&sessions, &id).unwrap();
+        let record = record_snapshot(&sessions, &id);
+        assert_eq!(record.status, TransferStatus::Cancelled);
+        assert!(
+            record.destinations.is_empty(),
+            "cancel must not publish a missing resource"
+        );
+        assert_eq!(event_data(&events, "transfer-done").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn receive_atomic_copy_keeps_original_until_history_patch() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let target = directory.path().join("target");
+        std::fs::write(&source, b"verified bytes").unwrap();
+        super::move_file(&source, &target)
+            .await
+            .expect("commit copy");
+        assert!(
+            source.is_file(),
+            "record still points to tmp until caller publishes final path"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"verified bytes");
+        assert_eq!(std::fs::read(&target).unwrap(), b"verified bytes");
+    }
+
+    #[tokio::test]
+    async fn receive_atomic_copy_creates_parent_in_distinct_local_root() {
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source = source_root.path().join("source");
+        let target = target_root
+            .path()
+            .join("authorized")
+            .join("nested")
+            .join("target");
+        std::fs::write(&source, b"verified bytes").unwrap();
+        let result = super::move_file(&source, &target).await;
+        assert!(
+            result.is_ok(),
+            "authorized copy must create its missing parent: {result:?}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"verified bytes");
+        assert_eq!(std::fs::read(&source).unwrap(), b"verified bytes");
+    }
+
+    #[tokio::test]
+    async fn receive_atomic_commit_preserves_preexisting_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        std::fs::write(&source, b"new payload").unwrap();
+        let target = directory.path().join("photo.png");
+        std::fs::write(&target, b"preexisting bytes").unwrap();
+        super::move_file(&source, &target)
+            .await
+            .expect("unique commit");
+        assert_eq!(std::fs::read(&target).unwrap(), b"preexisting bytes");
+        assert_eq!(
+            std::fs::read(directory.path().join("photo (1).png")).unwrap(),
+            b"new payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_concurrent_atomic_commits_create_distinct_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let downloads = directory.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        std::fs::write(&first, b"first bytes").unwrap();
+        std::fs::write(&second, b"second bytes").unwrap();
+        let target = downloads.join("same.bin");
+        let (one, two) = tokio::join!(
+            super::move_file(&first, &target),
+            super::move_file(&second, &target)
+        );
+        one.expect("first commit");
+        two.expect("second commit");
+        let mut contents = std::fs::read_dir(&downloads)
+            .unwrap()
+            .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
+            .collect::<Vec<_>>();
+        contents.sort();
+        assert_eq!(
+            contents,
+            vec![b"first bytes".to_vec(), b"second bytes".to_vec()]
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_atomic_candidate_exhaustion_fails_without_clobber() {
+        let directory = tempfile::tempdir().unwrap();
+        let downloads = directory.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
+        let target = downloads.join("f.bin");
+        std::fs::write(&target, b"old bytes").unwrap();
+        for index in 1..1000 {
+            std::fs::write(downloads.join(format!("f ({index}).bin")), b"old bytes").unwrap();
+        }
+        let source = directory.path().join("source");
+        std::fs::write(&source, b"new payload").unwrap();
+        let result = super::move_file(&source, &target).await;
+        assert!(
+            result.is_err(),
+            "candidate exhaustion must fail instead of overwriting"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"new payload");
+        for entry in std::fs::read_dir(&downloads).unwrap() {
+            assert_eq!(std::fs::read(entry.unwrap().path()).unwrap(), b"old bytes");
+        }
+    }
+
+    #[test]
     fn server_status_events_are_complete_snapshots() {
         let temp = tempfile::tempdir().expect("temp dir");
         let events = Arc::new(WebEventBroadcaster::new());
@@ -2122,6 +2967,7 @@ mod tests {
             Arc::new(ReceiveSessions::new(temp.path(), Arc::clone(&events)).expect("sessions"));
         Settings {
             port: 0,
+            download_dir: Some(temp.path().join("downloads").to_string_lossy().into_owned()),
             ..Default::default()
         }
         .save(temp.path())
@@ -2524,7 +3370,7 @@ mod tests {
         // ("nothing to transfer", official) and finishes the session.
         let (session_id, decision_rx) = prepare_manual(&sessions, &entries, SENDER_IP);
         let waiter = spawn_waiter(&sessions, session_id.clone(), decision_rx);
-        let accepted = session_accept(&sessions, &session_id, Some(vec!["bogus-id".into()]))
+        let accepted = session_accept(&sessions, &session_id, Some(Vec::new()))
             .expect("empty accept is allowed");
         assert!(accepted.is_empty());
         let (status, body) = waiter.await.expect("waiter task");
@@ -3374,6 +4220,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         Settings {
             port: 0,
+            download_dir: Some(temp.path().join("downloads").to_string_lossy().into_owned()),
             ..Default::default()
         }
         .save(temp.path())
@@ -3475,6 +4322,7 @@ mod tests {
             let dir = tempfile::tempdir().expect("data dir");
             Settings {
                 port: 0,
+                download_dir: Some(dir.path().join("downloads").to_string_lossy().into_owned()),
                 ..Default::default()
             }
             .save(dir.path())
@@ -3685,11 +4533,20 @@ mod tests {
             .expect("last write completed");
         let gate = fixture.block_filesystem();
         drop(tx);
-        // EOF and flush can finish without more blocking jobs. Done is marked
-        // before pick_unique_path queues its real filesystem query at the gate.
+        // EOF and flush settle before commit queues its real filesystem work.
+        // History stays Transferring until save succeeds/fails; the eviction
+        // plus active lease identifies the retained terminal commit owner.
         fixture.wait_for(
-            || record_snapshot(&fixture.sessions, &id).status == TransferStatus::Done,
-            "upload entered terminal commit",
+            || session_status(&fixture.sessions, &id).is_none(),
+            "upload entered retained terminal commit",
+        );
+        assert_eq!(
+            record_snapshot(&fixture.sessions, &id).status,
+            TransferStatus::Transferring
+        );
+        assert_eq!(
+            record_snapshot(&fixture.sessions, &id).destinations["finished"],
+            source.to_string_lossy()
         );
         caller.abort();
         assert!(fixture.runtime.block_on(caller).unwrap_err().is_cancelled());
@@ -3699,7 +4556,7 @@ mod tests {
         assert_eq!(
             while_blocked.state,
             crate::service::ServiceState::Stopping,
-            "a dropped HTTP response cannot discard an already-Done commit owner"
+            "a dropped HTTP response cannot discard a retained commit owner"
         );
         let unique = downloads.join("finished (1).bin");
         assert_eq!(

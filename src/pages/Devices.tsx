@@ -9,6 +9,7 @@ import { useMemo, useRef, useState } from "react";
 import { pickFromHostTree } from "otools-plugin-sdk/host-file-tree";
 import { discoverNow, isPreviewMode, sendFiles, sendText, serverStatus } from "../api";
 import { DeviceCard } from "../components/DeviceCard";
+import { TransferCard } from "../components/TransferCard";
 import { formatError } from "../format";
 import type { PluginStore } from "../hooks/usePollEvents";
 
@@ -25,6 +26,8 @@ export function DevicesPage({ store, onGoToTransfers }: DevicesPageProps) {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState<Busy>(null);
   const [error, setError] = useState<string | null>(null);
+  const [sentSessionId, setSentSessionId] = useState<string | null>(null);
+  const sentRecord = store.transfers.find((record) => record.sessionId === sentSessionId && record.direction === "Send") ?? null;
   const storeRef = useRef(store);
   storeRef.current = store;
   const serviceAvailable = store.ready && !store.hostError && !store.serviceBusy && !store.stopConfirmation && store.server?.state === "running";
@@ -78,9 +81,9 @@ export function DevicesPage({ store, onGoToTransfers }: DevicesPageProps) {
         setError("服务状态已变化，请在服务运行后重新选择文件");
         return;
       }
-      await sendFiles(selected.ip, selected.info.port, paths, pin.trim() || undefined, selected.info.protocol);
+      const sent = await sendFiles(selected.ip, selected.info.port, paths, pin.trim() || undefined, selected.info.protocol);
+      setSentSessionId(sent.sessionId);
       await store.refreshTransfers();
-      onGoToTransfers();
     } catch (cause) {
       setError(formatError(cause));
     } finally {
@@ -98,10 +101,10 @@ export function DevicesPage({ store, onGoToTransfers }: DevicesPageProps) {
     setBusy("text");
     setError(null);
     try {
-      await sendText(selected.ip, selected.info.port, body, pin.trim() || undefined, selected.info.protocol);
+      const sent = await sendText(selected.ip, selected.info.port, body, pin.trim() || undefined, selected.info.protocol);
+      setSentSessionId(sent.sessionId);
       setText("");
       await store.refreshTransfers();
-      onGoToTransfers();
     } catch (cause) {
       setError(formatError(cause));
     } finally {
@@ -208,6 +211,17 @@ export function DevicesPage({ store, onGoToTransfers }: DevicesPageProps) {
             className="field"
           />
         </div>
+      )}
+      {sentSessionId && (
+        <section className="send-feedback" aria-label="本次发送">
+          <div className="send-feedback-head">
+            <h3>本次发送</h3>
+            <button type="button" className="btn btn-sm" onClick={onGoToTransfers}>查看全部传输</button>
+          </div>
+          {sentRecord ? <TransferCard record={sentRecord} progress={store.progress[sentRecord.sessionId]} onRefresh={store.refreshTransfers} /> : (
+            <p className="content-note" role="status">正在读取传输记录…</p>
+          )}
+        </section>
       )}
     </div>
   );

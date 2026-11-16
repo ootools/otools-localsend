@@ -1,0 +1,67 @@
+Native image dependency notice
+
+Covered package versions: zune-core-0.5.3, zune-jpeg-0.5.15
+License used for this distribution: MIT
+
+Local Cargo registry evidence (no network lookup):
+- zune-core-0.5.3: declared license MIT OR Apache-2.0 OR Zlib; upstream https://github.com/etemesi254/zune-image
+- zune-jpeg-0.5.15: declared license MIT OR Apache-2.0 OR Zlib; upstream https://github.com/etemesi254/zune-image/tree/dev/crates/zune-jpeg
+  Authors as recorded in Cargo.toml: caleb <etemesicaleb@gmail.com>
+
+Verbatim license sources (byte-identical; one shared copy):
+- zune-core-0.5.3/LICENSE-MIT
+- zune-jpeg-0.5.15/LICENSE-MIT
+
+===== Full license text =====
+
+MIT License
+
+Copyright (c) zune-image developers
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+===== Additional source notice, verbatim from zune-core-0.5.3/src/bit_depth.rs =====
+
+/*
+ * Copyright (c) 2023.
+ *
+ * This software is free software;
+ *
+ * You can redistribute it or modify it under terms of the MIT, Apache License or Zlib license
+ */
+
+===== Additional source notice, verbatim from zune-jpeg-0.5.15/src/bitstream.rs =====
+
+/*
+ * Copyright (c) 2023.
+ *
+ * This software is free software;
+ *
+ * You can redistribute it or modify it under terms of the MIT, Apache License or Zlib license
+ */
+
+===== Additional source notice, verbatim from zune-jpeg-0.5.15/src/color_convert/neon64.rs =====
+
+/*
+ * Copyright (c) 2025.
+ *
+ * This software is free software;
+ *
+ * You can redistribute it or modify it under terms of the MIT, Apache License or Zlib license
+ */
